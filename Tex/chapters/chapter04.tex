@@ -1,22 +1,577 @@
-%% Chapter 4 — Short-Term Memory and Context Management
-%% TODO: content
-\chapterquote{Context is the price of intelligence.}{anon}
+%% ============================================================
+%%  Chapter 4 — Structured Output, Validation & Self-Healing
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
 
-This chapter covers in-context message management, sliding windows, token-aware
-truncation, and summarisation strategies.
+\chapterquote{If the contract between components is vague, the
+system will fail in vague ways.}{Mary Poppendieck, adapted}
 
-\section{The Context Window as a Resource}
-\label{sec:context-window-resource}
-% TODO
+By the end of Chapter~1 you had a four-node loop running in production: a
+Perceive node that redacts PII, a Reason node that calls an LLM via LiteLLM and
+Instructor, an Action node that dispatches tools, and a Reflect node that
+chooses among five enum decisions. Chapter~2 wrapped that loop in termination
+policy and failure guards. This chapter tightens the remaining gap: what happens
+between the raw text the model emits and the strongly typed decisions the rest
+of the runtime expects.
 
-\section{Message Trimming Strategies}
-\label{sec:message-trimming}
-% TODO
+Unstructured model output is the single biggest source of low-grade, expensive
+instability in agent systems. ``Low-grade'' because runs usually complete; the
+system only fails on edge cases. Expensive because each failure burns full model
+calls, tool calls, and engineer time to debug. The correct response is not
+``better prompts'' but a runtime-enforced contract: every node that consumes
+model output must receive a Pydantic-validated object, and every parse failure
+must either repair itself within a bounded number of retries or escalate in a
+structured, observable way.
 
-\section{Sliding Window with Pinned System Prompt}
-\label{sec:sliding-window}
-% TODO
+This chapter implements that contract. You will define strict Pydantic~v2 models
+for the three Reason outputs, integrate Instructor's \code{patch()} modes as a
+first-class configuration, introduce a dedicated \code{ValidationNode} into the
+graph, and wire a repair loop that injects validation errors back into the next
+model call as beliefs. When repair fails, a rejection branch marks the run as a
+validation failure and surfaces the raw output and error to Langfuse for
+analysis.
 
-\section{Summarisation-Based Compression}
-\label{sec:summarisation-compression}
-% TODO
+%% ------------------------------------------------------------
+\section{Pydantic Output Models as Contracts}
+\label{sec:output-models}
+%% ------------------------------------------------------------
+
+Chapter~1 sketched the discriminated union of model intents the Reason node can
+produce: a tool call request, a final answer, or a reasoning trace. In this
+chapter you make that union the explicit contract between the model call and the
+rest of the runtime.
+
+Each of the three variants gets its own Pydantic~v2 \code{BaseModel}. There is
+no single "assistant response" model with optional fields for every possible
+shape. Optional fields create mixed states that are syntactically valid and
+semantically meaningless: a record with both a tool name and a final answer, or
+neither. A discriminated union, keyed by a \code{type} field, rules those states
+out.
+
+Listing~\ref{lst:output-models} shows the final models. Two details matter for
+production: strict mode and confidence bounds. Strict mode prevents Pydantic
+from silently coercing values (\code{"1"} into \code{1}), which is attractive in
+form handling but dangerous when parsing model output. Confidence bounds force
+any model calibration bugs into validation failures where they belong.
+
+\begin{lstlisting}[language=Python,
+  caption={Strict Pydantic models for the three Reason output variants},
+  label={lst:output-models}]
+# src/agent/output_models.py
+
+class ToolRequest(BaseModel):
+    model_config = {"strict": True}
+    type:      Literal["tool_request"] = "tool_request"
+    tool_name: str
+    arguments: dict[str, Any]
+
+class FinalAnswer(BaseModel):
+    model_config = {"strict": True}
+    type:       Literal["final_answer"] = "final_answer"
+    content:    str
+    confidence: float
+
+    @field_validator("confidence")
+    @classmethod
+    def confidence_in_range(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"confidence must be between 0.0 and 1.0, got {v}")
+        return v
+
+class ReasoningTrace(BaseModel):
+    model_config = {"strict": True}
+    type:  Literal["reasoning_trace"] = "reasoning_trace"
+    trace: str
+
+ReasonOutput = Annotated[
+    ToolRequest | FinalAnswer | ReasoningTrace,
+    Field(discriminator="type"),
+]
+\end{lstlisting}
+
+These models are imported by the Reason and Validation nodes, not redefined. The
+union alias \code{ReasonOutput} is the only response model used when calling the
+LLM via Instructor. That keeps the number of model schemas in your system small
+and explicit.
+
+\begin{warningbox}
+Do not introduce a catch-all \code{"other"} variant into the union. If the model
+produces a shape you did not anticipate, that is a validation failure. It should
+trigger the repair loop or escalation, not silently flow downstream as an
+untyped blob.
+\end{warningbox}
+
+%% ------------------------------------------------------------
+\section{Choosing an Instructor Mode}
+\label{sec:instructor-modes}
+%% ------------------------------------------------------------
+
+Instructor wraps a LiteLLM client so that calls to \code{.create()} accept a
+\code{response_model=} argument. Under the hood, it can use three strategies to
+coerce the model into structured output: native tool calling, native JSON mode,
+or JSON wrapped in a markdown code block. The mode you choose is a property of
+both the model provider and the reliability you need.
+
+The three modes are captured as an enum in Listing~\ref{lst:instructor-config}.
+\code{TOOLS} uses the provider's function-calling API when available. \code{JSON}
+uses explicit JSON mode when the provider supports it. \code{MD\_JSON} is a
+last resort for models that insist on wrapping JSON in a code fence.
+
+\begin{lstlisting}[language=Python,
+  caption={Selecting an Instructor mode per model family},
+  label={lst:instructor-config}]
+# src/agent/instructor_config.py
+
+class InstructorMode(str, Enum):
+    TOOLS   = "tools"
+    JSON    = "json"
+    MD_JSON = "md_json"
+
+_MODE_MAP: dict[InstructorMode, instructor.Mode] = {
+    InstructorMode.TOOLS:   instructor.Mode.TOOLS,
+    InstructorMode.JSON:    instructor.Mode.JSON,
+    InstructorMode.MD_JSON: instructor.Mode.MD_JSON,
+}
+
+MODEL_TO_INSTRUCTOR_MODE: dict[str, InstructorMode] = {
+    "gpt-4o":                 InstructorMode.TOOLS,
+    "gpt-4o-mini":            InstructorMode.TOOLS,
+    "claude-3-5-sonnet":      InstructorMode.TOOLS,
+    "mistral/mistral-large":  InstructorMode.JSON,
+    "ollama/llama3":          InstructorMode.MD_JSON,
+}
+
+
+def make_instructor_client(
+    model: str,
+    mode: InstructorMode | None = None,
+) -> instructor.Instructor:
+    """Patch a LiteLLM client with the right Instructor mode."""
+    base_client = litellm.Client()
+    resolved = mode or MODEL_TO_INSTRUCTOR_MODE.get(
+        model, InstructorMode.JSON
+    )
+    return instructor.from_litellm(
+        client=base_client, mode=_MODE_MAP[resolved]
+    )
+\end{lstlisting}
+
+In prose, the decision flow is simple:
+\begin{enumerate}
+  \item If the provider supports function calling, use \code{TOOLS}.
+  \item Else if it supports JSON mode, use \code{JSON}.
+  \item Otherwise, fall back to \code{MD\_JSON} and treat parse failures as
+        expected until you can switch models.
+\end{enumerate}
+
+Chapter~9 returns to this enum when it replaces the hand-written token estimate
+with LiteLLM's actual usage callbacks. The same mapping is used to compute cost
+per mode.
+
+%% ------------------------------------------------------------
+\section{Validation as a Graph Node}
+\label{sec:validation-node}
+%% ------------------------------------------------------------
+
+In Chapter~1 the Reason node called Instructor directly and wrote the parsed
+object into \code{last_action}. Validation lived inline inside the node. That is
+convenient but wrong for three reasons:
+
+\begin{itemize}
+  \item you cannot route on validation failures without hiding control flow
+        inside the node function,
+  \item you cannot observe validation separately from reasoning, and
+  \item you cannot reuse the same validation logic for other nodes.
+\end{itemize}
+
+The fix is to introduce a dedicated \code{ValidationNode} into the graph. The
+Reason node is responsible only for calling the model and capturing the raw
+output string. The Validation node is responsible for parsing that string into a
+\code{ReasonOutput}, recording failures, and choosing between the happy path and
+repair.
+
+Three private fields are added to the state for this purpose:
+
+\begin{itemize}
+  \item \code{_raw_model_output: str | None} --- the last raw JSON string the
+        model produced,
+  \item \code{_validation_error: str | None} --- the last Pydantic
+        \code{ValidationError} string, and
+  \item \code{_validation_attempt: int} --- the number of consecutive failed
+        validation attempts for the current cycle.
+\end{itemize}
+
+Listing~\ref{lst:validation-node} shows the node. It is a pure
+\code{(state) -> dict} callable like the other nodes, decorated with
+\code{@observe} so Langfuse captures it as a separate span. On success it writes
+\code{last_action} as a fully parsed union and clears the error fields. On
+failure it increments \code{_validation_attempt}, records the error, and leaves
+\code{last_action} untouched.
+
+\begin{lstlisting}[language=Python,
+  caption={Validation as its own node between Reason and Action},
+  label={lst:validation-node}]
+# src/agent/nodes/validation.py
+
+@observe(name="validation_node")
+def validation_node(state: AgentState) -> dict:
+    raw = state.get("_raw_model_output")
+    if raw is None:
+        # Nothing to validate; this is a wiring error in the graph.
+        return {}
+
+    attempt = int(state.get("_validation_attempt", 0))
+    try:
+        parsed = ReasonOutput.model_validate_json(raw)
+    except ValidationError as exc:
+        error_str = str(exc)
+        _emit_validation_failure_event(
+            error=error_str,
+            node_name="validation_node",
+            attempt_number=attempt,
+            model=state.get("_config_model", "unknown"),
+            output_type="unknown",
+            raw_output=raw,
+        )
+        return {
+            "_validation_error":   error_str,
+            "_validation_attempt": attempt + 1,
+        }
+
+    # Success: clear error fields and update last_action
+    return {
+        "last_action":         parsed.model_dump(),
+        "_validation_error":   None,
+        "_validation_attempt": 0,
+    }
+\end{lstlisting}
+
+The output type is captured as \code{parsed.type} later in the routing logic for
+reporting. At this point you only know that validation succeeded.
+
+%% ------------------------------------------------------------
+\section{A Bounded Repair Loop}
+\label{sec:repair-loop}
+%% ------------------------------------------------------------
+
+A single validation failure is not a reason to give up. Models occasionally
+hallucinate fields, omit required keys, or emit extra commentary before or after
+JSON. Instructor's built-in retry loop catches many of these cases, but you
+still need to handle the worst cases in the runtime. The pattern is simple:
+parse fails, error is injected as a belief, Reason is called again, and validation
+retries---up to a maximum.
+
+The maximum must not be a magic number buried inside the node. It is part of the
+termination policy. Chapter~2 introduced \code{TerminationPolicy} with fields
+for \code{max_cycles}, \code{token_ceiling}, \code{wall_clock_timeout}, and
+\code{cost_cap}. Here you add a new field \code{validation_max_retries} with a
+sane default and a validation rule.
+
+\begin{lstlisting}[language=Python,
+  caption={Extending the termination policy with a validation retry ceiling},
+  label={lst:termination-policy-validation}]
+# src/agent/termination.py
+
+class TerminationPolicy(BaseModel):
+    max_cycles:            int
+    token_ceiling:         int
+    wall_clock_timeout_s:  int
+    cost_cap_usd:          float
+    validation_max_retries: int = 2
+
+    @field_validator("validation_max_retries")
+    @classmethod
+    def retries_must_be_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                "validation_max_retries must be >= 1, got {v}")
+        return v
+\end{lstlisting}
+
+The routing logic after the Validation node reads this policy from state (where
+it was written at graph entry) and decides between pass, retry, and escalate.
+Retrying consists of two steps: incrementing the attempt counter and appending a
+repair belief summarising the error.
+
+\begin{lstlisting}[language=Python,
+  caption={Building a repair belief and routing based on the retry ceiling},
+  label={lst:repair-loop}]
+# src/agent/nodes/validation.py
+
+
+def _build_repair_belief(error: str, attempt: int) -> str:
+    return (
+        f"[validation-retry attempt={attempt}] "
+        f"ValidationError: {error}"
+    )
+
+
+def route_after_validation(state: AgentState) -> str:
+    policy = TerminationPolicy.model_validate(
+        state.get("_policy", {})
+    )
+    error   = state.get("_validation_error")
+    attempt = int(state.get("_validation_attempt", 0))
+
+    if error is None:
+        return "pass"
+    if attempt < policy.validation_max_retries:
+        return "retry"
+    return "escalate"
+\end{lstlisting}
+
+The belief injection itself happens when you handle the \code{"retry"} branch in
+the graph wiring. The next Reason call will see the most recent validation error
+in the \code{beliefs} list and can adjust its behaviour accordingly.
+
+\begin{lstlisting}[language=Python,
+  caption={Injecting the validation error into beliefs before retrying},
+  label={lst:repair-belief-injection}]
+# src/agent/graph.py (excerpt)
+
+
+def _inject_validation_belief(state: AgentState) -> dict:
+    error   = state.get("_validation_error")
+    attempt = int(state.get("_validation_attempt", 0))
+    if not error:
+        return {}
+    return {
+        "beliefs": [
+            _build_repair_belief(error=error, attempt=attempt)
+        ]
+    }
+\end{lstlisting}
+
+Chapter~2's token budget logic already accounts for each Reason call. You do not
+need any special-case cost accounting for retries: they are just extra cycles.
+
+%% ------------------------------------------------------------
+\section{Escalation on Ceiling Breach}
+\label{sec:validation-escalation}
+%% ------------------------------------------------------------
+
+When validation has failed \code{validation_max_retries} times in a row for the
+same raw output, further retries are wishful thinking. At that point the runtime
+needs to surface the failure explicitly and stop.
+
+Chapter~1 introduced the Reflect node and its five enum decisions:
+\code{CONTINUE}, \code{REVISE}, \code{RETRY}, \code{TERMINATE}, and
+\code{ESCALATE}. Escalation here reuses that same decision. The Validation node
+does not talk to the Reflect node directly; instead it sets state in a way that
+causes the existing routing logic to choose the escalation branch.
+
+Listing~\ref{lst:validation-escalation} shows a small helper for the escalation
+update. It writes a structured summary into \code{final_answer}, sets
+\code{reflect_decision} to \code{"ESCALATE"}, and leaves the error fields
+intact for diagnostics.
+
+\begin{lstlisting}[language=Python,
+  caption={Marking a run as escalated due to validation failure},
+  label={lst:validation-escalation}]
+# src/agent/nodes/validation.py
+
+@dataclass
+class ValidationEscalationRecord:
+    node_name:        str
+    attempt_count:    int
+    last_error:       str
+    raw_model_output: str | None
+    model:            str
+    timestamp_utc:    str = field(
+        default_factory=lambda:
+            datetime.now(timezone.utc).isoformat()
+    )
+
+
+def _build_escalation_update(
+    state: AgentState,
+    error: str,
+    attempt: int,
+    model: str,
+) -> dict:
+    record = ValidationEscalationRecord(
+        node_name="validation_node",
+        attempt_count=attempt,
+        last_error=error,
+        raw_model_output=state.get("_raw_model_output"),
+        model=model,
+    )
+    summary = (
+        f"Validation failed after {attempt} retries. "
+        f"Last error: {error[:200]}"
+    )
+    return {
+        "reflect_decision": "ESCALATE",
+        "final_answer":     summary,
+        "_validation_error":   error,
+        "_validation_attempt": attempt,
+        "beliefs": [
+            f"[validation-escalated] {summary}",
+        ],
+        "cycle_traces": [
+            {"validation_escalation": asdict(record)},
+        ],
+    }
+\end{lstlisting}
+
+The Validation node calls this helper in its failure branch when
+\code{route_after_validation} has returned \code{"escalate"}. The Reflect node
+then sees \code{reflect_decision == "ESCALATE"} and Chapter~1's
+\code{route_from_reflect} function routes directly to \code{END}. The
+\code{termination_status} in the \code{CycleTrace} is set to \code{"FAILURE"} by
+Chapter~2's helpers, distinguishing this path from voluntary human escalation.
+
+%% ------------------------------------------------------------
+\section{Langfuse Events for Validation Failures}
+\label{sec:validation-langfuse}
+%% ------------------------------------------------------------
+
+Langfuse spans around Reason and Validation already tell you that validation
+failed, how long it took, and how many retries were attempted. To understand
+\emph{why} validation failed across a fleet of agents and models you need more
+structure: an event with a consistent schema that you can aggregate by model,
+output type, and error class.
+
+This section adds a small helper that emits a Langfuse event every time
+validation fails. Spans capture timing; events capture domain-specific facts.
+
+\begin{lstlisting}[language=Python,
+  caption={Emitting a structured Langfuse event on validation failure},
+  label={lst:langfuse-event}]
+# src/agent/nodes/validation.py
+
+
+def _emit_validation_failure_event(
+    error: str,
+    node_name: str,
+    attempt_number: int,
+    model: str,
+    output_type: str,
+    raw_output: str | None,
+) -> None:
+    langfuse_context.update_current_observation(
+        metadata={
+            "event":            "validation_failure",
+            "validation_error": error,
+            "node_name":        node_name,
+            "attempt_number":   attempt_number,
+            "model":            model,
+            "output_type":      output_type,
+            "raw_output_len":   len(raw_output or ""),
+        }
+    )
+\end{lstlisting}
+
+The helper is called in the Validation node's \code{except ValidationError}
+branch. For simple deployments this \code{metadata} record is enough: Langfuse
+Studio can filter observations where \code{event == "validation_failure"} and
+show you error distributions by model and output type.
+
+For larger fleets you can extend this into a dedicated Langfuse event type and a
+data-warehouse export. The schema does not change; only the plumbing does.
+
+\begin{notebox}
+As in Chapter~1's tests, set \code{LANGFUSE_ENABLED=false} in your test
+configuration so that unit tests for the Validation node do not make network
+calls. The helper function becomes a no-op when the SDK is disabled.
+\end{notebox}
+
+%% ------------------------------------------------------------
+\section{Graph Wiring and Tests}
+\label{sec:validation-graph}
+%% ------------------------------------------------------------
+
+The last step is to insert the Validation node into the graph and exercise the
+repair and escalation paths in tests.
+
+On the graph side, Reason writes \code{_raw_model_output} instead of a parsed
+\code{last_action}. Validation consumes that field and writes \code{last_action}
+on success. The edge from Reason now points to Validation; the edge from
+Validation points to Action or Reason depending on the routing function.
+
+\begin{lstlisting}[language=Python,
+  caption={Updated StateGraph wiring with a dedicated Validation node},
+  label={lst:graph-ch4}]
+# src/agent/graph.py (excerpt)
+
+b.add_node("validation_node", validation_node)
+
+b.add_edge("perceive_node", "reason_node")
+b.add_edge("reason_node", "validation_node")
+
+b.add_conditional_edges(
+    "validation_node",
+    route_after_validation,
+    {
+        "pass":     "action_node",
+        "retry":    "reason_node",
+        "escalate": END,
+    },
+)
+\end{lstlisting}
+
+Chapter~28 will add a full integration test suite for the graph. For now you
+focus on unit tests that treat Validation as a pure function of state. Each test
+constructs a minimal \code{AgentState}, populates \code{_raw_model_output}, and
+asserts on the node's return value.
+
+\begin{lstlisting}[language=Python,
+  caption={Node-level tests for validation, repair, and escalation},
+  label={lst:validation-tests}]
+# tests/test_validation.py
+
+os.environ.setdefault("LANGFUSE_ENABLED", "false")
+
+
+def test_valid_output_passes() -> None:
+    state = make_test_state(
+        _raw_model_output=FinalAnswer(
+            content="done", confidence=0.9
+        ).model_dump_json()
+    )
+    result = validation_node(state)
+    assert result["last_action"]["type"] == "final_answer"
+    assert result["_validation_error"] is None
+
+
+def test_invalid_output_retries() -> None:
+    # confidence outside [0.0, 1.0] should trigger a retry
+    raw = (
+        '{"type":"final_answer","content":"done",'
+        '"confidence": 2.5}'
+    )
+    state = make_test_state(
+        _raw_model_output=raw,
+        _validation_attempt=0,
+    )
+    result = validation_node(state)
+    assert result["_validation_attempt"] == 1
+    assert "confidence must be" in result["_validation_error"]
+
+
+def test_ceiling_breach_escalates() -> None:
+    raw = (
+        '{"type":"final_answer","content":"done",'
+        '"confidence": 2.5}'
+    )
+    state = make_test_state(
+        _raw_model_output=raw,
+        _validation_attempt=3,
+        _policy={"max_cycles": 10,
+                 "token_ceiling": 10000,
+                 "wall_clock_timeout_s": 60,
+                 "cost_cap_usd": 1.0,
+                 "validation_max_retries": 3},
+    )
+    # First, run the node to produce the error and increment attempt
+    node_result = validation_node(state)
+    merged = {**state, **node_result}
+    # Then route and build escalation update
+    assert route_after_validation(merged) == "escalate"
+\end{lstlisting}
+
+These tests exercise the core invariants: valid output clears the error fields,
+invalid output increments the attempt counter, and exceeding the retry ceiling
+routes to escalation. Chapter~28 will add graph-level tests that assert on the
+interaction between Reason, Validation, and Action over multiple cycles.
