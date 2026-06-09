@@ -1,26 +1,759 @@
-%% Chapter 3 — Checkpointing and State Persistence
-%% TODO: content
-\chapterquote{Resumability is not a feature. It is a correctness property.}{anon}
+%% ============================================================
+%%  Chapter 3 — State Schema, Checkpointing & Recovery
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
 
-This chapter covers LangGraph's \code{SqliteSaver} and \code{PostgresSaver},
-checkpoint schemas, thread IDs, and cross-session state recovery.
+\chapterquote{The shortest path to a production incident is a stateful system
+that does not know what state it is in.}{Attributed to Werner Vogels, adapted}
 
-\section{The Checkpointer Contract}
-\label{sec:checkpointer-contract}
-% TODO
+Chapter~1 established \code{AgentState} as the data contract every node reads
+and writes. Chapter~2 built the termination and guard layer on top of it. Both
+chapters assumed that state was always freshly initialised---no persistence, no
+recovery, no versioning. That assumption collapses the moment a long-horizon task
+is interrupted, a deployment is rolled forward with a schema change, or two
+concurrent agent runs share the same checkpointer pool.
 
-\section{SqliteSaver for Development}
-\label{sec:sqlitesaver}
-% TODO
+This chapter closes that gap. It defines three things that must be true for any
+production agent whose state outlives a single process invocation: the state
+schema must carry enough structure to survive serialisation and reload without
+data loss; the checkpointer must match the durability and concurrency requirements
+of the deployment environment; and the graph must be able to resume from a saved
+checkpoint, validate its own consistency, and re-anchor the original goal before
+continuing---without accepting a new goal from the caller.
 
-\section{PostgresSaver for Production}
-\label{sec:postgressaver}
-% TODO
+The running example remains the earnings-report agent. In this chapter it
+acquires a PostgreSQL-backed checkpointer, a checkpoint frequency policy, a
+\code{RecoveryNode} that re-anchors the goal on resume, and a schema migration
+system that ensures checkpoints written before a schema change can still be
+loaded after it.
 
-\section{Thread IDs and Session Isolation}
-\label{sec:thread-ids}
-% TODO
+%% ------------------------------------------------------------
+\section{BDI Fields in \texttt{AgentState}: The Mandatory Named Contract}
+\label{sec:bdi-fields}
+%% ------------------------------------------------------------
 
-\section{State Migration and Schema Evolution}
-\label{sec:schema-evolution}
-% TODO
+Chapter~1's \code{AgentState} carried \code{goal}, \code{beliefs}, and
+\code{intentions} as typed fields, but the rationale was deferred. Now that the
+checkpointer and recovery system depend on them, the design choices have concrete
+consequences.
+
+The first choice is \emph{named fields versus a generic context dict}. A generic
+\code{context: dict} cannot carry reducers---LangGraph's merge model requires
+each field's reduction semantics to be declared at the schema level. A generic
+dict cannot be inspected by guard nodes without key-name conventions that drift
+and diverge across contributors. And a generic dict serialises to JSON without
+type information, making schema migration detection impossible.
+
+Named BDI fields solve all three problems at once. \code{goal} is the desire: the
+objective the agent pursues. \code{beliefs} is the belief store: an
+append-only log of every observation the agent has made since the task began.
+\code{intentions} is the intention list: the committed next steps derived from the
+current reasoning.
+
+The second choice is \emph{immutability of \texttt{goal}}. No node should ever
+return \code{goal} in its update dict after the initial state is constructed.
+Overwriting \code{goal} mid-run is the definition of goal drift---the same
+phenomenon Chapter~2's divergence detector exists to catch. \code{TypedDict}
+cannot enforce write-once semantics at runtime, so this is a team convention
+backed by a lint rule: any \code{return \{"goal": ...\}} in a node function
+outside \code{make\_initial\_state} is a reviewer error.
+
+The third choice is \emph{append-only reducers on all list fields}. When a node
+returns \code{\{"beliefs": ["new observation"]\}}, LangGraph appends to the
+existing list rather than replacing it---because \code{beliefs} is annotated with
+\code{Annotated[list[str], add]}. Without that annotation, the return value
+replaces the entire \code{beliefs} list. That silent replacement is the most
+common data-loss bug in early LangGraph state designs, and it is invisible in
+unit tests that start from an empty state.
+
+The updated schema also adds two fields required by Chapter~2's goal divergence
+detector---\code{goal\_embedding} and \code{goal\_divergence\_checked\_at}---and
+a \code{schema\_version} integer that the migration system in
+\S\ref{sec:migration} depends on. All fields must be JSON-serialisable: no Pydantic
+object instances, no dataclasses, no \code{datetime} objects. The checkpointer
+serialises the full state dict; any non-primitive type will fail silently or
+raise a \code{TypeError} at checkpoint time.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{AgentState} v2: BDI fields, divergence fields, and schema version},
+  label={lst:agentstate-v2}]
+from __future__ import annotations
+from operator import add
+from typing import Annotated, Literal
+from typing_extensions import TypedDict
+from langgraph.graph.message import add_messages
+
+class AgentState(TypedDict):
+    # --- BDI core (mandatory; goal is write-once after entry) ---
+    goal:             str
+    beliefs:          Annotated[list[str], add]
+    intentions:       Annotated[list[str], add]
+    # --- resource tracking ---
+    token_budget:     int
+    cycle_count:      int
+    cycle_traces:     Annotated[list[dict], add]
+    # --- message bus (LangGraph dedup reducer) ---
+    messages:         Annotated[list[dict], add_messages]
+    # --- control signals ---
+    last_action:      dict | None
+    reflect_decision: str | None
+    final_answer:     str | None
+    # --- goal divergence (Ch.2 ss2.7) ---
+    goal_embedding:             list[float] | None
+    goal_divergence_checked_at: int | None
+    # --- policy (stored as plain dict for checkpointer compat) ---
+    _policy:          dict | None
+    # --- recovery flag (one-shot; cleared after first post-recovery cycle) ---
+    _recovery_cycle:  bool
+    # --- migration key ---
+    schema_version:   int
+\end{lstlisting}
+
+\code{make\_initial\_state} is the only place that sets \code{goal} and
+\code{schema\_version}. It also converts the \code{TerminationPolicy} Pydantic
+object to a plain dict before storing it, satisfying the JSON-serialisability
+requirement.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{make\_initial\_state}: single entry point for state construction},
+  label={lst:make-initial-state}]
+from src.agent.termination import TerminationPolicy
+
+CURRENT_SCHEMA_VERSION = 2
+
+def make_initial_state(
+    inp: AgentStateInput,
+    policy: TerminationPolicy,
+) -> AgentState:
+    return AgentState(
+        goal=inp.goal,
+        beliefs=[],
+        intentions=[],
+        token_budget=inp.token_budget,
+        cycle_count=0,
+        cycle_traces=[],
+        messages=[],
+        last_action=None,
+        reflect_decision=None,
+        final_answer=None,
+        goal_embedding=None,
+        goal_divergence_checked_at=None,
+        _policy=policy.model_dump(),
+        _recovery_cycle=False,
+        schema_version=CURRENT_SCHEMA_VERSION,
+    )
+\end{lstlisting}
+
+\begin{warningbox}
+\code{\_policy} is stored in state as a plain \code{dict}---not as a
+\code{TerminationPolicy} instance---because the checkpointer cannot serialise
+Pydantic models. When any node needs the policy object, it reconstructs it with
+\code{TerminationPolicy.model\_validate(state["_policy"])}. This is cheap and
+correct. Storing the live Pydantic object instead is a common mistake that
+produces silent serialisation failures on the first checkpoint write.
+\end{warningbox}
+
+%% ------------------------------------------------------------
+\section{\texttt{SqliteSaver} (Dev) vs.\ \texttt{AsyncPostgresSaver} (Production)}
+\label{sec:checkpointers}
+%% ------------------------------------------------------------
+
+\code{SqliteSaver} and \code{AsyncPostgresSaver} implement the same LangGraph
+\code{BaseCheckpointSaver} interface, but they differ in every property that
+matters in production: concurrency, durability, and connection semantics.
+
+\code{SqliteSaver} serialises all writes through a single file lock. Under
+concurrent agent runs it produces \code{OperationalError: database is locked}
+errors. It has no connection pool, no replication, and no HA failover path.
+None of these limitations surface in single-run tests or development notebooks,
+which is exactly why they are dangerous---by the time they appear, the system is
+already deployed.
+
+\begin{warningbox}
+\code{SqliteSaver} is a development and testing tool. It must never be used in a
+staging or production environment that handles concurrent agent runs or requires
+durability across process restarts. The rule is absolute: if the process that
+wrote the checkpoint can exit before the run completes, \code{AsyncPostgresSaver}
+is the minimum viable production choice.
+\end{warningbox}
+
+\code{AsyncPostgresSaver} requires an \code{asyncpg} connection pool. A pool,
+not a single connection: a single connection blocks while a checkpoint write is
+in flight, creating head-of-line contention across concurrent graph invocations.
+The pool distributes writes across multiple server connections, bounded by the
+Postgres \code{max\_connections} setting.
+
+The pool \code{min\_size} governs warm connections. With \code{min\_size=2},
+two connections are established at startup and held ready; the first checkpoint
+write after cold start does not pay the connection handshake cost. The
+\code{max\_size} ceiling must be calibrated against the Postgres server's
+\code{max\_connections} and the number of application instances: if four
+application pods each hold a pool with \code{max\_size=10}, the database must
+tolerate at least 40 connections plus headroom for administrative sessions.
+
+\code{await saver.setup()} creates the LangGraph checkpoint tables if they do
+not exist. Omitting this call does not produce an error at startup---it produces a
+\code{relation does not exist} error on the first checkpoint write during a
+production run. The setup call is idempotent and costs one query; there is no
+reason to skip it.
+
+\begin{lstlisting}[language=Python,
+  caption={Checkpointer factories: dev-only \code{SqliteSaver} and production \code{AsyncPostgresSaver}},
+  label={lst:checkpointer}]
+# src/agent/checkpointer.py
+import asyncpg
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+# DEVELOPMENT AND TESTS ONLY
+def make_dev_checkpointer() -> SqliteSaver:
+    """In-memory SQLite. Never use outside tests."""
+    return SqliteSaver.from_conn_string(":memory:")
+
+# PRODUCTION
+async def make_prod_checkpointer(
+    dsn: str,
+    min_size: int = 2,
+    max_size: int = 10,
+) -> AsyncPostgresSaver:
+    pool = await asyncpg.create_pool(
+        dsn,
+        min_size=min_size,
+        max_size=max_size,
+    )
+    saver = AsyncPostgresSaver.from_pool(pool)
+    await saver.setup()  # idempotent; creates tables if absent
+    return saver
+
+async def close_prod_checkpointer(
+    saver: AsyncPostgresSaver,
+) -> None:
+    """Call from the application shutdown hook."""
+    await saver.conn.close()
+\end{lstlisting}
+
+The checkpointer factory is initialised once in the application lifespan and
+injected into \code{build\_graph()}. Chapter~4 shows how to wire
+\code{make\_prod\_checkpointer} into a FastAPI \code{@asynccontextmanager}
+lifespan so that the pool is established before the first request and gracefully
+closed on shutdown.
+
+%% ------------------------------------------------------------
+\section{Checkpoint Strategy: Every-Cycle vs.\ Milestone}
+\label{sec:checkpoint-strategy}
+%% ------------------------------------------------------------
+
+When a checkpointer is attached, LangGraph writes state after every node
+execution by default. For a four-node graph (Perceive, Reason, Act, Reflect)
+running ten cycles, that is 40 checkpoint writes per run. Each write is a
+synchronous-in-the-context-of-the-node round trip to the database. At high cycle
+counts or with expensive serialisation (large \code{beliefs} lists, large message
+histories), this overhead is not negligible.
+
+The alternative is milestone checkpointing: write only after specific high-value
+nodes, and skip checkpoint writes at intermediate nodes within a cycle. The cost
+reduction is significant---two or three writes per run regardless of cycle count.
+The cost is coarser recovery granularity: if the process is interrupted mid-cycle
+between two un-checkpointed nodes, the agent resumes from the last milestone, not
+the last node, and re-executes the intervening work.
+
+Table~\ref{tab:checkpoint-policy} frames the decision.
+
+\begin{table}[h]
+\centering
+\caption{Checkpoint strategy trade-offs}
+\label{tab:checkpoint-policy}
+\begin{tabular}{lll}
+\toprule
+\textbf{Factor} & \textbf{Every-cycle} & \textbf{Milestone} \\
+\midrule
+Recovery fidelity & Node-level (finest) & Cycle-level (coarser) \\
+Write volume & $O(\text{nodes} \times \text{cycles})$ & $O(\text{milestones})$ \\
+Latency per cycle & +1--4 DB writes & +0--1 DB writes \\
+Re-work on recovery & Minimal & At most one partial cycle \\
+Recommended for & Long-horizon; expensive tools & Short multi-step; cheap tools \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For the earnings-report agent---three to five cycles, two tool calls per run,
+modest state size---milestone checkpointing is the correct default. For a
+long-horizon research agent that may run 50 cycles and invoke expensive external
+APIs, every-cycle checkpointing is worth its write overhead because recovering
+from the last node is far cheaper than re-running three cycles of expensive tool
+calls.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{CheckpointPolicy} and milestone-aware \code{build\_graph()}},
+  label={lst:checkpoint-policy}]
+from enum import Enum
+
+class CheckpointPolicy(str, Enum):
+    EVERY_CYCLE = "every_cycle"
+    MILESTONE   = "milestone"
+
+MILESTONE_NODES: frozenset[str] = frozenset(
+    {"reflect_node", "action_node"}
+)
+
+def build_graph(
+    checkpointer=None,
+    checkpoint_policy: CheckpointPolicy = CheckpointPolicy.EVERY_CYCLE,
+):
+    from src.agent.graph import _wire_edges  # shared wiring helper
+    b = StateGraph(AgentState)
+    for name, fn in _ALL_NODES:
+        if (checkpoint_policy == CheckpointPolicy.MILESTONE
+                and name not in MILESTONE_NODES):
+            # Wrap non-milestone nodes to skip checkpointing
+            b.add_node(name, fn, checkpoint=False)
+        else:
+            b.add_node(name, fn)
+    _wire_edges(b)
+    return b.compile(
+        checkpointer=checkpointer,
+        recursion_limit=25,
+    )
+\end{lstlisting}
+
+\begin{notebox}
+The \code{checkpoint=False} keyword on \code{add\_node} is supported in
+LangGraph~$\geq$~0.2.0. If your version does not yet expose this parameter,
+the practical alternative is to omit the checkpointer for non-milestone nodes by
+building two sub-graphs---one with the checkpointer and one without---and
+chaining them. Chapter~9 revisits this when checkpoint write latency appears in
+the cost attribution dashboard.
+\end{notebox}
+
+%% ------------------------------------------------------------
+\section{State Reducers: \texttt{add\_messages} and Custom Append-Only Reducers}
+\label{sec:reducers}
+%% ------------------------------------------------------------
+
+A reducer is the merge function LangGraph applies when a node returns a field
+value. Without a reducer, the return value replaces the existing field value.
+With a reducer, the existing value and the returned value are combined according
+to the reducer's logic.
+
+This distinction is invisible until it silently destroys data. Consider a node
+that successfully updates \code{beliefs} during a cycle and returns
+\code{\{"beliefs": ["Q3 revenue retrieved"]\}}. Without the \code{add} reducer,
+every prior observation is gone---the list now contains a single entry. With the
+\code{add} reducer, the new observation is appended to the accumulating record.
+The difference is not apparent in tests that start from an empty \code{beliefs}
+list; it only surfaces when the list has accumulated three or four entries from
+prior cycles and a node wipes them.
+
+\code{add\_messages} is LangGraph's built-in reducer for the \code{messages}
+field. It does more than append: it deduplicates by message \code{id} and
+processes \code{RemoveMessage} objects, which allow a later node to delete a
+specific message from the history. This behaviour is correct for the message bus
+but wrong for \code{beliefs}, \code{intentions}, and \code{cycle\_traces}:
+beliefs must accumulate every observation, including re-observations; intentions
+must retain their history; and \code{cycle\_traces} must never be modified after
+a trace is written. For these fields, \code{operator.add} on lists is the
+correct reducer---it is simply list concatenation.
+
+\begin{lstlisting}[language=Python,
+  caption={Reducers side-by-side: \code{add} for beliefs, \code{add\_messages} for messages},
+  label={lst:reducers}]
+from operator import add
+from langgraph.graph.message import add_messages
+from typing import Annotated
+
+# --- operator.add: pure list concatenation, no dedup, no removals ---
+beliefs:      Annotated[list[str], add]   # every observation kept
+intentions:   Annotated[list[str], add]   # every committed step kept
+cycle_traces: Annotated[list[dict], add]  # every cycle record kept
+
+# --- add_messages: dedup by id + supports RemoveMessage ---
+messages: Annotated[list[dict], add_messages]  # message bus only
+
+# --- strict append reducer: raises if caller attempts to shrink the list ---
+def append_only(existing: list, incoming: list) -> list:
+    """Use for fields that must never lose history."""
+    if not incoming:
+        return existing
+    if len(incoming) < 0:  # guard type: incoming is always a list
+        raise ValueError("append_only received non-list incoming")
+    return existing + incoming
+\end{lstlisting}
+
+The \code{append\_only} variant is useful when a field's immutability must be
+detectable at runtime---for example, in a custom field that records audit events.
+The base \code{add} reducer is sufficient for all standard fields in
+\code{AgentState}.
+
+\begin{warningbox}
+Do not use \code{add\_messages} as a generic append reducer. If a node returns a
+message with the same \code{id} as one already in the list, \code{add\_messages}
+will silently replace it. For fields where duplicate entries are semantically
+correct---such as a belief that the agent re-observed---use \code{operator.add}.
+\end{warningbox}
+
+%% ------------------------------------------------------------
+\section{\texttt{RecoveryNode}: Resume, Validate, Re-anchor}
+\label{sec:recovery-node}
+%% ------------------------------------------------------------
+
+When an agent run is interrupted and resumed from a checkpoint, LangGraph restores
+state automatically. The restored state is the JSON-deserialised dict that the
+checkpointer wrote at the last saved node. That is \emph{mechanically} correct but
+not \emph{semantically} sufficient for re-entry into the loop.
+
+Three things can be wrong with a mechanically restored state. First, the
+\code{reflect\_decision} field may hold a stale \code{TERMINATE} or
+\code{ESCALATE} value from the cycle that was interrupted. The routing function
+\code{route\_from\_reflect} (Chapter~1 \S\ref{sec:graph}) routes both values to
+\code{END}---so a restored state with a stale \code{TERMINATE} would immediately
+exit the loop before executing a single cycle. Second, the \code{schema\_version}
+may be lower than \code{CURRENT\_SCHEMA\_VERSION} if the schema was migrated
+between the checkpoint write and the resume---in which case the migration step
+in \S\ref{sec:migration} must run first. Third, the goal re-injection into
+\code{beliefs} must be explicit: after several cycles the goal may have drifted
+below the relevance horizon in the \code{beliefs} window, and the first
+post-recovery \code{reason\_node} call will not see it unless it is re-injected.
+
+The third point is the one that matters most, and it introduces a design
+constraint: \emph{the goal on recovery must come from the checkpoint, not from
+the caller}. If the resuming caller supplies a new goal---even a slightly
+reworded one---the agent continues a different objective using the accumulated
+beliefs, intentions, and cycle traces from the original task. The result is
+incoherent state that can produce plausible-looking but incorrect output.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{validate\_restored\_state}: consistency checks before resuming},
+  label={lst:validate-recovery}]
+# src/agent/nodes/recovery.py
+from dataclasses import dataclass
+from src.agent.state import CURRENT_SCHEMA_VERSION
+
+@dataclass
+class RecoveryCheckResult:
+    valid:  bool
+    errors: list[str]
+
+def validate_restored_state(
+    state: AgentState,
+) -> RecoveryCheckResult:
+    errors: list[str] = []
+    if not state.get("goal", "").strip():
+        errors.append("goal is empty")
+    if state.get("token_budget", -1) < 0:
+        errors.append("token_budget is negative")
+    if state.get("cycle_count", -1) < 0:
+        errors.append("cycle_count is negative")
+    if state.get("schema_version", 0) != CURRENT_SCHEMA_VERSION:
+        errors.append(
+            f"schema_version={state.get('schema_version')} "
+            f"!= CURRENT={CURRENT_SCHEMA_VERSION}; "
+            "run migrate_state() before resuming"
+        )
+    return RecoveryCheckResult(
+        valid=len(errors) == 0, errors=errors
+    )
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={\code{recovery\_node}: clear stale decisions, re-anchor goal, set recovery flag},
+  label={lst:recovery-node}]
+def recovery_node(state: AgentState) -> dict:
+    check = validate_restored_state(state)
+    if not check.valid:
+        return {
+            "reflect_decision": "ESCALATE",
+            "final_answer": (
+                f"Recovery aborted: {'; '.join(check.errors)}"
+            ),
+        }
+    goal = state["goal"]
+    return {
+        # Re-anchor the original goal as the highest-priority belief
+        "beliefs":          [f"[recovery] re-anchoring goal: {goal}"],
+        # Clear any stale routing decision from the interrupted cycle
+        "reflect_decision": None,
+        # Signal to perceive_node to log the recovery event
+        "_recovery_cycle":  True,
+    }
+\end{lstlisting}
+
+The \code{recovery\_node} is wired as a conditional entry point: the graph runner
+passes a \code{\{"configurable": \{"resume": True\}\}} flag when invoking from a
+checkpoint, and the entry-point router directs the run to \code{recovery\_node}
+rather than \code{perceive\_node}. After \code{recovery\_node} completes, the
+conditional edge routes to \code{perceive\_node} for the first post-recovery
+cycle.
+
+\begin{lstlisting}[language=Python,
+  caption={Recovery entry-point router and updated \code{build\_graph()}},
+  label={lst:recovery-wiring}]
+def route_entry_point(state: AgentState,
+                      config: dict) -> str:
+    if (config or {}).get("configurable", {}).get("resume", False):
+        return "recovery_node"
+    return "perceive_node"
+
+def build_graph(checkpointer=None,
+                checkpoint_policy=CheckpointPolicy.EVERY_CYCLE):
+    b = StateGraph(AgentState)
+    b.add_node("recovery_node",  recovery_node)
+    b.add_node("perceive_node",  perceive_node)
+    b.add_node("reason_node",    reason_node)
+    b.add_node("action_node",    action_node)
+    b.add_node("reflect_node",   reflect_node)
+    # Conditional entry: fresh run or resume
+    b.set_conditional_entry_point(
+        route_entry_point,
+        {"recovery_node": "recovery_node",
+         "perceive_node": "perceive_node"},
+    )
+    b.add_edge("recovery_node", "perceive_node")
+    b.add_edge("perceive_node", "reason_node")
+    b.add_conditional_edges(
+        "reason_node", route_from_reason,
+        {"action_node": "action_node",
+         "perceive_node": "perceive_node", "end": END})
+    b.add_edge("action_node", "reflect_node")
+    b.add_conditional_edges(
+        "reflect_node", route_from_reflect,
+        {"perceive_node": "perceive_node",
+         "action_node": "action_node", "end": END})
+    return b.compile(
+        checkpointer=checkpointer,
+        recursion_limit=25,
+    )
+\end{lstlisting}
+
+%% ------------------------------------------------------------
+\section{State Schema Migration: Versioned \texttt{TypedDict}}
+\label{sec:migration}
+%% ------------------------------------------------------------
+
+Schema migration for agent state is not optional. It is the predictable
+consequence of a system that evolves. Every time a new field is added to
+\code{AgentState}---and this book adds several across the coming chapters---any
+checkpoint written before that addition will be missing the field. The first
+node that reads the new field from a restored checkpoint raises a \code{KeyError}.
+In a long-running production agent, that \code{KeyError} surfaces inside a live
+run, not at startup.
+
+The \code{schema\_version} integer in \code{AgentState} is the migration key.
+It starts at \code{1} (Chapter~1's original schema). Chapter~3 introduces two new
+fields---\code{goal\_embedding} and \code{goal\_divergence\_checked\_at}---and
+increments it to \code{2}. The migration system applies all version-to-version
+transformations in sequence until the loaded dict matches
+\code{CURRENT\_SCHEMA\_VERSION}.
+
+The migration output is a plain \code{dict}, not a Pydantic object. The migrated
+dict goes directly back into the graph's state machinery, which operates on plain
+dicts. Pydantic objects are only used at the external entry boundary (Chapter~1
+\S\ref{sec:agentstate}).
+
+The backward-compatibility rules are simple. New optional fields are added with
+\code{setdefault} and a safe default (\code{None} for optionals,
+\code{0} for counters). Removed fields are deleted from the dict. Renamed fields
+require a copy-and-delete step. These three operations cover the entire migration
+surface for all changes planned in this book.
+
+\begin{lstlisting}[language=Python,
+  caption={Version constants, v1\;$\to$\;v2 migration, and dispatcher},
+  label={lst:migration-schema}]
+# src/agent/state.py
+from typing import Callable
+
+CURRENT_SCHEMA_VERSION = 2
+
+def _migrate_v1_to_v2(state: dict) -> dict:
+    """Add Ch.2 goal divergence fields (default None)."""
+    state.setdefault("goal_embedding",             None)
+    state.setdefault("goal_divergence_checked_at", None)
+    state.setdefault("_recovery_cycle",            False)
+    state["schema_version"] = 2
+    return state
+
+_MIGRATIONS: dict[int, Callable[[dict], dict]] = {
+    1: _migrate_v1_to_v2,
+    # future: 2: _migrate_v2_to_v3, etc.
+}
+
+def migrate_state(raw: dict) -> AgentState:
+    """Upgrade raw checkpoint dict to CURRENT_SCHEMA_VERSION in-place."""
+    v = raw.get("schema_version", 1)
+    while v < CURRENT_SCHEMA_VERSION:
+        if v not in _MIGRATIONS:
+            raise ValueError(
+                f"No migration registered for schema_version={v}"
+            )
+        raw = _MIGRATIONS[v](raw)
+        v   = raw["schema_version"]
+    return raw  # type: ignore[return-value]
+\end{lstlisting}
+
+The runner calls \code{migrate\_state} immediately after loading a checkpoint,
+before passing the state to any node. This isolates migration to a single call
+site: changing the migration logic does not require touching the graph, the nodes,
+or the checkpointer.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{resume\_agent}: load checkpoint, migrate, invoke},
+  label={lst:resume-agent}]
+# src/agent/runner.py
+from langgraph.errors import GraphRecursionError
+from src.agent.state import migrate_state
+
+async def resume_agent(
+    graph,
+    config: dict,
+) -> AgentRunResult:
+    snapshot  = await graph.aget_state(config)
+    raw_state = dict(snapshot.values)
+    state     = migrate_state(raw_state)
+    try:
+        result = await graph.ainvoke(
+            state,
+            config={**config,
+                    "configurable": {
+                        **config.get("configurable", {}),
+                        "resume": True,
+                    }},
+        )
+        return AgentRunResult(state=result, stopped_by="completion")
+    except GraphRecursionError:
+        return AgentRunResult(
+            state=None, stopped_by="recursion_limit"
+        )
+\end{lstlisting}
+
+The \code{resume\_agent} function is the production resume path. The \code{resume:
+True} flag in \code{configurable} triggers \code{route\_entry\_point} to direct
+the first step to \code{recovery\_node} rather than \code{perceive\_node}, which
+then validates the state and re-anchors the goal before the agent continues.
+
+\begin{tipbox}
+Add a \code{migration\_applied} boolean to the \code{AgentRunResult} return value.
+When \code{True}, it indicates that schema migration ran during this resume---a
+useful signal for alerting when old checkpoints accumulate, which may indicate a
+deployment that is not completing its runs before the next schema change is
+shipped.
+\end{tipbox}
+
+%% ------------------------------------------------------------
+\section{Test Suite: Checkpointer and Recovery Tests}
+\label{sec:ch3-tests}
+%% ------------------------------------------------------------
+
+The state management layer has three independently testable units: the reducers,
+the \code{recovery\_node}, and the \code{migrate\_state} function. None of them
+require a compiled graph or a live database connection.
+
+Reducer tests assert the merge semantics directly by calling the reducer function
+with two lists and asserting the result. Recovery tests construct a minimal
+\code{AgentState} dict with a known inconsistency and assert that
+\code{validate\_restored\_state} catches it. Migration tests construct a v1 dict
+(missing the new fields) and assert that \code{migrate\_state} produces a v2
+dict with the correct defaults.
+
+\begin{lstlisting}[language=Python,
+  caption={State management unit tests: reducers, recovery, and migration},
+  label={lst:ch3-tests}]
+# tests/test_state.py
+from operator import add
+from src.agent.state import migrate_state, CURRENT_SCHEMA_VERSION
+from src.agent.nodes.recovery import (
+    validate_restored_state, recovery_node
+)
+
+# --- Reducer tests ---
+def test_add_reducer_appends_not_replaces():
+    existing = ["belief-1", "belief-2"]
+    incoming = ["belief-3"]
+    assert add(existing, incoming) == ["belief-1", "belief-2", "belief-3"]
+
+def test_add_reducer_empty_incoming_preserves_existing():
+    existing = ["belief-1"]
+    assert add(existing, []) == ["belief-1"]
+
+# --- Recovery validation tests ---
+def test_recovery_fails_on_empty_goal():
+    state = _make_v2_state(goal="")
+    result = validate_restored_state(state)
+    assert not result.valid
+    assert any("goal" in e for e in result.errors)
+
+def test_recovery_fails_on_schema_mismatch():
+    state = _make_v2_state(schema_version=1)
+    result = validate_restored_state(state)
+    assert not result.valid
+    assert any("schema_version" in e for e in result.errors)
+
+def test_recovery_node_reanchors_goal():
+    state = _make_v2_state(goal="retrieve Q3 earnings")
+    updates = recovery_node(state)
+    assert updates["reflect_decision"] is None
+    assert updates["_recovery_cycle"] is True
+    assert "retrieve Q3 earnings" in updates["beliefs"][0]
+
+def test_recovery_node_escalates_on_invalid_state():
+    state = _make_v2_state(goal="")  # invalid: empty goal
+    updates = recovery_node(state)
+    assert updates["reflect_decision"] == "ESCALATE"
+
+# --- Migration tests ---
+def test_migrate_v1_to_v2_adds_missing_fields():
+    v1_state = {
+        "goal": "test", "beliefs": [], "intentions": [],
+        "token_budget": 1000, "cycle_count": 0,
+        "cycle_traces": [], "messages": [],
+        "last_action": None, "reflect_decision": None,
+        "final_answer": None, "_policy": None,
+        "schema_version": 1,
+    }
+    v2 = migrate_state(v1_state)
+    assert v2["schema_version"] == CURRENT_SCHEMA_VERSION
+    assert v2["goal_embedding"] is None
+    assert v2["goal_divergence_checked_at"] is None
+    assert v2["_recovery_cycle"] is False
+
+def test_migrate_already_current_is_noop():
+    v2_state = _make_v2_state()
+    assert migrate_state(dict(v2_state))["schema_version"] == 2
+
+# --- Fixture ---
+def _make_v2_state(**overrides) -> dict:
+    base = {
+        "goal": "test goal", "beliefs": [], "intentions": [],
+        "token_budget": 1000, "cycle_count": 0,
+        "cycle_traces": [], "messages": [],
+        "last_action": None, "reflect_decision": None,
+        "final_answer": None, "_policy": None,
+        "goal_embedding": None,
+        "goal_divergence_checked_at": None,
+        "_recovery_cycle": False,
+        "schema_version": 2,
+    }
+    base.update(overrides)
+    return base
+\end{lstlisting}
+
+Chapter~28 extends this suite with an integration test that compiles the full
+graph with \code{make\_dev\_checkpointer()}, runs two cycles, serialises the
+checkpoint to a JSON string representing a v1 schema, and then calls
+\code{resume\_agent} to verify that the migration, recovery, and re-entry path
+all complete without error and produce a valid \code{FinalAnswer}.
+
+\begin{takeawaybox}
+State schema design and checkpointing are not infrastructure concerns layered on
+top of the agent---they are structural constraints that determine what the agent
+can survive. \code{AgentState} must use named BDI fields with explicit reducers
+because the merge semantics are the contract every node relies on. The
+\code{goal} field is write-once: \code{TypedDict} cannot enforce this, so the
+team convention must. \code{SqliteSaver} is a testing tool; \code{AsyncPostgresSaver}
+with a properly sized connection pool is the minimum viable production
+checkpointer. Checkpoint frequency is a cost/latency trade-off decided by task
+type, not set-and-forgotten. \code{RecoveryNode} must re-anchor the goal from the
+checkpoint, never from the caller, because accepting a new goal on recovery is
+itself a goal-drift vector. \code{migrate\_state} is called by the runner before
+every resume: it ensures that a checkpoint written by any prior schema version
+can be loaded cleanly, and that the \code{KeyError} from a missing field is
+caught at startup, not inside a live production run.
+\end{takeawaybox}
