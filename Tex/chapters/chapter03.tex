@@ -148,7 +148,7 @@ def make_initial_state(
 \code{\_policy} is stored in state as a plain \code{dict}---not as a
 \code{TerminationPolicy} instance---because the checkpointer cannot serialise
 Pydantic models. When any node needs the policy object, it reconstructs it with
-\code{TerminationPolicy.model\_validate(state["_policy"])}. This is cheap and
+\lstinline|TerminationPolicy.model_validate(state["_policy"])|. This is cheap and
 correct. Storing the live Pydantic object instead is a common mistake that
 produces silent serialisation failures on the first checkpoint write.
 \end{warningbox}
