@@ -1,27 +1,884 @@
-%% Chapter 2 — Loop Safety and Termination
-%% TODO: content
-\chapterquote{A system that cannot stop is a system you do not control.}{anon}
+%% ============================================================
+%%  Chapter 2 -- Termination, Resource Limits & Loop Failure Guards
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
 
-This chapter establishes the hard guarantees that prevent a correctly reasoned
-agent from running indefinitely, exhausting resources, or diverging from its
-original goal.
+\chapterquote{A system that cannot stop is not autonomous. It is runaway.}
+{Attributed to Edsger W.\ Dijkstra, adapted}
 
-\section{Termination Conditions}
-\label{sec:termination-conditions}
-% TODO
+Chapter~1 built the smallest complete agent loop you can put into production: four
+typed nodes, conditional routing, a checkpointer, and Langfuse spans on every
+cycle. It left one question open: what happens when the loop does not stop?
 
-\section{Cycle Limit and Budget Guards}
-\label{sec:cycle-limit}
-% TODO
+The answer is expensive and embarrassing. A loop without explicit termination
+guards can exhaust a token budget, run up a four-figure API bill overnight, or
+produce thousands of log entries documenting a system that was effectively frozen
+but still billing. None of these failures produce a loud error. They produce
+silent accumulation until a threshold is crossed that was never set.
 
-\section{Goal Divergence Detection}
+This chapter installs four independent layers of protection. The first is a
+\code{TerminationPolicy} Pydantic model that consolidates all resource axes into
+a single validated, serialisable config object. The second is LangGraph's native
+\code{recursion\_limit}, a structural ceiling that fires regardless of
+application logic. The third is an application-level cycle counter checked by a
+routing function at the start of every cycle. The fourth is a suite of semantic
+detectors---infinite loop, stuck state, and goal divergence---each with its own
+dedicated recovery branch.
+
+Two-layer guard design is the central principle. Neither the LangGraph ceiling
+nor the application counter is sufficient on its own. Understanding why both are
+required, and why they must be independent, is the core engineering lesson of
+this chapter.
+
+%% ------------------------------------------------------------
+\section{\texttt{TerminationPolicy}: The Four-Axis Config Object}
+\label{sec:termination-policy}
+%% ------------------------------------------------------------
+
+Termination limits almost always start as constants in the code. A
+\code{MAX\_CYCLES = 10} at the top of \code{agent.py}, a
+\code{TOKEN\_BUDGET = 8000} two files away, a wall-clock check that someone
+added after an incident and stored in a config YAML under a different key name.
+Over time these constants diverge. Different task types need different limits.
+A deployment rolls out with the wrong value because there was no single place
+to update. A checkpoint is written with the constants at one set of values;
+the agent is resumed after the constants have changed.
+
+A single Pydantic \code{BaseModel} solves all of these at once.
+
+The choice of \code{BaseModel} over \code{@dataclass} is deliberate and
+consequential. Pydantic provides three things a dataclass does not: free JSON
+serialisation via \code{model\_dump()}, which means the policy can be stored
+inside \code{AgentState} and survive a checkpoint round-trip; field validators
+that enforce invariants at construction time, not at the first use of a value
+in a guard condition; and \code{model\_config = \{"frozen": True\}}, which makes
+the object immutable after construction so no node can silently relax a limit
+during a run.
+
+The four axes cover every dimension of runaway cost. \code{max\_cycles} bounds
+the number of complete Perceive-Reason-Act-Reflect iterations. \code{token\_ceiling}
+bounds cumulative token consumption across all model calls in the run.
+\code{wall\_clock\_timeout} bounds elapsed real time in seconds---useful for
+user-facing tasks where latency is a product requirement, not just a cost concern.
+\code{cost\_cap} bounds total spend in USD, not in tokens. The distinction between
+\code{token\_ceiling} and \code{cost\_cap} matters: a run that calls a cheap model
+twenty times may exhaust the token ceiling while staying well under the cost cap;
+a run that makes two calls to a premium model may breach the cost cap after a
+fraction of the token ceiling. Both axes are needed.
+
+\code{wall\_clock\_timeout} and \code{cost\_cap} are typed \code{float | None}.
+A policy with only \code{max\_cycles} and \code{token\_ceiling} set is valid;
+the orchestrator simply skips the checks for \code{None} axes. The alternative---
+omitting those fields entirely---creates a different, more dangerous situation:
+the code never checks for a wall-clock limit at all, so no future operator can
+enable it without a code change.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{TerminationPolicy}: validated, immutable, serialisable},
+  label={lst:terminationpolicy}]
+# src/agent/termination.py
+from pydantic import BaseModel, field_validator
+
+class TerminationPolicy(BaseModel):
+    max_cycles:         int
+    token_ceiling:      int
+    wall_clock_timeout: float | None = None  # seconds
+    cost_cap:           float | None = None  # USD
+    model_config = {"frozen": True}
+
+    @field_validator("max_cycles")
+    @classmethod
+    def max_cycles_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"max_cycles must be > 0, got {v}")
+        return v
+
+    @field_validator("token_ceiling")
+    @classmethod
+    def ceiling_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"token_ceiling must be > 0, got {v}"
+            )
+        return v
+\end{lstlisting}
+
+\begin{warningbox}
+Do not store a live \code{TerminationPolicy} instance in \code{AgentState}.
+The checkpointer serialises state as JSON; Pydantic objects are not
+JSON-serialisable by default. Store \code{policy.model\_dump()} and reconstruct
+with \code{TerminationPolicy.model\_validate(state["_policy"])} when a node needs
+the object. Chapter~3 shows this pattern in \code{make\_initial\_state}.
+\end{warningbox}
+
+%% ------------------------------------------------------------
+\section{LangGraph Native Recursion Guard: \texttt{recursion\_limit}
+         and \texttt{GraphRecursionError}}
+\label{sec:recursion-guard}
+%% ------------------------------------------------------------
+
+\code{recursion\_limit} is a structural property of the compiled graph. It is set
+in \code{b.compile(recursion\_limit=N)}, not in \code{config["configurable"]}.
+This distinction is not a naming convention---it reflects what the parameter
+actually controls. A \code{config["configurable"]} value can be changed per run
+because it is a per-run parameter passed through the runtime. \code{recursion\_limit}
+is baked into the compiled graph object; changing it requires recompiling.
+
+LangGraph counts \emph{node executions}, not cycles. A four-node graph running
+ten cycles executes 40 node steps. Setting \code{recursion\_limit = max\_cycles}
+would trigger after the first ten node steps---after two and a half cycles, not
+ten. The correct formula is \code{recursion\_limit = max\_cycles * 4} for a
+four-node graph, with headroom added for recovery and guard nodes.
+
+\code{recursion\_limit} is the last line of defence. It fires when every other
+limit has failed to stop the loop---when the application-level cycle counter
+was not incremented due to a node bug, when the token budget check was bypassed
+by an exception handler, when a routing bug caused the graph to cycle through
+a two-node sub-path rather than the full four-node path. It is structural: no
+amount of application code can suppress it once the node-step count is reached.
+
+An uncaught \code{GraphRecursionError} in production means the caller receives
+a Python exception instead of a structured \code{AgentRunResult}. The calling
+service crashes, logs a stack trace, and has no structured record of what the
+agent accomplished before it was stopped. Catching it explicitly and converting
+it to a \code{stopped\_by="recursion\_limit"} result is not optional.
+
+\begin{warningbox}
+Never raise \code{recursion\_limit} as a workaround for missing termination
+logic. The correct response to a loop that reaches the recursion limit is to
+add proper termination guards---not to increase the number. A higher limit is
+a more expensive infinite loop.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={\code{AgentRunResult} and \code{run\_agent} with explicit
+           \code{GraphRecursionError} handling},
+  label={lst:runner}]
+# src/agent/runner.py
+from dataclasses import dataclass
+from langgraph.errors import GraphRecursionError
+
+@dataclass
+class AgentRunResult:
+    state:      dict | None
+    stopped_by: str   # "completion" | "recursion_limit"
+
+def run_agent(
+    graph,
+    initial_state: dict,
+    config: dict,
+) -> AgentRunResult:
+    try:
+        result = graph.invoke(initial_state, config=config)
+        return AgentRunResult(state=result,
+                              stopped_by="completion")
+    except GraphRecursionError:
+        return AgentRunResult(state=None,
+                              stopped_by="recursion_limit")
+\end{lstlisting}
+
+The \code{stopped\_by} string becomes the \code{termination\_status} field in the
+final \code{CycleTrace} record (Chapter~1 \S\ref{sec:cycle-trace}). A result with
+\code{stopped\_by="recursion\_limit"} is incomplete even if the agent produced
+partial output. Logging it as a success because a \code{final\_answer} field
+happens to be present is a monitoring error.
+
+%% ------------------------------------------------------------
+\section{Application-Level Max-Cycle Policy: The Second Guard Layer}
+\label{sec:app-cycle-guard}
+%% ------------------------------------------------------------
+
+\code{recursion\_limit} alone is not sufficient. The failure mode it does not
+cover is the one that occurs when \code{cycle\_count} is not incremented
+correctly. Consider a node bug that returns an empty dict instead of
+\code{\{"cycle\_count": state["cycle\_count"] + 1\}}. From LangGraph's perspective,
+the graph is still executing---each node execution counts toward the recursion
+limit---but from the application's perspective, the cycle counter never advances.
+The application-level guard never fires. The graph hits \code{recursion\_limit}
+at \code{max\_cycles * 4} node steps, which may be far more than the intended
+number of semantic cycles.
+
+Application-level alone is also not sufficient. It depends entirely on the
+\code{cycle\_count} increment being correct in every code path. The
+\code{recursion\_limit} is structural: it counts node executions in the LangGraph
+runtime, independently of any value in \code{AgentState}. Application code
+cannot suppress it, reset it, or bypass it. These two independence properties
+are precisely why both layers are necessary.
+
+The application guard lives in \code{pre\_cycle\_gate}, a routing function inserted
+at the loop entry point. It runs before \code{perceive\_node} on every cycle. If
+either the cycle limit or the token floor is breached, it routes to a dedicated
+recovery node rather than continuing. The gate checks both axes so that there is
+one decision point at loop entry, not two separate routing functions that could
+fire at different times.
+
+\code{cycle\_count} is incremented inside \code{perceive\_node}, the first node
+of each cycle. It must not be incremented inside \code{reflect\_node}: if a cycle
+fails mid-execution and is retried, the count must reflect cycles \emph{entered},
+not cycles \emph{completed}. An incomplete cycle that consumed tokens still
+counts against the limit.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{pre\_cycle\_gate}: the two-check loop entry guard},
+  label={lst:precyclegate}]
+# src/agent/graph.py
+from src.agent.termination import TerminationPolicy
+
+_MINIMUM_SAFE_BUDGET = 500   # from src/agent/nodes/reason.py
+
+def pre_cycle_gate(state: AgentState) -> str:
+    policy = TerminationPolicy.model_validate(
+        state.get("_policy") or {}
+    )
+    if state["cycle_count"] >= policy.max_cycles:
+        return "cycle_limit_exceeded"
+    if state["token_budget"] < _MINIMUM_SAFE_BUDGET:
+        return "budget_exhausted"
+    return "perceive_node"
+
+def build_graph(policy: TerminationPolicy,
+                checkpointer=None):
+    b = StateGraph(AgentState)
+    b.add_node("perceive_node",        perceive_node)
+    b.add_node("reason_node",          reason_node)
+    b.add_node("action_node",          action_node)
+    b.add_node("reflect_node",         reflect_node)
+    b.add_node("cycle_limit_exceeded", cycle_limit_node)
+    b.add_node("budget_exhausted",     budget_exhausted_node)
+    b.set_conditional_entry_point(
+        pre_cycle_gate,
+        {"perceive_node":        "perceive_node",
+         "cycle_limit_exceeded": "cycle_limit_exceeded",
+         "budget_exhausted":     "budget_exhausted"},
+    )
+    # ... remaining edges omitted for brevity (see ss2.8)
+    return b.compile(
+        checkpointer=checkpointer,
+        recursion_limit=policy.max_cycles * 4,
+    )
+\end{lstlisting}
+
+\begin{notebox}
+\code{recursion\_limit} is derived from \code{policy.max\_cycles} at compile time,
+not from a hard-coded constant. This means the structural ceiling and the
+application ceiling are always proportional---a policy change updates both
+without requiring a separate edit to \code{compile()}.
+\end{notebox}
+
+%% ------------------------------------------------------------
+\section{Cumulative Token Budget: \texttt{token\_budget} Graceful Stop}
+\label{sec:token-budget}
+%% ------------------------------------------------------------
+
+Chapter~1's \code{reason\_node} raises \code{BudgetExhaustedError} when
+\code{token\_budget} falls below \code{\_MINIMUM\_SAFE\_BUDGET}. That behaviour
+is correct inside a unit test where the node is called in isolation. In
+production, an exception raised inside a node propagates uncaught through the
+graph unless explicitly handled by an error edge, producing the same unstructured
+failure outcome as an uncaught \code{GraphRecursionError}.
+
+The production pattern is different: the budget check moves to \code{pre\_cycle\_gate},
+before the node is ever invoked. When the gate detects a sub-threshold budget, it
+routes to \code{budget\_exhausted\_node}, which writes a structured
+\code{termination\_status} and routes to \code{END}. No exception is raised; the
+caller receives a clean \code{AgentRunResult}.
+
+\code{token\_budget} is a floor, not a count-up counter. It starts at
+\code{TerminationPolicy.token\_ceiling} and is decremented by \code{reason\_node}
+each cycle. It must never go negative: \code{max(0, remaining - used)} is the
+correct update expression. The floor semantics matter because the budget is also
+read by the \code{pre\_cycle\_gate} as a routing signal---a negative value would
+pass the \code{< \_MINIMUM\_SAFE\_BUDGET} check correctly, but any arithmetic on
+it in downstream nodes would produce nonsensical results.
+
+The \code{pre\_cycle\_gate} intentionally combines both checks---cycle count and
+token budget---into one routing function. Two separate routing functions at the
+loop entry would require two conditional entry points, which LangGraph does not
+natively support, and would also create an ordering dependency: which check fires
+first when both limits are breached simultaneously? A single gate with an explicit
+ordering (cycle count checked before token budget) is unambiguous.
+
+%% ------------------------------------------------------------
+\section{Infinite Loop Detector: \texttt{goal\_delta} and Repeated Actions}
+\label{sec:infinite-loop}
+%% ------------------------------------------------------------
+
+The cycle counter and token budget guard against \emph{resource overrun}.
+They do not guard against \emph{semantic stagnation}: a loop that executes
+correctly, calls tools successfully, decrements the budget, increments the cycle
+counter, and makes no real progress toward the goal. This is the infinite loop
+failure mode, and it is silent precisely because the instrumentation metrics
+all look healthy.
+
+The signal is \code{goal\_delta}, introduced in Chapter~1 \S\ref{sec:reflect}.
+\code{ReflectNode} emits \code{goal\_delta: Literal["ADVANCED", "NO\_CHANGE",
+"REGRESSED"]} in every \code{CycleTrace}. A single \code{NO\_CHANGE} is not
+alarm-worthy---a cycle that retrieved context without yet acting on it may
+legitimately report no goal advancement. Three consecutive \code{NO\_CHANGE}
+values, with the same tool being called each time, is the definition of an
+infinite loop.
+
+The detector is a pure function of \code{AgentState}. It reads
+\code{state["cycle\_traces"]}, inspects the last \code{window} entries, and
+returns a typed signal object. No model call, no I/O, no side effects. This
+makes it testable with synthetic trace sequences (\S\ref{sec:ch2-tests}) and
+cheap to run on every cycle.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{InfiniteLoopSignal}, \code{detect\_infinite\_loop}, and
+           \code{detect\_repeated\_action}},
+  label={lst:infiniteloop}]
+# src/agent/guards.py
+from dataclasses import dataclass
+from src.agent.state import AgentState
+
+@dataclass
+class InfiniteLoopSignal:
+    triggered:             bool
+    consecutive_no_change: int
+    repeated_action:       str | None  # tool name, or None
+
+def detect_repeated_action(
+    state: AgentState,
+    window: int = 3,
+) -> str | None:
+    traces = state.get("cycle_traces", [])
+    if len(traces) < window:
+        return None
+    recent = [t.get("action_invoked") for t in traces[-window:]]
+    if all(a is not None and a == recent[0] for a in recent):
+        return recent[0]
+    return None
+
+def detect_infinite_loop(
+    state: AgentState,
+    window: int = 3,
+) -> InfiniteLoopSignal:
+    traces = state.get("cycle_traces", [])
+    if len(traces) < window:
+        return InfiniteLoopSignal(
+            triggered=False,
+            consecutive_no_change=0,
+            repeated_action=None,
+        )
+    recent  = traces[-window:]
+    no_chg  = sum(1 for t in recent
+                  if t.get("goal_delta") == "NO_CHANGE")
+    rep_act = detect_repeated_action(state, window)
+    triggered = (no_chg >= window)
+    return InfiniteLoopSignal(
+        triggered=triggered,
+        consecutive_no_change=no_chg,
+        repeated_action=rep_act,
+    )
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={\code{loop\_guard\_node}: calls the detector and routes on trigger},
+  label={lst:loop-guard-node}]
+def loop_guard_node(state: AgentState) -> dict:
+    signal = detect_infinite_loop(state)
+    if signal.triggered:
+        return {
+            "reflect_decision": "ESCALATE",
+            "beliefs": [
+                f"[loop-guard] infinite loop detected: "
+                f"{signal.consecutive_no_change} consecutive "
+                f"NO_CHANGE cycles, "
+                f"repeated_action={signal.repeated_action}"
+            ],
+        }
+    return {}
+\end{lstlisting}
+
+%% ------------------------------------------------------------
+\section{Stuck-State Detector: No Valid Output for N Cycles}
+\label{sec:stuck-state}
+%% ------------------------------------------------------------
+
+A stuck state is distinct from an infinite loop. An infinite loop \emph{makes
+progress in form}---it calls tools, tools return results, \code{CycleTrace} records
+are written---while making no progress toward the goal. A stuck state does not
+even produce a valid next action: the model returns \code{ReasoningTrace} cycle
+after cycle without committing to either a tool call or a final answer.
+
+Chapter~1 \S\ref{sec:reason} established that a single \code{ReasoningTrace} is
+legitimate. The model may need to externalise an intermediate deliberation step
+before it is ready to commit to an action. What is not legitimate is \emph{N
+consecutive} \code{ReasoningTrace} outputs with no intervening \code{TOOL\_CALL}
+or \code{FINAL\_ANSWER}. That pattern means the model is circling without
+committing---a symptom of an under-specified goal, an ambiguous tool set, or a
+prompt that encourages over-deliberation.
+
+The detection signal is \code{CycleTrace.reason\_output\_type}. The stuck-state
+detector reads the last \code{window} traces and counts entries where
+\code{reason\_output\_type} is neither \code{"TOOL\_CALL"} nor
+\code{"FINAL\_ANSWER"}. When the count equals \code{window}, the detector
+triggers.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{StuckStateSignal} and \code{detect\_stuck\_state}},
+  label={lst:stuckstate}]
+@dataclass
+class StuckStateSignal:
+    triggered:               bool
+    consecutive_non_actions: int
+    last_output_types:       list[str]
+
+def detect_stuck_state(
+    state: AgentState,
+    window: int = 3,
+) -> StuckStateSignal:
+    traces = state.get("cycle_traces", [])
+    if len(traces) < window:
+        return StuckStateSignal(
+            triggered=False,
+            consecutive_non_actions=0,
+            last_output_types=[],
+        )
+    recent = traces[-window:]
+    types  = [t.get("reason_output_type", "") for t in recent]
+    non_actions = sum(
+        1 for ot in types
+        if ot not in ("TOOL_CALL", "FINAL_ANSWER")
+    )
+    return StuckStateSignal(
+        triggered=(non_actions >= window),
+        consecutive_non_actions=non_actions,
+        last_output_types=types,
+    )
+
+def stuck_state_guard_node(state: AgentState) -> dict:
+    signal = detect_stuck_state(state)
+    if signal.triggered:
+        return {
+            "reflect_decision": "ESCALATE",
+            "beliefs": [
+                f"[stuck-guard] {signal.consecutive_non_actions} "
+                f"consecutive non-action outputs: "
+                f"{signal.last_output_types}"
+            ],
+        }
+    return {}
+\end{lstlisting}
+
+%% ------------------------------------------------------------
+\section{Goal Divergence Detector: Cosine Distance and Rollback}
 \label{sec:goal-divergence}
-% TODO
+%% ------------------------------------------------------------
 
-\section{GraphRecursionError Handling}
-\label{sec:recursion-error}
-% TODO
+Goal divergence is the most dangerous failure mode covered in this chapter.
+An infinite loop and a stuck state are both visible in the metrics: cycle count
+advances without a \code{FINAL\_ANSWER}, or \code{reason\_output\_type} shows
+a long run of \code{REASONING\_TRACE}. Goal divergence is invisible in the same
+metrics: the loop is executing, tools are being called, \code{goal\_delta} may
+even show \code{ADVANCED} occasionally---but the agent is advancing toward the
+wrong objective.
 
-\section{Idempotency and Safe Retry}
-\label{sec:idempotency}
-% TODO
+This happens because the \code{goal} field in \code{AgentState} is immutable
+by convention, not by runtime enforcement. As the \code{beliefs} list grows and
+the model's sliding context window fills with tool results and prior reasoning,
+the original goal text recedes. The model continues to reason about the most
+recent beliefs, which may have accumulated around a subtask rather than the
+primary objective. The agent is solving a problem---just not the right one.
+
+Embedding-based cosine distance gives a quantitative measure of this drift.
+The original goal is embedded once at graph entry and stored in
+\code{AgentState.goal\_embedding}. At each detection check, the current goal
+summary---reconstructed from the most recent beliefs or explicitly tracked---is
+embedded and compared. When the cosine \emph{distance} exceeds
+\code{DIVERGENCE\_THRESHOLD = 0.25}, the detector triggers.
+
+Two cost concerns must be addressed. First, embedding is not free: a single
+embedding call costs tokens and adds latency. The solution is to cache the
+original embedding in \code{AgentState} (one call at entry, never again) and
+to check divergence only every \code{N\_DIVERGENCE\_CHECK\_INTERVAL} cycles
+(default 5), not every cycle. Second, the check-interval must be calibrated
+against the expected run length: checking every 5 cycles in a 6-cycle run means
+the detector fires only once, which is sufficient.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{cosine\_distance}, \code{embed\_text},
+           and \code{detect\_goal\_divergence}},
+  label={lst:goaldivergence-fns}]
+import math
+from litellm import embedding as litellm_embedding
+
+_EMBED_MODEL              = "text-embedding-3-small"
+DIVERGENCE_THRESHOLD      = 0.25
+N_DIVERGENCE_CHECK_INTERVAL = 5
+
+def embed_text(text: str) -> list[float]:
+    resp = litellm_embedding(model=_EMBED_MODEL, input=[text])
+    return resp.data[0]["embedding"]
+
+def cosine_distance(
+    a: list[float], b: list[float]
+) -> float:
+    dot   = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(y * y for y in b))
+    if mag_a == 0 or mag_b == 0:
+        return 1.0
+    return 1.0 - dot / (mag_a * mag_b)
+
+@dataclass
+class GoalDivergenceSignal:
+    triggered:           bool
+    cosine_distance:     float
+    rollback_checkpoint: str | None
+
+def detect_goal_divergence(
+    state: AgentState,
+    threshold: float = DIVERGENCE_THRESHOLD,
+) -> GoalDivergenceSignal:
+    orig_emb = state.get("goal_embedding")
+    if orig_emb is None:
+        return GoalDivergenceSignal(
+            triggered=False, cosine_distance=0.0,
+            rollback_checkpoint=None)
+    current_summary = " ".join(
+        state.get("beliefs", [])[-3:]
+    ) or state["goal"]
+    curr_emb = embed_text(current_summary)
+    dist     = cosine_distance(orig_emb, curr_emb)
+    return GoalDivergenceSignal(
+        triggered=(dist > threshold),
+        cosine_distance=dist,
+        rollback_checkpoint=None,  # set by guard node
+    )
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={\code{goal\_divergence\_guard\_node}: every-N-cycles check with rollback},
+  label={lst:goaldivergence-node}]
+def goal_divergence_guard_node(
+    state: AgentState,
+    config: dict,
+) -> dict:
+    cycle = state.get("cycle_count", 0)
+    last  = state.get("goal_divergence_checked_at") or 0
+    if cycle - last < N_DIVERGENCE_CHECK_INTERVAL:
+        return {}  # not yet due for a check
+
+    signal = detect_goal_divergence(state)
+    updates: dict = {
+        "goal_divergence_checked_at": cycle
+    }
+    if signal.triggered:
+        updates["reflect_decision"] = "ESCALATE"
+        updates["beliefs"] = [
+            f"[divergence-guard] cosine distance "
+            f"{signal.cosine_distance:.3f} exceeds threshold "
+            f"{DIVERGENCE_THRESHOLD}; initiating rollback"
+        ]
+    return updates
+\end{lstlisting}
+
+\begin{tipbox}
+Chapter~6 covers embedding model selection in detail. For the divergence
+detector, latency and cost matter more than quality: the goal embedding is a
+short text compared to another short text. \code{text-embedding-3-small} is
+an appropriate default. Chapter~6 also shows how to cache the model's tokeniser
+for faster batch embedding when multiple agents are running concurrently.
+\end{tipbox}
+
+%% ------------------------------------------------------------
+\section{Per-Failure-Mode LangGraph Recovery Branches}
+\label{sec:recovery-branches}
+%% ------------------------------------------------------------
+
+Three detectors produce three different signals, and those signals require three
+different recovery strategies. Routing all three to a single
+\code{failure\_node} is the obvious shortcut, and it is the wrong one: the
+recovery from an infinite loop (increment a retry counter, check if the retry
+ceiling is reached, escalate if so) is completely different from the recovery
+from a stuck state (escalate to a human handoff immediately) and from the
+recovery from goal divergence (roll back to the last aligned checkpoint, re-anchor
+the goal in beliefs, re-enter the perceive cycle).
+
+Merging these paths into a generic handler means that the most expensive
+recovery action---checkpoint rollback with goal re-anchoring---runs for a loop
+that could have been resolved with a simple retry increment. It also means that
+the \code{termination\_status} field in the \code{CycleTrace} becomes meaningless:
+``failure'' instead of ``infinite loop after N cycles'' or ``goal drift above
+threshold at cycle K''.
+
+Each guard node returns a routing signal via \code{reflect\_decision}. The
+routing function after the guard layer reads that value and directs the run to
+the appropriate recovery node. Recovery nodes write a structured
+\code{termination\_status} and route to \code{END}---except
+\code{goal\_divergence\_recovery\_node}, which routes back to \code{perceive\_node}
+after re-anchoring the goal.
+
+\begin{lstlisting}[language=Python,
+  caption={Three recovery nodes with distinct strategies},
+  label={lst:recovery-nodes}]
+# src/agent/guards.py  (continued)
+
+def infinite_loop_recovery_node(
+    state: AgentState,
+) -> dict:
+    policy = TerminationPolicy.model_validate(
+        state.get("_policy") or {}
+    )
+    retries = state.get("_retry_count", 0) + 1
+    if retries >= getattr(policy, "max_retries", 3):
+        return {
+            "reflect_decision": "ESCALATE",
+            "final_answer": (
+                f"Infinite loop detected after {retries} retries; "
+                "escalating."
+            ),
+            "_retry_count": retries,
+        }
+    return {
+        "reflect_decision": "RETRY",
+        "_retry_count":     retries,
+    }
+
+def stuck_state_recovery_node(
+    state: AgentState,
+) -> dict:
+    return {
+        "reflect_decision": "ESCALATE",
+        "final_answer": (
+            "Agent is stuck: no valid action produced after "
+            "3 consecutive cycles. Escalating for human review."
+        ),
+    }
+
+def goal_divergence_recovery_node(
+    state: AgentState,
+    config: dict,
+) -> dict:
+    goal = state["goal"]
+    return {
+        "beliefs":          [f"[divergence-recovery] goal "
+                             f"re-anchored: {goal}"],
+        "reflect_decision": None,  # clear stale decision
+    }
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={\code{build\_graph} with guard nodes, recovery nodes, and wiring},
+  label={lst:graph-ch2}]
+def build_graph(
+    policy: TerminationPolicy,
+    checkpointer=None,
+):
+    b = StateGraph(AgentState)
+    # -- core nodes --
+    for name, fn in [
+        ("perceive_node",  perceive_node),
+        ("reason_node",    reason_node),
+        ("action_node",    action_node),
+        ("reflect_node",   reflect_node),
+    ]:
+        b.add_node(name, fn)
+    # -- resource limit nodes --
+    b.add_node("cycle_limit_exceeded",  cycle_limit_node)
+    b.add_node("budget_exhausted",      budget_exhausted_node)
+    # -- guard nodes --
+    b.add_node("loop_guard_node",       loop_guard_node)
+    b.add_node("stuck_state_guard_node",stuck_state_guard_node)
+    b.add_node("goal_divergence_guard", goal_divergence_guard_node)
+    # -- recovery nodes --
+    b.add_node("infinite_loop_recovery",   infinite_loop_recovery_node)
+    b.add_node("stuck_state_recovery",     stuck_state_recovery_node)
+    b.add_node("goal_divergence_recovery", goal_divergence_recovery_node)
+    # -- entry --
+    b.set_conditional_entry_point(
+        pre_cycle_gate,
+        {"perceive_node":        "perceive_node",
+         "cycle_limit_exceeded": "cycle_limit_exceeded",
+         "budget_exhausted":     "budget_exhausted"},
+    )
+    # -- core loop --
+    b.add_edge("perceive_node", "reason_node")
+    b.add_conditional_edges(
+        "reason_node", route_from_reason,
+        {"action_node":   "action_node",
+         "perceive_node": "perceive_node", "end": END})
+    b.add_edge("action_node",  "reflect_node")
+    b.add_edge("reflect_node", "loop_guard_node")
+    b.add_edge("loop_guard_node", "stuck_state_guard_node")
+    b.add_edge("stuck_state_guard_node", "goal_divergence_guard")
+    # -- guard routing --
+    b.add_conditional_edges(
+        "goal_divergence_guard", _route_after_guards,
+        {"infinite_loop_recovery":   "infinite_loop_recovery",
+         "stuck_state_recovery":     "stuck_state_recovery",
+         "goal_divergence_recovery": "goal_divergence_recovery",
+         "continue":                 "perceive_node",
+         "end":                      END})
+    # -- recovery exits --
+    b.add_conditional_edges(
+        "infinite_loop_recovery", _route_after_recovery,
+        {"perceive_node": "perceive_node", "end": END})
+    b.add_edge("stuck_state_recovery",     END)
+    b.add_edge("goal_divergence_recovery", "perceive_node")
+    b.add_edge("cycle_limit_exceeded",     END)
+    b.add_edge("budget_exhausted",         END)
+    return b.compile(
+        checkpointer=checkpointer,
+        recursion_limit=policy.max_cycles * 4,
+    )
+\end{lstlisting}
+
+%% ------------------------------------------------------------
+\section{Test Suite: Guard Triggering Tests}
+\label{sec:ch2-tests}
+%% ------------------------------------------------------------
+
+Every detector in this chapter is a pure function of \code{AgentState}. No
+compiled graph is required to test them. Tests construct synthetic
+\code{cycle\_traces} lists using a \code{make\_cycle\_trace} helper and pass
+them directly to the detector functions. This makes the test cases fast,
+deterministic, and independent of LangGraph's execution engine.
+
+The \code{GraphRecursionError} path requires one integration test: a minimal
+graph compiled with \code{recursion\_limit=2} and a node that always returns
+\code{CONTINUE}, invoked via \code{run\_agent} to confirm the error is caught
+and converted to a structured result.
+
+\begin{lstlisting}[language=Python,
+  caption={Guard test fixture and detector unit tests},
+  label={lst:guard-tests}]
+# tests/test_guards.py
+from src.agent.guards import (
+    detect_infinite_loop, detect_stuck_state,
+    detect_goal_divergence,
+)
+from unittest.mock import patch
+
+def make_cycle_trace(
+    goal_delta:         str       = "NO_CHANGE",
+    reason_output_type: str       = "REASONING_TRACE",
+    action_invoked:     str|None  = None,
+) -> dict:
+    return {
+        "goal_delta":          goal_delta,
+        "reason_output_type":  reason_output_type,
+        "action_invoked":      action_invoked,
+    }
+
+def _state_with_traces(traces: list[dict]) -> dict:
+    return {"cycle_traces": traces, "goal": "test goal",
+            "beliefs": [], "goal_embedding": None,
+            "goal_divergence_checked_at": None,
+            "cycle_count": len(traces)}
+
+def test_infinite_loop_triggers_after_3_no_change():
+    traces = [make_cycle_trace(goal_delta="NO_CHANGE",
+                               action_invoked="fetch_report")] * 3
+    sig = detect_infinite_loop(_state_with_traces(traces))
+    assert sig.triggered
+    assert sig.consecutive_no_change == 3
+    assert sig.repeated_action == "fetch_report"
+
+def test_infinite_loop_no_trigger_below_window():
+    traces = [make_cycle_trace(goal_delta="NO_CHANGE")] * 2
+    assert not detect_infinite_loop(
+        _state_with_traces(traces)).triggered
+
+def test_stuck_state_triggers_after_3_reasoning_traces():
+    traces = [make_cycle_trace(
+        reason_output_type="REASONING_TRACE")] * 3
+    sig = detect_stuck_state(_state_with_traces(traces))
+    assert sig.triggered
+    assert sig.consecutive_non_actions == 3
+
+def test_stuck_state_no_trigger_with_tool_call():
+    traces = [
+        make_cycle_trace(reason_output_type="REASONING_TRACE"),
+        make_cycle_trace(reason_output_type="TOOL_CALL"),
+        make_cycle_trace(reason_output_type="REASONING_TRACE"),
+    ]
+    assert not detect_stuck_state(
+        _state_with_traces(traces)).triggered
+
+def test_goal_divergence_triggers_above_threshold():
+    orig_emb = [1.0, 0.0]
+    with patch("src.agent.guards.embed_text",
+               return_value=[0.0, 1.0]):
+        state = _state_with_traces([])
+        state["goal_embedding"] = orig_emb
+        state["beliefs"]        = ["drifted context"]
+        sig = detect_goal_divergence(state, threshold=0.1)
+    assert sig.triggered
+    assert sig.cosine_distance > 0.1
+
+def test_goal_divergence_no_trigger_below_threshold():
+    orig_emb = [1.0, 0.0]
+    with patch("src.agent.guards.embed_text",
+               return_value=[0.99, 0.14]):
+        state = _state_with_traces([])
+        state["goal_embedding"] = orig_emb
+        state["beliefs"]        = ["still on track"]
+        sig = detect_goal_divergence(state, threshold=0.25)
+    assert not sig.triggered
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={\code{test\_graphrecursion\_caught\_by\_runner}: integration test},
+  label={lst:runner-test}]
+# tests/test_runner.py
+from langgraph.graph import StateGraph, END
+from src.agent.runner import run_agent, AgentRunResult
+from src.agent.termination import TerminationPolicy
+from src.agent.state import AgentState
+
+def test_graphrecursion_caught_by_runner():
+    """A graph that always loops must return stopped_by=recursion_limit."""
+    b = StateGraph(AgentState)
+
+    def looping_node(state):
+        return {"cycle_count": state["cycle_count"] + 1}
+
+    b.add_node("looping_node", looping_node)
+    b.set_entry_point("looping_node")
+    b.add_edge("looping_node", "looping_node")
+    graph = b.compile(recursion_limit=2)
+
+    policy  = TerminationPolicy(max_cycles=10,
+                                 token_ceiling=8000)
+    initial = {"cycle_count": 0, "token_budget": 8000,
+               "goal": "test", "beliefs": [],
+               "intentions": [], "messages": [],
+               "cycle_traces": [], "last_action": None,
+               "reflect_decision": None,
+               "final_answer": None, "_policy": None,
+               "goal_embedding": None,
+               "goal_divergence_checked_at": None,
+               "_recovery_cycle": False,
+               "schema_version": 2}
+    result = run_agent(graph, initial, config={})
+    assert result.stopped_by == "recursion_limit"
+    assert result.state is None
+\end{lstlisting}
+
+Chapter~28 extends this suite to full integration tests: a compiled production
+graph with \code{SqliteSaver} checkpointing, synthetic multi-cycle state
+sequences that exercise every detector and every recovery branch, and assertions
+on the complete \code{CycleTrace} record emitted by each run.
+
+\begin{takeawaybox}
+Termination is a first-class design problem, not an afterthought. Every
+production agent needs four independent axes of resource protection:
+\code{max\_cycles}, \code{token\_ceiling}, \code{wall\_clock\_timeout}, and
+\code{cost\_cap}---collected in a single \code{TerminationPolicy} object that is
+validated at construction and immutable at runtime. Two guard layers are required
+because neither alone is sufficient: \code{recursion\_limit} is structural and
+cannot be bypassed, but knows nothing about semantic progress;
+the application cycle counter knows about semantic progress, but can be defeated
+by a node bug that skips the increment. Three semantic detectors protect against
+failures that resource limits cannot see: infinite loops (\code{goal\_delta}
+stagnant across N cycles), stuck states (\code{reason\_output\_type} producing no
+valid action for N cycles), and goal divergence (cosine distance between original
+and current goal embedding above threshold). Each detector routes to its own
+dedicated recovery node because recovery strategies are not interchangeable.
+Chapter~3 asks the question that follows naturally: once the agent stops, whether
+cleanly or by a guard, what state has it left behind, and how can that state be
+resumed safely?
+\end{takeawaybox}
