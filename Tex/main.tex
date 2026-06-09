@@ -1,0 +1,190 @@
+%!TEX program = xelatex
+%% ============================================================
+%%  MAIN ENTRY POINT
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%
+%%  Compile: latexmk -xelatex -f -interaction=nonstopmode
+%%           -output-directory=Tex/Output Tex/main.tex
+%% ============================================================
+
+\input{Tex/preamble}
+
+\gdef\theBookTitle{Production-Grade Agentic AI}
+\gdef\theBookSubtitle{LangGraph + Python Frameworks}
+\gdef\theBookAuthor{Haythem Aber}
+\gdef\theBookYear{2026}
+\gdef\theBookDate{June 2026}
+\gdef\theBookVolume{Volume 1}
+\gdef\theBookVolumeScope{From Core Loop to Production Systems}
+
+\newcommand{\makehalftitle}{%
+  \cleardoublepage\thispagestyle{empty}\vspace*{\fill}
+  \begin{center}
+    {\sffamily\LARGE\bfseries\color{BookBlue}\theBookTitle}
+  \end{center}
+  \vspace*{\fill}\clearpage}
+
+\newcommand{\makecover}{%
+  \begin{titlepage}\thispagestyle{empty}\vspace*{2cm}
+    \begin{center}
+      {\sffamily\large\scshape\theBookVolume\par}\vspace{0.3cm}
+      {\sffamily\small\itshape\theBookVolumeScope\par}\vspace{1.2cm}
+      \hrule height 0.5pt\par\vspace{1.2cm}
+      {\sffamily\fontsize{38}{46}\bfseries\selectfont\theBookTitle\par}
+      \vspace{1.2cm}\hrule height 0.5pt\par\vspace{0.8cm}
+      {\sffamily\fontsize{11}{14}\selectfont\theBookSubtitle\par}
+      \vspace{1.5cm}{\sffamily\Large\theBookAuthor\par}\vfill
+      {\sffamily\normalsize\theBookDate\par}\vspace{0.5cm}
+    \end{center}
+  \end{titlepage}\nopagecolor}
+
+\newcommand{\makecopyright}{%
+  \thispagestyle{empty}\vspace*{\fill}
+  \begin{small}
+    \noindent\textit{\theBookTitle}\\
+    \textit{\theBookSubtitle}\\
+    \textit{\theBookVolume: \theBookVolumeScope}\\[12pt]
+    \noindent Copyright \textcopyright{} \theBookYear\ \theBookAuthor.
+    All rights reserved.\\[8pt]
+    \noindent No part of this publication may be reproduced,
+    distributed, or transmitted without prior written permission
+    of the author.\\[8pt]
+    \noindent\textbf{Permissions:} Contact the author directly.\\[8pt]
+    \noindent First edition. \theBookDate.
+  \end{small}
+  \vspace*{\fill}\clearpage}
+
+\newcommand{\makededication}[1]{%
+  \cleardoublepage\thispagestyle{empty}\vspace*{\fill}
+  \begin{center}\itshape #1\end{center}
+  \vspace*{\fill}\clearpage}
+
+\newenvironment{preface}{%
+  \cleardoublepage
+  \chapter*{Preface}
+  \addcontentsline{toc}{chapter}{Preface}
+  \markboth{Preface}{Preface}%
+}{\clearpage}
+
+\pretocmd{\tableofcontents}{\cleardoublepage}{}{}
+\setcounter{tocdepth}{1}
+
+%% ============================================================
+\begin{document}
+%% ============================================================
+
+\frontmatter
+\makehalftitle
+\makecover
+\makecopyright
+\makededication{%
+  The loop that does not observe itself\\  
+  cannot know when to stop.}
+
+\begin{preface}
+% TODO: preface text
+\end{preface}
+
+\tableofcontents
+
+%% ============================================================
+\mainmatter
+%% ============================================================
+
+%%  PART 1: The Core Agent Loop
+\part{The Core Agent Loop}
+\label{part:core-loop}
+
+\chapter{The Core Loop}
+\label{ch:core-loop}
+\input{Tex/chapters/chapter01}
+
+\chapter{Loop Safety and Termination}
+\label{ch:loop-safety}
+\input{Tex/chapters/chapter02}
+
+\chapter{Checkpointing and State Persistence}
+\label{ch:checkpointing}
+\input{Tex/chapters/chapter03}
+
+\partclose{End of Part~1 --- The loop is built and safe.\\Part~2 gives it memory.}
+
+%%  PART 2: Memory Architecture
+\part{Memory Architecture}
+\label{part:memory}
+
+\chapter{Short-Term Memory and Context Management}
+\label{ch:short-term-memory}
+\input{Tex/chapters/chapter04}
+
+\chapter{Long-Term Memory and Retrieval}
+\label{ch:long-term-memory}
+\input{Tex/chapters/chapter05}
+
+\chapter{Procedural Memory and Tool Registry}
+\label{ch:procedural-memory}
+\input{Tex/chapters/chapter06}
+
+\partclose{End of Part~2 --- The agent remembers.\\Part~3 gives it tools.}
+
+%%  PART 3: Tool and Action Layer
+\part{Tool and Action Layer}
+\label{part:tools}
+
+\chapter{Tool Design and the MCP Interface}
+\label{ch:tool-design}
+\input{Tex/chapters/chapter07}
+
+\chapter{Structured Output and Instructor}
+\label{ch:structured-output}
+\input{Tex/chapters/chapter08}
+
+\chapter{LiteLLM: Provider Abstraction and Fallback Routing}
+\label{ch:litellm}
+\input{Tex/chapters/chapter09}
+
+\partclose{End of Part~3 --- The agent acts.\\Part~4 makes it observable.}
+
+%%  PART 4: Observability
+\part{Observability}
+\label{part:observability}
+
+\chapter{Langfuse Instrumentation}
+\label{ch:langfuse}
+\input{Tex/chapters/chapter10}
+
+\chapter{Prompt Architecture and Context Assembly}
+\label{ch:prompt-architecture}
+\input{Tex/chapters/chapter11}
+
+\chapter{Evaluation and Quality Gates}
+\label{ch:evaluation}
+\input{Tex/chapters/chapter12}
+
+\partclose{End of Part~4 --- The agent is observable.\\Part~5 secures it.}
+
+%%  PART 5: Security and Production Hardening
+\part{Security and Production Hardening}
+\label{part:security}
+
+\chapter{Security: PII, Prompt Injection, and Secrets}
+\label{ch:security}
+\input{Tex/chapters/chapter13}
+
+\chapter{Human-in-the-Loop Patterns}
+\label{ch:hitl}
+\input{Tex/chapters/chapter14}
+
+\chapter{Multi-Agent Coordination}
+\label{ch:multi-agent}
+\input{Tex/chapters/chapter15}
+
+\partclose{End of Part~5 --- The agent is production-ready.}
+
+%% ============================================================
+\backmatter
+%% ============================================================
+
+\printindex
+
+\end{document}

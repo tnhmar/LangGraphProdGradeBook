@@ -1,0 +1,781 @@
+%% ============================================================
+%%  Chapter 1 — The Core Loop
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
+
+\chapterquote{A good decision-making system is not one that never fails. It is
+one that detects failure fast and corrects course before the damage
+compounds.}{John Boyd, adapted}
+
+A single LLM call can answer a question. It cannot own a goal.
+
+That sentence describes the boundary between a language model application and an
+agent system, and it is the boundary this entire book is concerned with crossing
+responsibly. The moment a task requires a second step that depends on the result
+of the first---retrieve a document, compare it to prior data, decide what to do
+based on what you found---a one-shot model call is structurally insufficient. Not
+because the model lacks reasoning quality, but because the surrounding system
+lacks the orchestration to carry state, invoke tools, evaluate outcomes, and
+decide what comes next.
+
+This chapter builds the smallest complete agent loop you can put into production.
+By the end, you will have a \code{StateGraph} with four typed nodes---Perceive,
+Reason, Act, Reflect---wired by conditional edges, compiled with a checkpointer,
+and instrumented with Langfuse spans on every node. Every design decision in that
+loop is explained: why \code{TypedDict} coexists with Pydantic~v2, why reflection
+is a typed control function rather than a narrative addition, why \code{.compile()}
+is an architectural boundary and not a formality, and why cycle traces are
+operational artifacts rather than optional debug output.
+
+The running example throughout Part~I is an earnings-report agent: its task is to
+retrieve a quarterly earnings report, compare flagged risk metrics to
+prior-quarter thresholds, and produce a structured summary with escalation
+signals. It is a genuine multi-step task---later steps depend on earlier results,
+tool outputs shape plan revisions, and termination is not self-evident.
+
+%% ------------------------------------------------------------
+\section{AgentState: TypedDict + Pydantic~v2}
+\label{sec:agentstate}
+%% ------------------------------------------------------------
+
+The state schema is the first thing you design, not the last. Before tools,
+before prompts, before model selection, you define the data contract that all
+nodes read and all nodes update. Everything else follows from it.
+
+LangGraph requires state to be a \code{TypedDict}. This is not a
+preference---it is a runtime constraint. LangGraph's graph executor, reducers,
+checkpointer serialization, and streaming machinery all work over plain Python
+dicts. Pydantic \code{BaseModel} instances carry methods, validators, and
+metaclass machinery that conflict with this merge model.
+
+The solution is to use both, at their correct boundaries. \code{AgentState} is a
+\code{TypedDict} used internally by the graph at runtime. \code{AgentStateInput}
+is a Pydantic~v2 \code{BaseModel} used as the validation gateway at the entry
+point---when external code constructs an initial state before the first graph
+invocation.
+
+\begin{lstlisting}[language=Python, caption={\code{AgentState} TypedDict and
+\code{AgentStateInput} Pydantic model}, label={lst:agentstate}]
+# src/agent/state.py
+from typing import TypedDict, Annotated
+from operator import add
+
+class AgentState(TypedDict):
+    goal: str                            # immutable; set at entry
+    beliefs: Annotated[list[str], add]   # append-only reducer
+    intentions: Annotated[list[str], add]
+    token_budget: int                    # hard ceiling, never None
+    cycle_count: int                     # managed by orchestrator
+    messages: Annotated[list[dict], add]
+    last_action: dict | None
+    reflect_decision: str | None
+    final_answer: str | None
+
+from pydantic import BaseModel, field_validator
+
+class AgentStateInput(BaseModel):
+    goal: str
+    token_budget: int
+    model_config = {"frozen": True}
+
+    @field_validator("token_budget")
+    @classmethod
+    def budget_must_be_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"token_budget must be > 0, got {v}")
+        return v
+
+    @field_validator("goal")
+    @classmethod
+    def goal_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("goal must not be empty")
+        return v.strip()
+
+def make_initial_state(inp: AgentStateInput) -> AgentState:
+    return AgentState(
+        goal=inp.goal,
+        beliefs=[],
+        intentions=[],
+        token_budget=inp.token_budget,
+        cycle_count=0,
+        messages=[],
+        last_action=None,
+        reflect_decision=None,
+        final_answer=None,
+    )
+\end{lstlisting}
+
+The \code{Annotated[list[str], add]} fields use LangGraph's built-in reducer.
+When a node returns \code{{"beliefs": ["new observation"]}}, LangGraph appends
+to the existing list rather than replacing it.
+
+The BDI mapping is intentional. \term{goal} is the desire---the objective the
+agent pursues. \term{beliefs} is the belief store---the agent's accumulating
+record of what it has observed. \term{intentions} is the intention
+list---committed next steps derived from the current plan.
+
+\begin{warningbox}
+\code{token\_budget} set to \code{None} does not raise a runtime error---it
+silently propagates until a comparison against an integer fails deep inside a
+node. The Pydantic validator here is cheap insurance that prevents a class of
+production bugs that are extremely frustrating to trace. Never ship a graph entry
+point without it.
+\end{warningbox}
+
+%% ------------------------------------------------------------
+\section{PerceiveNode: Sensory Filtering and PII Redaction}
+\label{sec:perceive}
+%% ------------------------------------------------------------
+
+Perception is the most under-engineered layer in most agent systems. PII that
+enters \code{beliefs} or \code{messages} can leak into tool call arguments, audit
+logs, and Langfuse traces. Malformed tool responses injected raw into the context
+produce reasoning failures that look like model errors.
+
+The Perceive node has three responsibilities: redact PII at ingestion, validate
+incoming data shape, and truncate oversized inputs before they enter the context.
+
+PII redaction uses Microsoft Presidio rather than regex patterns. Presidio's
+\code{AnalyzerEngine} runs a pretrained NER model that generalises across names,
+emails, phone numbers, national IDs, and financial identifiers without a pattern
+library to maintain.
+
+\begin{lstlisting}[language=Python, caption={\code{perceive\_node} with Presidio
+redaction and \code{@observe} instrumentation},
+label={lst:perceive}]
+# src/agent/nodes/perceive.py
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from langfuse.decorators import observe, langfuse_context
+from ..state import AgentState
+
+_analyzer  = AnalyzerEngine()
+_anonymizer = AnonymizerEngine()
+
+def redact_pii(text: str, language: str = "en") -> tuple[str, int]:
+    results = _analyzer.analyze(text=text, language=language)
+    if not results:
+        return text, 0
+    anonymized = _anonymizer.anonymize(text=text,
+                                        analyzer_results=results)
+    return anonymized.text, len(results)
+
+def _truncate_if_needed(text: str, max_chars: int = 4000) -> str:
+    if len(text) <= max_chars:
+        return text
+    return (text[:max_chars]
+            + f"\n[truncated -- {len(text) - max_chars} chars removed]")
+
+@observe(name="perceive_node")
+def perceive_node(state: AgentState) -> dict:
+    updates: dict = {}
+    redaction_count = 0
+    messages = state.get("messages", [])
+    if messages:
+        last_msg = messages[-1]
+        if last_msg.get("role") == "tool":
+            raw = last_msg.get("content", "")
+            truncated = _truncate_if_needed(raw)
+            redacted, n = redact_pii(truncated)
+            redaction_count += n
+            if redacted != raw:
+                updates["_last_tool_content_redacted"] = redacted
+    if messages:
+        last = messages[-1]
+        preview = str(last.get("content", ""))[:120]
+        updates["beliefs"] = [
+            f"[cycle {state['cycle_count']}] "
+            f"{last.get('role','unknown')}: {preview}"
+        ]
+    langfuse_context.update_current_observation(
+        metadata={
+            "cycle_count":     state["cycle_count"],
+            "redaction_count": redaction_count,
+            "message_count":   len(messages),
+        })
+    return updates
+\end{lstlisting}
+
+The \code{@observe(name="perceive\_node")} decorator wraps the node function
+directly. Wrapping the graph runner would produce a single top-level span with no
+per-node breakdown---operationally useless for diagnosing which node in a
+ten-cycle run first produced an error.
+
+\begin{tipbox}
+Run \code{presidio-analyzer} in a separate process for high-throughput production
+workloads. The NER model initialisation is expensive. The module-level
+\code{\_analyzer} instance is sufficient for development and moderate loads; for
+production consider serving Presidio as a sidecar.
+\end{tipbox}
+
+%% ------------------------------------------------------------
+\section{ReasonNode: LiteLLM \texorpdfstring{$\to$}{->} Instructor
+\texorpdfstring{$\to$}{->} Typed Union Output}
+\label{sec:reason}
+%% ------------------------------------------------------------
+
+The Reason node is where the model call happens. But the model call is the middle
+of the node, not the whole node. Before the call: assemble context, check the
+token budget, route to the correct model. After the call: deduct tokens consumed,
+parse the output into a typed object the orchestrator can act on mechanically.
+
+LiteLLM provides the provider abstraction. Instructor patches the LiteLLM client
+to add structured output enforcement via function calling or JSON mode, validates
+the response against the target Pydantic schema, and retries automatically on
+parse failure. The output type is a discriminated union:
+
+\begin{lstlisting}[language=Python, caption={Discriminated union output types and
+\code{reason\_node}}, label={lst:reason}]
+# src/agent/nodes/reason.py
+from typing import Literal
+from pydantic import BaseModel
+import instructor, litellm
+from langfuse.decorators import observe, langfuse_context
+from ..state import AgentState
+
+client = instructor.patch(litellm)
+
+class ToolRequest(BaseModel):
+    type: Literal["tool_request"] = "tool_request"
+    tool_name: str
+    arguments: dict
+
+class FinalAnswer(BaseModel):
+    type: Literal["final_answer"] = "final_answer"
+    content: str
+    confidence: float   # 0.0--1.0
+
+class ReasoningTrace(BaseModel):
+    type: Literal["reasoning_trace"] = "reasoning_trace"
+    trace: str          # fed back into next Perceive cycle
+
+ReasonOutput = ToolRequest | FinalAnswer | ReasoningTrace
+
+class BudgetExhaustedError(RuntimeError):
+    pass
+
+_MINIMUM_SAFE_BUDGET = 500
+
+@observe(name="reason_node")
+def reason_node(state: AgentState) -> dict:
+    remaining = state["token_budget"]
+    if remaining < _MINIMUM_SAFE_BUDGET:
+        raise BudgetExhaustedError(
+            f"token_budget={remaining} below minimum "
+            f"safe threshold of {_MINIMUM_SAFE_BUDGET}."
+        )
+    user_content = (
+        f"ACTIVE GOAL: {state['goal']}\n\n"
+        f"CYCLE: {state['cycle_count']}\n\n"
+        f"RECENT BELIEFS:\n"
+        + "\n".join(state.get("beliefs", [])[-5:])
+        + "\n\nREASON about the next best action."
+    )
+    messages = [
+        {"role": "system", "content": "You are a goal-directed "
+         "reasoning engine. Output a ToolRequest, FinalAnswer, "
+         "or ReasoningTrace."},
+        *state.get("messages", [])[-10:],
+        {"role": "user", "content": user_content},
+    ]
+    output: ReasonOutput = client.chat.completions.create(
+        model=state.get("_config_model", "gpt-4o-mini"),
+        messages=messages,
+        response_model=ReasonOutput,
+        max_retries=2,
+    )
+    estimated_used = (len(str(messages)) + len(str(output))) // 4
+    new_budget = max(0, remaining - estimated_used)
+    langfuse_context.update_current_observation(
+        usage={"input": estimated_used, "output": len(str(output))//4,
+               "unit": "TOKENS"},
+        metadata={"output_type": output.type,
+                  "token_budget_remaining": new_budget})
+    return {
+        "messages":     [{"role": "assistant",
+                          "content": output.model_dump_json()}],
+        "last_action":  output.model_dump(),
+        "token_budget": new_budget,
+    }
+\end{lstlisting}
+
+\code{ReasoningTrace} is not an action. When the model needs to externalise
+intermediate deliberation before committing to a tool call, it returns a
+\code{ReasoningTrace}. The orchestrator feeds its \code{trace} content back into
+the next Perceive cycle as a belief, then loops back through Reason again.
+Nothing is executed.
+
+\begin{warningbox}
+The token deduction above uses a character-count estimate. This is intentionally
+approximate at this stage. Chapter~9 replaces it with LiteLLM's actual usage
+response object and a proper callback-based accounting system. Never ship the
+approximation to production.
+\end{warningbox}
+
+%% ------------------------------------------------------------
+\section{ActionNode: ToolNode Dispatch and Audit}
+\label{sec:action}
+%% ------------------------------------------------------------
+
+Every tool call is a commitment to a side effect that may be irreversible. The
+\code{ToolInvocationRecord} emitted by this node is not optional
+instrumentation---it is a structural output of every cycle that calls a tool.
+
+\begin{lstlisting}[language=Python, caption={\code{ToolInvocationRecord} and
+\code{action\_node}}, label={lst:action}]
+# src/agent/nodes/action.py
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+from langfuse.decorators import observe, langfuse_context
+from ..state import AgentState
+
+_REGISTERED_TOOLS: dict[str, callable] = {}
+
+def register_tool(name: str, fn: callable) -> None:
+    _REGISTERED_TOOLS[name] = fn
+
+@dataclass
+class ToolInvocationRecord:
+    call:       str      # "<tool_name>(<json_args>)"
+    result:     Any
+    latency_ms: float
+    agent_id:   str
+    tool_name:  str
+    success:    bool
+    error:      str | None = None
+    timestamp_utc: str = field(
+        default_factory=lambda:
+            datetime.now(timezone.utc).isoformat()
+    )
+
+class UnregisteredToolError(ValueError):
+    pass
+
+@observe(name="action_node")
+def action_node(state: AgentState, config: dict) -> dict:
+    last = state.get("last_action") or {}
+    if last.get("type") != "tool_request":
+        return {}
+    tool_name = last.get("tool_name", "")
+    arguments = last.get("arguments", {})
+    agent_id  = (config or {}).get(
+        "configurable", {}).get("agent_id", "unknown")
+    if tool_name not in _REGISTERED_TOOLS:
+        raise UnregisteredToolError(
+            f"Model requested unregistered tool '{tool_name}'. "
+            f"Available: {list(_REGISTERED_TOOLS)}"
+        )
+    tool_fn = _REGISTERED_TOOLS[tool_name]
+    t0 = time.perf_counter_ns()
+    result = error = None
+    success = False
+    try:
+        result  = tool_fn(**arguments)
+        success = True
+    except Exception as exc:
+        error = result = f"{type(exc).__name__}: {exc}"
+    latency_ms = (time.perf_counter_ns() - t0) / 1e6
+    record = ToolInvocationRecord(
+        call=f"{tool_name}({arguments})", result=result,
+        latency_ms=latency_ms, agent_id=agent_id,
+        tool_name=tool_name, success=success, error=error)
+    langfuse_context.update_current_observation(
+        metadata={"tool_name": tool_name, "success": success,
+                  "latency_ms": latency_ms, "error": error})
+    return {
+        "messages":   [{"role": "tool", "content": str(result),
+                        "tool_call_id": tool_name}],
+        "last_action": {**last, **record.__dict__},
+    }
+\end{lstlisting}
+
+The latency measurement uses \code{time.perf\_counter\_ns()} around the tool
+function call, not around the whole node. Node overhead should not appear in tool
+latency metrics because tool latency is the signal used to detect slow external
+dependencies.
+
+%% ------------------------------------------------------------
+\section{ReflectNode: Enum-Gated Typed Decision}
+\label{sec:reflect}
+%% ------------------------------------------------------------
+
+Reflection is a control function, not a narrative addition to the prompt. The
+five enum values produced by this node are the complete, closed decision space
+for the loop transition after every action.
+
+\begin{itemize}
+  \item \code{CONTINUE} --- advance to the next cycle normally
+  \item \code{REVISE} --- update the goal or plan before the next cycle
+  \item \code{RETRY} --- re-execute the same tool with no plan change
+  \item \code{TERMINATE} --- task is complete; set \code{final\_answer} and exit
+  \item \code{ESCALATE} --- task cannot be completed; surface to human
+\end{itemize}
+
+The distinction between \code{REVISE} and \code{RETRY} is operationally
+important. \code{RETRY} means the plan is correct but the execution
+failed---try again. \code{REVISE} means the execution succeeded but revealed
+that the current plan is wrong---change the plan.
+
+\begin{lstlisting}[language=Python, caption={\code{ReflectionOutput} and
+\code{reflect\_node}}, label={lst:reflect}]
+# src/agent/nodes/reflect.py
+from typing import Literal
+from pydantic import BaseModel
+import instructor, litellm
+from langfuse.decorators import observe, langfuse_context
+from ..state import AgentState
+
+client = instructor.patch(litellm)
+
+class ReflectionOutput(BaseModel):
+    decision: Literal[
+        "CONTINUE","REVISE","RETRY","TERMINATE","ESCALATE"]
+    goal_delta: Literal["ADVANCED","NO_CHANGE","REGRESSED"]
+    technical_success: bool
+    reason_code: str
+    summary: str
+
+@observe(name="reflect_node")
+def reflect_node(state: AgentState, config: dict) -> dict:
+    last  = state.get("last_action") or {}
+    model = ((config or {}).get("configurable", {})
+              .get("reflect_model", "gpt-4o-mini"))
+    user_content = (
+        f"ACTIVE GOAL: {state['goal']}\n"
+        f"CYCLE: {state['cycle_count']}\n"
+        f"LAST ACTION: {last.get('call','none')}\n"
+        f"SUCCESS: {last.get('success',False)}\n"
+        f"ERROR: {last.get('error') or 'none'}\n"
+        f"RESULT: {str(last.get('result',''))[:500]}\n"
+        "Evaluate progress and choose the next loop transition."
+    )
+    output: ReflectionOutput = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system",
+             "content": "You are a reflection engine. "
+             "Choose: CONTINUE|REVISE|RETRY|TERMINATE|ESCALATE."},
+            {"role": "user", "content": user_content},
+        ],
+        response_model=ReflectionOutput,
+        max_retries=2,
+    )
+    langfuse_context.update_current_observation(metadata={
+        "decision":   output.decision,
+        "goal_delta": output.goal_delta,
+        "reason_code":output.reason_code,
+    })
+    updates: dict = {
+        "reflect_decision": output.decision,
+        "beliefs": [
+            f"[reflect cycle={state['cycle_count']}] "
+            f"{output.summary}"],
+    }
+    if output.decision == "TERMINATE":
+        updates["final_answer"] = (
+            state.get("final_answer")
+            or next(
+                (m.get("content","") for m in
+                 reversed(state.get("messages",[]))
+                 if m.get("role")=="assistant"),
+                "Task complete."))
+    return updates
+\end{lstlisting}
+
+\begin{notebox}
+The five \code{decision} values---\code{CONTINUE}, \code{REVISE}, \code{RETRY},
+\code{TERMINATE}, \code{ESCALATE}---are locked. Chapter~2's routing function maps
+each value to a graph branch. Any additional value added to this enum without
+updating the routing branches will hit the \code{else} clause and silently
+terminate the run.
+\end{notebox}
+
+%% ------------------------------------------------------------
+\section{StateGraph Wiring and \texttt{.compile()} as an
+         Architectural Boundary}
+\label{sec:graph}
+%% ------------------------------------------------------------
+
+\code{.compile()} is a named architectural boundary for three reasons that matter
+operationally. First, it validates graph structure at compile time: misconfigured
+edges are caught before the graph runs a single cycle. Second, it enables
+streaming via \code{graph.stream()}. Third, it connects the checkpointer: every
+node execution is automatically persisted to the configured store.
+
+\begin{lstlisting}[language=Python, caption={\code{StateGraph} wiring and
+\code{build\_graph()}}, label={lst:graph}]
+# src/agent/graph.py
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+from .state import AgentState
+from .nodes.perceive import perceive_node
+from .nodes.reason  import reason_node
+from .nodes.action  import action_node
+from .nodes.reflect import reflect_node
+
+def route_from_reason(state: AgentState) -> str:
+    t = (state.get("last_action") or {}).get("type","")
+    if t == "final_answer":    return "end"
+    if t == "reasoning_trace": return "perceive_node"
+    return "action_node"
+
+def route_from_reflect(state: AgentState) -> str:
+    d = state.get("reflect_decision") or "CONTINUE"
+    return {
+        "CONTINUE":  "perceive_node",
+        "REVISE":    "perceive_node",
+        "RETRY":     "action_node",
+        "TERMINATE": "end",
+        "ESCALATE":  "end",
+    }.get(d, "end")
+
+def build_graph(checkpointer=None):
+    b = StateGraph(AgentState)
+    b.add_node("perceive_node", perceive_node)
+    b.add_node("reason_node",   reason_node)
+    b.add_node("action_node",   action_node)
+    b.add_node("reflect_node",  reflect_node)
+    b.set_entry_point("perceive_node")
+    b.add_edge("perceive_node", "reason_node")
+    b.add_conditional_edges(
+        "reason_node", route_from_reason,
+        {"action_node":   "action_node",
+         "perceive_node": "perceive_node",
+         "end":           END})
+    b.add_edge("action_node", "reflect_node")
+    b.add_conditional_edges(
+        "reflect_node", route_from_reflect,
+        {"perceive_node": "perceive_node",
+         "action_node":   "action_node",
+         "end":           END})
+    return b.compile(checkpointer=checkpointer,
+                     recursion_limit=25)
+
+def build_dev_graph():
+    return build_graph(
+        SqliteSaver.from_conn_string(":memory:"))
+\end{lstlisting}
+
+\code{recursion\_limit=25} is a hard guard: LangGraph raises
+\code{GraphRecursionError} when it is reached. Chapter~2 explains why increasing
+this number is not a valid alternative to proper termination logic.
+
+%% ------------------------------------------------------------
+\section{Embedded vs.\ Explicit Reflection}
+\label{sec:reflection-modes}
+%% ------------------------------------------------------------
+
+Embedded reflection means the next \code{ReasonNode} call receives the last
+\code{ToolMessage} in context and implicitly decides what to do next through its
+regular reasoning pass---no separate model call, no separate node. Embedded
+reflection costs less: one fewer model call per cycle, lower latency, one fewer
+span in the trace tree.
+
+The promotion criteria for moving to explicit \code{ReflectNode} are four
+specific production requirements:
+
+\begin{enumerate}
+  \item Independent audit of self-evaluation is required by policy.
+  \item Action safety requires a separate gate before any information that could
+        influence the next action is mixed with new context.
+  \item Recovery logic is becoming opaque inside the Reason prompt.
+  \item A different, smaller model for reflection is economically justified.
+\end{enumerate}
+
+Start with \code{"explicit"} for any task that involves external tool calls. Use
+\code{"embedded"} only for tasks with no side effects, short horizons, and no
+audit requirements.
+
+%% ------------------------------------------------------------
+\section{Langfuse Span Emission via \texttt{@observe}}
+\label{sec:observe}
+%% ------------------------------------------------------------
+
+\code{@observe} must decorate the \textbf{node function}, not the graph runner or
+\code{graph.invoke()}. Wrapping the graph runner produces one Langfuse span for
+the entire run. Decorating each node function produces a trace tree: four child
+spans per cycle---\code{perceive\_node}, \code{reason\_node},
+\code{action\_node}, \code{reflect\_node}---each with its own duration, token
+usage, and metadata.
+
+The \code{name=} parameter on \code{@observe} must exactly match the string used
+in \code{builder.add\_node()}. Langfuse Studio correlates span names to graph
+node names when they are identical, enabling trace-to-graph overlays.
+
+Session grouping is handled by passing \code{session\_id} through
+\code{config["configurable"]}:
+
+\begin{lstlisting}[language=Python, label={lst:session}]
+result = graph.invoke(
+    initial_state,
+    config={
+        "configurable": {
+            "agent_id":     "agent-001",
+            "session_id":   "session-abc123",
+            "model":        "gpt-4o",
+            "reflect_model":"gpt-4o-mini",
+        }
+    },
+)
+\end{lstlisting}
+
+%% ------------------------------------------------------------
+\section{Cycle Trace Record: 13 Mandatory Fields}
+\label{sec:cycle-trace}
+%% ------------------------------------------------------------
+
+A Langfuse span is push telemetry to an external service. A \code{CycleTrace} is
+a typed Python dataclass appended to state and independently inspectable during
+or after a run. Chapter~2's infinite loop and goal divergence detectors read this
+field every cycle.
+
+\begin{lstlisting}[language=Python, caption={\code{CycleTrace} with all 13
+mandatory fields}, label={lst:cycletrace}]
+# src/agent/trace.py
+from dataclasses import dataclass, field
+from typing import Literal
+
+@dataclass
+class TokenUsage:
+    input: int
+    output: int
+    cumulative_total: int
+
+@dataclass
+class CycleTrace:
+    cycle_number:            int
+    goal_summary:            str
+    context_package_summary: str
+    reason_output_type: Literal[
+        "TOOL_CALL","FINAL_ANSWER","REASONING_TRACE"]
+    action_invoked:     str | None
+    validation_result:  Literal["PASSED","REJECTED","SKIPPED"]
+    tool_result_summary: str | None
+    reflection_decision: Literal[
+        "CONTINUE","REVISE","RETRY","TERMINATE","ESCALATE"]
+    goal_delta: Literal["ADVANCED","NO_CHANGE","REGRESSED"]
+    termination_status: Literal[
+        "RUNNING","COMPLETED","RESOURCE_LIMIT",
+        "FAILURE","ESCALATED"]
+    token_usage:  TokenUsage
+    wall_time_ms: float
+    reason_code:  str
+\end{lstlisting}
+
+\code{termination\_status} uses different vocabulary from
+\code{reflect\_decision}. A \code{TERMINATE} decision maps to \code{COMPLETED}.
+A task stopped by the \code{recursion\_limit} guard maps to
+\code{RESOURCE\_LIMIT}. Aggregating them under a single ``stopped'' label hides a
+significant quality signal.
+
+%% ------------------------------------------------------------
+\section{pytest Suite: Node Isolation Tests}
+\label{sec:tests}
+%% ------------------------------------------------------------
+
+The node functions are pure \code{(state: AgentState, config: dict) -> dict}
+callables. No graph compilation is required to test them.
+
+\begin{lstlisting}[language=Python, caption={Isolation tests for all four nodes},
+label={lst:tests}]
+# tests/conftest.py
+from src.agent.state import AgentState
+
+def make_test_state(**overrides) -> AgentState:
+    base: AgentState = {
+        "goal": "Test goal", "beliefs": [],
+        "intentions": [], "token_budget": 4000,
+        "cycle_count": 1, "messages": [],
+        "last_action": None, "reflect_decision": None,
+        "final_answer": None,
+    }
+    base.update(overrides)
+    return base
+
+# tests/test_perceive_node.py
+import os
+os.environ.setdefault("LANGFUSE_ENABLED", "false")
+from unittest.mock import patch, MagicMock
+from src.agent.nodes.perceive import perceive_node
+from tests.conftest import make_test_state
+
+def test_pii_is_redacted():
+    state = make_test_state(messages=[
+        {"role":"tool","content":"Email: john@example.com"}])
+    with patch("src.agent.nodes.perceive._analyzer") as ma, \
+         patch("src.agent.nodes.perceive._anonymizer") as mb:
+        mock_r = MagicMock()
+        mock_r.text = "Email: <EMAIL_ADDRESS>"
+        ma.analyze.return_value = [MagicMock()]
+        mb.anonymize.return_value = mock_r
+        result = perceive_node(state)
+    assert "<EMAIL_ADDRESS>" in result["_last_tool_content_redacted"]
+
+# tests/test_reason_node.py
+from src.agent.nodes.reason import (
+    reason_node, BudgetExhaustedError, ToolRequest)
+from tests.conftest import make_test_state
+
+def test_budget_exhausted_raises():
+    state = make_test_state(token_budget=100)
+    import pytest
+    with pytest.raises(BudgetExhaustedError):
+        reason_node(state)
+
+# tests/test_action_node.py
+from src.agent.nodes.action import (
+    action_node, register_tool, UnregisteredToolError)
+from tests.conftest import make_test_state
+
+def test_record_mandatory_fields():
+    register_tool("echo", lambda msg: f"echo: {msg}")
+    state = make_test_state(last_action={
+        "type":"tool_request","tool_name":"echo",
+        "arguments":{"msg":"hello"}})
+    result = action_node(
+        state, {"configurable":{"agent_id":"test"}})
+    r = result["last_action"]
+    assert all(k in r for k in
+               ["call","result","latency_ms","agent_id"])
+
+# tests/test_reflect_node.py
+from src.agent.nodes.reflect import reflect_node, ReflectionOutput
+from tests.conftest import make_test_state
+
+def test_terminate_sets_final_answer():
+    state = make_test_state(
+        messages=[{"role":"assistant","content":"Done."}],
+        last_action={"call":"f()","result":"ok",
+                     "success":True})
+    out = ReflectionOutput(
+        decision="TERMINATE", goal_delta="ADVANCED",
+        technical_success=True, reason_code="goal_met",
+        summary="Goal met.")
+    with patch("src.agent.nodes.reflect.client") as mc:
+        mc.chat.completions.create.return_value = out
+        result = reflect_node(state, {})
+    assert result["reflect_decision"] == "TERMINATE"
+    assert result.get("final_answer") is not None
+\end{lstlisting}
+
+Each node is tested without a compiled graph and without Langfuse network calls.
+\code{LANGFUSE\_ENABLED=false} disables the SDK globally for the test process.
+Chapter~28 extends this suite to graph-level integration tests that compile the
+full graph, use \code{SqliteSaver} checkpointing, and assert on multi-cycle state
+evolution.
+
+\begin{takeawaybox}
+The core loop established in this chapter is a fixed contract for the rest of the
+book. \code{AgentState} is a \code{TypedDict}; Pydantic validates at the
+boundary only. \code{PerceiveNode} redacts PII via Presidio before any content
+reaches the model. \code{ReasonNode} returns a discriminated union the
+orchestrator routes on mechanically. \code{ActionNode} emits a
+\code{ToolInvocationRecord} on every execution including failures.
+\code{ReflectNode} produces five locked enum values. \code{.compile()} validates
+structure, enables streaming, and connects the checkpointer. \code{@observe}
+decorates node functions, not graph runners. Chapter~2 asks the question this
+chapter left open: what happens when the loop does not stop?
+\end{takeawaybox}
