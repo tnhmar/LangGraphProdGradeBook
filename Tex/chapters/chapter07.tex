@@ -1,22 +1,822 @@
-%% Chapter 7 — Tool Design and the MCP Interface
-%% TODO: content
-\chapterquote{Good interfaces survive bad implementations.}{anon}
+%% ============================================================
+%%  Chapter 7 — Short-Term Memory & Working Context
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
 
-This chapter covers Model Context Protocol (MCP), tool input/output schemas,
-error envelopes, and tool composition patterns.
+\chapterquote{The model does not remember. You decide what it sees.}{anon}
 
-\section{MCP Overview}
-\label{sec:mcp-overview}
-% TODO
+The production failure this chapter prevents is context amnesia under
+load: the condition where a long-horizon agent loop silently forgets
+that a user said ``never use code blocks'' three turns ago, or truncates
+the only sentence that contained a critical user preference, because
+nobody managed what was placed in the context window between turns.
+This is not a token-overflow error --- no exception is raised. The
+model's input is technically valid. The agent's behaviour simply
+degrades, and the degradation is invisible until a user complains or an
+evaluation catches it. In a customer-facing agent running hundreds of
+sessions per hour, that silent degradation is a support cost, a churn
+driver, and an on-call incident waiting to happen.
 
-\section{Tool Input and Output Schemas}
-\label{sec:tool-schemas}
-% TODO
+The solution operates in three layers. The first layer is an explicit
+\emph{working buffer}: a typed message list backed by LangGraph's
+\code{MessagesState} and the \code{add\_messages} reducer, which gives
+the graph a single source of truth for what the model has said and seen
+in the current session. The second layer is a \emph{budget enforcer}:
+a \code{trim\_messages} function that evicts the oldest content before
+every model call, with invariants that protect the system message and
+the current user turn from eviction. The third layer is a
+\emph{compression pipeline}: a summarisation node that converts
+accumulated history into a compact prose summary stored in the
+\code{HISTORY} slot, and a \code{MemoryInjectionNode} that formats and
+injects both that summary and any retrieved memories through a six-step
+pipeline governed by a four-question policy function.
 
-\section{Error Envelopes and Partial Failure}
-\label{sec:error-envelopes}
-% TODO
+The sections are ordered by dependency. Section~\ref{sec:messages-state}
+builds the working buffer first, because trimming and summarisation both
+operate on that buffer and cannot be explained without it.
+Section~\ref{sec:trim-messages} adds the budget enforcer, because
+trimming is the first-line defence before summarisation is needed.
+Section~\ref{sec:summarization-node} adds the summarisation node, which
+produces the compressed \code{history} string consumed by the injection
+pipeline. Section~\ref{sec:injection-pipeline} assembles the six-step
+injection pipeline into a \code{MemoryInjectionNode}.
+Section~\ref{sec:compact-format} formalises the compact memory text
+format that the pipeline emits, and explains why raw record injection is
+an anti-pattern. Section~\ref{sec:injection-policy} adds the
+four-question policy guard that decides, before any injection, whether
+the pipeline should run at all.
 
-\section{Tool Composition}
-\label{sec:tool-composition}
-% TODO
+This chapter introduces seven domain terms that appear throughout the
+rest of the book. Table~\ref{tab:memory-taxonomy} maps each term to its
+scope before any implementation detail.
+
+\begin{table}[ht]
+\centering
+\caption{Short-term memory terms, scope, and lifetime introduced in Chapter~7}
+\label{tab:memory-taxonomy}
+\begin{tabular}{llll}
+\toprule
+\textbf{Term} & \textbf{Scope} & \textbf{Lifetime} & \textbf{Owner} \\
+\midrule
+\code{MessagesState}      & In-context turn list  & Current session     & LangGraph \\
+\code{add\_messages}      & Append reducer        & Per graph write     & LangGraph \\
+\code{trim\_messages()}   & Budget enforcer       & Per model call      & \S\ref{sec:trim-messages} \\
+\code{summarization\_node} & History compressor   & Triggered on N turns & \S\ref{sec:summarization-node} \\
+\code{MemoryInjectionNode} & Six-step pipeline    & Pre-model call      & \S\ref{sec:injection-pipeline} \\
+\code{MemoryType}         & Label for memory kind & Permanent in record & \S\ref{sec:compact-format} \\
+\code{should\_inject\_memory} & Policy gate       & Pre-inject          & \S\ref{sec:injection-policy} \\
+\midrule
+Short-term memory  & \multicolumn{3}{l}{\code{MessagesState} list; lives in-context; lost on session end} \\
+Long-term memory   & \multicolumn{3}{l}{Persisted by mem0; retrieved per query; introduced in Chapter~8} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The source layout for this chapter is:
+
+\begin{verbatim}
+src/
+  agent/
+    state/
+      messages_state_short_term.py   # §7.1
+      trim_messages.py               # §7.2
+    memory/
+      summarization_node.py          # §7.3
+      memory_injection_node.py       # §7.4
+      format_memory_block.py         # §7.5
+      injection_policy.py            # §7.6
+\end{verbatim}
+
+%% ------------------------------------------------------------
+\section{The Working Buffer Has One Owner}
+\label{sec:messages-state}
+%% ------------------------------------------------------------
+
+The fundamental problem with ad-hoc message management is that no
+single object in the graph owns the list of what has been said. When
+ownership is diffuse --- the model node appends messages, the tool node
+appends messages, the retry handler occasionally removes the last
+message --- the list becomes inconsistent. Two nodes may write
+different views of the same turn, a retry may silently duplicate a
+message, or a tool response may appear before the user turn that
+triggered it. The model sees this inconsistency as contradictory
+context; the output degrades in ways that are almost impossible to
+reproduce because the inconsistency depends on concurrency timing and
+retry history.\looseness=-1
+
+LangGraph's \code{MessagesState} and \code{add\_messages} reducer solve
+this by making the message list a reducer-owned, append-only structure.
+Every node that writes to \code{state[``messages'']} does so through
+\code{add\_messages}, which handles deduplication by message ID and
+ensures that updates from parallel branches are merged without
+conflict. No node ever replaces the entire list; every node declares
+only the messages it wants to add or update. The graph runtime handles
+the merge.
+
+The boundary between short-term and long-term memory is structural, not
+conceptual. \code{MessagesState} holds only what the model needs to
+reason about the \emph{current session's} turns. It is in-context: every
+message in the list occupies tokens on every model call. It is
+session-scoped: when the session ends, the list is discarded unless
+explicitly checkpointed. Long-term memory --- persistent, cross-session
+facts about the user or the world --- is outside this list. Chapter~8
+introduces mem0 as the store for that category of memory and shows how
+its retrieval results flow into the injection pipeline built in
+\S\ref{sec:injection-pipeline}. Nothing from mem0 ever lives directly
+in \code{MessagesState}; it is formatted and injected as a
+\code{SystemMessage} block at the injection step, keeping the turn list
+semantically clean.
+
+The \code{AgentState} TypedDict wraps \code{MessagesState} together with
+the supplementary fields the rest of this chapter writes into. The
+\code{history} field is the compressed prose summary produced by the
+summarisation node (\S\ref{sec:summarization-node}). The \code{meta}
+field is a free-form dict for per-invocation metadata such as
+\code{user\_id} and \code{session\_start}, which the injection policy
+(\S\ref{sec:injection-policy}) needs but which do not belong in the
+message list.
+
+\begin{lstlisting}[language=Python,
+  caption={AgentState TypedDict, SYSTEM\_PROMPT bootstrap, and model\_node using add\_messages},
+  label={lst:messages-state}]
+# src/agent/state/messages_state_short_term.py
+from __future__ import annotations
+from typing import Any
+from typing_extensions import TypedDict, Annotated
+from langchain_core.messages import SystemMessage, BaseMessage
+from langgraph.graph.message import add_messages
+from langchain_core.runnables import Runnable
+
+SYSTEM_PROMPT = (
+    "You are a helpful production assistant. "
+    "Follow user instructions precisely."
+)
+
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    history:  str | None
+    meta:     dict[str, Any]
+
+def bootstrap_state() -> AgentState:
+    return AgentState(
+        messages=[SystemMessage(content=SYSTEM_PROMPT)],
+        history=None,
+        meta={},
+    )
+
+def model_node(
+    state: AgentState,
+    llm:   Runnable,
+) -> dict:
+    response = llm.invoke(state["messages"])
+    return {"messages": [response]}
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:messages-state} deserve explanation.
+
+First, \code{messages} is declared as \code{Annotated[list[BaseMessage],
+add\_messages]} rather than a plain \code{list}. The \code{Annotated}
+wrapper tells LangGraph's graph runtime which reducer to use when two
+branches both write to \code{messages} in the same super-step.
+Without this annotation the runtime uses last-write-wins, which silently
+drops one branch's output whenever the graph forks. The annotation is
+the contract between the node author and the graph runtime; omitting it
+is a correctness bug, not a style issue.
+
+Second, the system message is injected once in \code{bootstrap\_state}
+and never injected again by any other node. Because \code{add\_messages}
+deduplicates by message ID, a second \code{SystemMessage} with the same
+content would create a duplicate entry visible to the model. Any node
+that needs to extend the system context --- such as the injection node
+in \S\ref{sec:injection-pipeline} --- appends a \emph{separate}
+\code{SystemMessage} with a distinct ID; it never modifies or replaces
+the bootstrap message.
+
+The working buffer is now well-defined. The next problem is that it
+grows without bound, and every additional message costs tokens on every
+model call.
+
+%% ------------------------------------------------------------
+\section{Eviction Must Follow an Invariant, Not a Heuristic}
+\label{sec:trim-messages}
+%% ------------------------------------------------------------
+
+The naive token-budget solution is to truncate the message list to the
+most recent \emph{K} messages before each model call. This is simple,
+predictable, and wrong in exactly the cases that matter most. It evicts
+the system message when \emph{K} is small relative to the session
+length. It evicts the current user turn when the turn is not literally
+the last message (which happens whenever tool calls, tool responses, and
+assistant intermediate messages accumulate between turns). It severs
+assistant messages from the user turns that prompted them, creating a
+message list where the model is answering questions it cannot see. Each
+of these errors degrades model output without raising any exception.
+
+The correct approach is an invariant-preserving eviction function that
+treats the message list as a structured object rather than a sequence of
+bytes. Three invariants must hold after every trim: the first
+\code{SystemMessage} in the list is never evicted; the most recent
+\code{HumanMessage} is never evicted; and eviction always removes
+oldest-first, taking messages in user+assistant pairs wherever possible
+to preserve conversational coherence. These are not preferences --- they
+are correctness conditions, and the trim function asserts them on exit.
+
+The token budget comes from outside the function: it is the
+\code{history} allocation in \code{SlotBudget} (introduced in
+Chapter~6), read from \code{RunnableConfig}. The trim function does not
+know the model's context window; it knows only how many tokens the
+\code{HISTORY} slot has been allocated. This separation means a test
+can pass a 200-token budget and verify deterministic eviction on a
+three-turn fixture without instantiating an LLM.
+
+\begin{warningbox}
+Never evict messages individually from the middle of the list. Removing
+an assistant message while keeping its preceding user message leaves the
+model with a question it cannot answer and an answer it cannot attribute.
+Always drop user+assistant pairs as an atomic unit from the oldest end.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={trim\_messages: oldest-first eviction with system and user-turn invariants},
+  label={lst:trim-messages}]
+# src/agent/state/trim_messages.py
+from __future__ import annotations
+from typing import Callable, Sequence
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
+
+TokenCounter = Callable[[Sequence[BaseMessage]], int]
+
+def trim_messages(
+    messages:     list[BaseMessage],
+    max_tokens:   int,
+    count_tokens: TokenCounter,
+) -> list[BaseMessage]:
+    if not messages:
+        return messages
+
+    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+    last_human  = next(
+        (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
+    )
+    protected   = set(id(m) for m in system_msgs)
+    if last_human is not None:
+        protected.add(id(last_human))
+
+    evictable = [m for m in messages if id(m) not in protected]
+    result    = list(messages)
+
+    while count_tokens(result) > max_tokens and evictable:
+        # drop oldest pair
+        drop_n = min(2, len(evictable))
+        to_drop = set(id(m) for m in evictable[:drop_n])
+        result   = [m for m in result   if id(m) not in to_drop]
+        evictable = [m for m in evictable if id(m) not in to_drop]
+
+    assert any(isinstance(m, SystemMessage) for m in result), \
+        "trim_messages invariant violated: system message evicted"
+    if last_human is not None:
+        assert any(id(m) == id(last_human) for m in result), \
+            "trim_messages invariant violated: current user turn evicted"
+    return result
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:trim-messages} deserve explanation.
+
+First, protection is tracked by object identity (\code{id(m)}) rather
+than by message type or content. A session can legitimately contain
+multiple \code{HumanMessage} objects; only the most recent one is
+protected. Comparing by \code{id} guarantees that exactly the object
+at the tail of the list is the protected one, even if two human messages
+have identical content.
+
+Second, the function accepts a \code{TokenCounter} callable rather than
+importing a specific tokeniser. This inversion is deliberate: in
+production the counter wraps \code{tiktoken}; in tests it can be
+\code{lambda msgs: len(msgs)} for deterministic fixture-based testing
+without requiring the tiktoken binary. The same \code{TokenCounter}
+type alias is reused by the injection policy in
+\S\ref{sec:injection-policy} for cost-benefit estimation.
+
+Third, the two \code{assert} statements at the end are not defensive
+programming --- they are executable specifications. If a future
+refactor breaks either invariant (for example, by reordering messages
+before trimming), the assertion fires at the trim call site with a
+precise message rather than silently corrupting the model's input. The
+Chapter~9 unit-test suite targets these assertions directly.
+
+With a budget enforcer in place, the working buffer can survive
+indefinitely without overflowing. But trimming alone discards information
+rather than compressing it. The next problem is how to preserve the
+\emph{substance} of evicted history without keeping the verbatim text.
+
+%% ------------------------------------------------------------
+\section{Evicted History Must Be Compressed, Not Discarded}
+\label{sec:summarization-node}
+%% ------------------------------------------------------------
+
+The problem with pure trimming is information loss. Oldest-first
+eviction removes the turns most likely to contain the user's original
+framing, their constraints, and the early decisions that all subsequent
+turns assumed. A model that has lost those turns will re-ask questions
+the user already answered, re-explain context the user already provided,
+and occasionally contradict earlier commitments because it cannot see
+them. In a support agent, that pattern triggers escalations. In a
+coding agent, it triggers rework.
+
+The solution is a summarisation node that intercepts messages before
+they would be evicted and converts them into a compact prose summary
+stored in \code{state[``history'']}. The summary is injected into the
+\code{HISTORY} slot by the assembly node (Chapter~6,
+\S\ref{sec:context-assembly-node}), giving the model a compressed
+representation of the evicted turns without the token cost of the
+originals. The trade-off is fidelity: a summary loses exact wording.
+That trade-off is correct for most sessions, where the model needs the
+\emph{substance} of earlier turns, not their verbatim text.
+
+The node uses LangChain's \code{load\_summarise\_chain} with
+\code{chain\_type=``map\_reduce''}. The map step runs a summarisation
+prompt over each message individually, producing a short summary per
+message; the reduce step combines those summaries into a single
+paragraph. Map-reduce is chosen over \code{stuff} (which concatenates
+all messages into one prompt) because the set of messages being
+summarised can itself exceed the model's context window when history is
+deep --- exactly the scenario where summarisation is triggered.
+
+\begin{notebox}
+Summarisation is triggered by a threshold, not by the trim function
+itself. The recommended trigger is: when \code{len(messages)} exceeds
+\code{2~*~keep\_last\_n} turns, move the oldest \code{len(messages) - keep\_last\_n}
+turns through the summarisation chain and remove them from
+\code{messages}. This keeps the live message list at a stable size and
+prevents the summarisation chain itself from receiving an arbitrarily
+long input.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={build\_history\_summarizer with map\_reduce config and summarization\_node},
+  label={lst:summarization-node}]
+# src/agent/memory/summarization_node.py
+from __future__ import annotations
+from langchain.chains.summarize import load_summarize_chain
+from langchain_core.language_models import BaseLanguageModel
+from langchain_core.documents import Document
+from langchain_core.runnables import Runnable
+from langchain_core.messages import BaseMessage
+from src.agent.state.messages_state_short_term import AgentState
+
+def build_history_summarizer(llm: BaseLanguageModel) -> Runnable:
+    return load_summarize_chain(llm, chain_type="map_reduce")
+
+def select_messages_for_summary(
+    messages:     list[BaseMessage],
+    keep_last_n:  int,
+) -> tuple[list[BaseMessage], list[BaseMessage]]:
+    if len(messages) <= keep_last_n:
+        return [], messages
+    return messages[:-keep_last_n], messages[-keep_last_n:]
+
+def summarization_node(
+    state:       AgentState,
+    summarizer:  Runnable,
+    keep_last_n: int = 10,
+) -> dict:
+    to_summarize, to_keep = select_messages_for_summary(
+        state["messages"], keep_last_n
+    )
+    if not to_summarize:
+        return {}
+    docs = [Document(page_content=m.content) for m in to_summarize
+            if m.content]
+    result      = summarizer.invoke({"input_documents": docs})
+    new_summary = result["output_text"].strip()
+    existing    = state.get("history") or ""
+    merged = (existing + "\n\n" + new_summary).strip() if existing else new_summary
+    return {"messages": to_keep, "history": merged}
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:summarization-node} deserve
+explanation.
+
+First, the node replaces \code{state[``messages'']} with \code{to\_keep}
+--- the recent slice --- rather than computing a delta. LangGraph's
+\code{add\_messages} reducer handles this correctly when the node
+returns the trimmed list as the new \code{messages} value, because
+\code{add\_messages} merges by message ID: messages present in
+\code{to\_keep} are retained, messages absent are considered superseded.
+Returning the full replacement list is safer than returning a deletion
+diff, which would require the node to track per-message IDs explicitly.
+
+Second, the node merges the new summary with \code{state[``history'']}
+rather than replacing it. Over a very long session, summarisation fires
+multiple times. Each invocation compresses a slice of older messages;
+the accumulated \code{history} string grows incrementally. That growth
+is bounded because each compression step reduces a sequence of verbose
+messages to a paragraph; the \code{HISTORY} slot's token budget (from
+Chapter~6's \code{SlotBudget}) constrains the total when
+\code{context\_assembly\_node} renders the slot.
+
+Third, \code{Document} wrapping is required because
+\code{load\_summarise\_chain} expects a list of
+\code{langchain\_core.documents.Document} objects, not raw strings or
+\code{BaseMessage} objects. Filtering on \code{m.content} prevents
+sending empty tool-call scaffolding messages --- which contain no
+summarisable prose --- through the chain, keeping the map step's
+token cost predictable.
+
+With compressed history available in \code{state[``history'']}, the
+graph now needs a principled way to decide which memories --- including
+both the compressed history and any retrieved long-term facts --- should
+be placed in front of the model before each call.
+
+%% ------------------------------------------------------------
+\section{Memory Injection Is a Six-Step Pipeline}
+\label{sec:injection-pipeline}
+%% ------------------------------------------------------------
+
+The temptation is to write a helper function that concatenates all
+available memory into a single string and prepends it to the system
+prompt. That approach fails in four ways. It injects everything regardless
+of relevance, burning tokens on facts the model does not need for this
+turn. It mixes memories from different sources (session history, user
+profile, past tasks) with no indication of their provenance, type, or
+age. It produces a single monolithic blob that the model cannot
+selectively attend to. And it provides no observable intermediate
+state, so when the model produces a wrong output, there is no way to
+determine whether the failure was in retrieval, formatting, or selection.
+
+The correct design is a pipeline of six discrete, named steps, each
+with a clear input contract and output type. Each step is independently
+testable and independently loggable. The six steps are:
+\code{retrieve\_raw\_memories}, which gathers candidates from
+\code{state[``history'']}, mem0 (Chapter~8), and recent turns;
+\code{filter\_by\_scope}, which constrains to the current user and
+time window; \code{score\_and\_rank}, which orders by relevance to the
+current query; \code{select\_top\_k}, which applies a hard cap;
+\code{format\_memory\_block}, which converts selected memories to the
+compact labelled text format defined in \S\ref{sec:compact-format}; and
+\code{inject\_memory\_block}, which appends the formatted block to
+\code{state[``messages'']} as a \code{SystemMessage}.
+
+\begin{notebox}
+These six step names are intentionally consistent with Chapter~8's
+\code{MemoryReadNode} steps. Chapter~8 plugs mem0 retrieval into
+\code{retrieve\_raw\_memories} without modifying any downstream step.
+The pipeline contract --- a \code{list[RetrievedMemory]} flows from step
+to step --- is the integration surface between this chapter and
+Chapter~8.
+\end{notebox}
+
+The \code{RetrievedMemory} TypedDict is the data contract between steps.
+It carries the memory's unique ID, its \code{MemoryType} label, the
+datetime it was created, its prose summary, and its relevance score.
+Every step receives and returns this typed structure, making the
+pipeline's data flow explicit and type-checkable without runtime
+reflection.
+
+\begin{lstlisting}[language=Python,
+  caption={RetrievedMemory TypedDict, six-step helpers, and memory\_injection\_node},
+  label={lst:injection-node}]
+# src/agent/memory/memory_injection_node.py
+from __future__ import annotations
+from datetime import datetime
+from typing_extensions import TypedDict
+from langchain_core.messages import SystemMessage
+from src.agent.state.messages_state_short_term import AgentState
+from src.agent.memory.format_memory_block import format_memory_block
+from src.agent.memory.injection_policy import should_inject_memory
+
+class RetrievedMemory(TypedDict):
+    id:         str
+    type:       str         # MemoryType literal
+    created_at: datetime
+    content:    str
+    score:      float
+
+def retrieve_raw_memories(state: AgentState) -> list[RetrievedMemory]:
+    # Returns history summary + placeholder for mem0 (Chapter 8)
+    memories: list[RetrievedMemory] = []
+    if state.get("history"):
+        memories.append(RetrievedMemory(
+            id="history-summary", type="episodic",
+            created_at=datetime.utcnow(), content=state["history"],
+            score=1.0,
+        ))
+    return memories
+
+def filter_by_scope(
+    memories: list[RetrievedMemory],
+    user_id:  str,
+    now:      datetime,
+) -> list[RetrievedMemory]:
+    return [m for m in memories if m["score"] > 0.0]
+
+def score_and_rank(
+    memories: list[RetrievedMemory], query: str
+) -> list[RetrievedMemory]:
+    return sorted(memories, key=lambda m: m["score"], reverse=True)
+
+def select_top_k(
+    memories: list[RetrievedMemory], k: int
+) -> list[RetrievedMemory]:
+    return memories[:k]
+
+def inject_memory_block(
+    state: AgentState, memory_block: str
+) -> dict:
+    msg = SystemMessage(content=memory_block)
+    return {"messages": [msg]}
+
+def memory_injection_node(
+    state:   AgentState,
+    *,
+    user_id: str,
+    now:     datetime,
+    top_k:   int = 5,
+) -> dict:
+    raw      = retrieve_raw_memories(state)
+    scoped   = filter_by_scope(raw, user_id, now)
+    ranked   = score_and_rank(scoped, query=_last_query(state))
+    selected = select_top_k(ranked, top_k)
+    if not should_inject_memory(state, selected, now, max_extra_tokens=512):
+        return {}
+    block = format_memory_block(selected)
+    return inject_memory_block(state, block)
+
+def _last_query(state: AgentState) -> str:
+    from langchain_core.messages import HumanMessage
+    msgs = state.get("messages", [])
+    for m in reversed(msgs):
+        if isinstance(m, HumanMessage):
+            return m.content
+    return ""
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:injection-node} deserve explanation.
+
+First, \code{retrieve\_raw\_memories} returns a single
+\code{RetrievedMemory} for the compressed history summary rather than
+parsing the summary into individual records. The history string is
+already compressed prose; splitting it would require a second LLM call.
+Chapter~8 extends this function to also call mem0's similarity search
+and append its results to the same list, making the history summary and
+retrieved long-term facts uniformly typed for all downstream steps.
+
+Second, \code{memory\_injection\_node} calls
+\code{should\_inject\_memory} \emph{after} selection but \emph{before}
+formatting and injection. The policy check (\S\ref{sec:injection-policy})
+needs the ranked, selected list --- not the raw list --- because its
+cost-benefit question requires knowing the actual token cost of the
+block that would be injected. Calling the policy on raw, unranked
+memories would overestimate cost.
+
+Third, the node returns an empty dict \code{\{\}} when the policy
+decides not to inject. LangGraph treats an empty dict return as a no-op
+state update, so the node remains in the graph unconditionally --- it
+is never conditionally skipped at the edge level. This is preferable to
+a conditional edge that bypasses the node, because it keeps the graph
+topology stable and makes the injection decision observable via the
+node's Langfuse span.
+
+The pipeline produces a memory block, but the format of that block is
+as important as its content. A poorly formatted injection degrades model
+steering even when the content is correct.
+
+%% ------------------------------------------------------------
+\section{Raw Records Are an Anti-Pattern; Labels Are Mandatory}
+\label{sec:compact-format}
+%% ------------------------------------------------------------
+
+The most common injection mistake is appending a Python \code{dict} or
+JSON object directly into the prompt: \verb|{"type": "preference",|
+\verb|"content": "user prefers dark mode", "created_at": "2026-01-15"}|.
+That format fails for three reasons. It is verbose: a 12-word user
+preference is wrapped in 60 characters of punctuation and field names.
+It leaks implementation: the model sees internal field names, storage
+timestamps in ISO format, and UUIDs that mean nothing in the context of
+a reasoning task. And it degrades model steering: the model's
+instruction-following is calibrated to prose, not to JSON-in-the-middle-of-prose.
+A model that receives JSON fragments in its system message attends to them
+less reliably than a model that receives a labelled, natural-language
+sentence.
+
+The mandatory format is a compact labelled line: \verb|Memory [type date]: summary|.
+The label provides the model with two signals at low token cost: the
+\emph{type} tells it what kind of fact this is (a past event, a standing
+preference, or an active task), and the \emph{date} tells it how recent
+the fact is, allowing the model to weight recency in its reasoning
+without being given a raw timestamp to parse. The summary is always
+a complete sentence or short paragraph --- never a field value
+extracted from a dict. The date format is \code{YYYY-MM-DD}: unambiguous,
+compact, and interpretable by the model without additional instructions.
+
+\begin{lstlisting}[language=Python,
+  caption={MemoryType, format\_single\_memory, and format\_memory\_block},
+  label={lst:format-memory}]
+# src/agent/memory/format_memory_block.py
+from __future__ import annotations
+from datetime import datetime
+from typing import Literal
+
+MemoryType = Literal["episodic", "profile", "preference", "task"]
+
+def format_single_memory(
+    mt:         MemoryType,
+    created_at: datetime,
+    summary:    str,
+) -> str:
+    date_str = created_at.strftime("%Y-%m-%d")
+    return f"Memory [{mt} {date_str}]: {summary}"
+
+def format_memory_block(memories: list) -> str:
+    """Accept list[RetrievedMemory]; return multi-line memory block."""
+    lines = []
+    for m in sorted(memories, key=lambda x: x["created_at"]):
+        lines.append(
+            format_single_memory(
+                mt=m["type"],
+                created_at=m["created_at"],
+                summary=m["content"],
+            )
+        )
+    return "\n".join(lines)
+
+def make_memory_system_message(memory_block: str):
+    from langchain_core.messages import SystemMessage
+    return SystemMessage(content=memory_block)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:format-memory} deserve explanation.
+
+First, \code{format\_memory\_block} sorts memories by
+\code{created\_at} ascending --- oldest first --- rather than by score
+descending. When the model reads a block of memory lines, temporal
+order provides a narrative coherence that relevance order does not: the
+user established a preference, then modified it, then acted on it; that
+sequence is meaningful. Within the block, all selected memories have
+already passed the \code{select\_top\_k} filter, so they are all
+considered relevant; ordering them by time is more useful than ordering
+them by a score the model never sees.
+
+Second, the four \code{MemoryType} literals are not open-ended strings.
+Constraining the type vocabulary prevents two common errors: a downstream
+step that branches on memory type (as Chapter~8's write node does) will
+fail with a clear \code{mypy} error if an unrecognised type is passed,
+rather than silently reaching a branch that does nothing. And the model's
+prompt instructions --- which tell it how to interpret \code{episodic}
+vs.\ \code{preference} entries --- are stable because the type vocabulary
+cannot drift at runtime.
+
+With a well-formed memory block guaranteed by the format layer, the
+remaining question is whether to inject it at all. Injecting on every
+turn wastes tokens and can introduce stale or irrelevant facts into the
+model's reasoning.
+
+%% ------------------------------------------------------------
+\section{Four Questions Decide Whether Injection Is Worthwhile}
+\label{sec:injection-policy}
+%% ------------------------------------------------------------
+
+The problem with unconditional injection is that it treats token cost as
+free and model attention as infinite. Neither is true. Every injected
+memory block occupies tokens in the \code{HISTORY} slot that could be
+used for recent conversational context. If the memories are not relevant
+to the current query, the model either ignores them (wasting tokens) or
+attends to them incorrectly (producing answers anchored on the wrong
+facts). If the memories are already implicit in the recent turns, the
+model receives redundant information that increases the risk of
+repetitive responses. If the memories are old enough to be misleading,
+injection actively harms output quality.
+
+The policy gate encodes four questions as boolean helper functions,
+each answerable from data already in the graph state. The four
+questions are: Is there at least one memory whose type and content are
+relevant to the current user query intent (\code{has\_relevant\_memory})?
+Is this memory not already obvious from the recent turns ---
+would injection be redundant (\code{is\_redundant\_with\_recent})?
+Is the memory recent enough, or explicitly timeless, so that using it
+now is safe and not misleading (\code{is\_fresh\_or\_timeless})?
+And will injecting this memory improve the model's decision or response
+quality more than it increases the token cost
+(\code{passes\_cost\_benefit})?
+
+\begin{tipbox}
+Configure \code{min\_score} to 0.6--0.7 for most applications. Below
+0.5, the relevance filter passes too many marginally related memories
+and the cost-benefit question rarely has a ``no'' answer that would have
+stopped them. The \code{max\_age\_days} threshold depends on memory
+type: set it to 90 for \code{episodic} memories, but leave
+\code{preference} and \code{profile} memories as effectively timeless
+by passing \code{max\_age\_days=365\,*\,10}.
+\end{tipbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Four policy helpers and should\_inject\_memory gate},
+  label={lst:injection-policy}]
+# src/agent/memory/injection_policy.py
+from __future__ import annotations
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Sequence
+from langchain_core.messages import BaseMessage
+
+TokenEstimator = Callable[[str], int]
+
+def has_relevant_memory(
+    memories: list, query: str, min_score: float = 0.6
+) -> bool:
+    return any(m["score"] >= min_score for m in memories)
+
+def is_redundant_with_recent(
+    messages: list[BaseMessage], memories: list
+) -> bool:
+    recent_text = " ".join(
+        m.content for m in messages[-6:] if m.content
+    ).lower()
+    for mem in memories:
+        if mem["content"][:40].lower() in recent_text:
+            return True
+    return False
+
+def is_fresh_or_timeless(
+    memory: dict, now: datetime, max_age_days: int = 90
+) -> bool:
+    created = memory["created_at"]
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age = (now.replace(tzinfo=timezone.utc) - created).days
+    return age <= max_age_days
+
+def passes_cost_benefit(
+    memories:         list,
+    max_extra_tokens: int,
+    estimate_tokens:  TokenEstimator,
+) -> bool:
+    total = sum(estimate_tokens(m["content"]) for m in memories)
+    return total <= max_extra_tokens
+
+def should_inject_memory(
+    state:            dict,
+    memories:         list,
+    now:              datetime,
+    max_extra_tokens: int,
+    min_score:        float = 0.6,
+    max_age_days:     int   = 90,
+    estimate_tokens:  TokenEstimator = lambda s: len(s.split()),
+) -> bool:
+    if not memories:
+        return False
+    if not has_relevant_memory(memories, _last_query(state), min_score):
+        return False
+    if is_redundant_with_recent(state.get("messages", []), memories):
+        return False
+    if not all(is_fresh_or_timeless(m, now, max_age_days) for m in memories):
+        memories = [m for m in memories
+                    if is_fresh_or_timeless(m, now, max_age_days)]
+    if not memories:
+        return False
+    return passes_cost_benefit(memories, max_extra_tokens, estimate_tokens)
+
+def _last_query(state: dict) -> str:
+    from langchain_core.messages import HumanMessage
+    for m in reversed(state.get("messages", [])):
+        if isinstance(m, HumanMessage):
+            return m.content
+    return ""
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:injection-policy} deserve
+explanation.
+
+First, \code{is\_redundant\_with\_recent} checks only the last six
+messages, not the full history. The full history may contain a distant
+mention of the same fact, but a distant mention does not make
+re-injection redundant --- the model may no longer be attending to it.
+The six-message window reflects the empirical attention boundary for
+most instruction-tuned models at production context depths; adjust it if
+evaluation data for a specific model suggests a different window.
+
+Second, \code{should\_inject\_memory} does not short-circuit on the
+freshness check. Instead, it \emph{filters} stale memories out of the
+list and proceeds with the remaining fresh ones. This is deliberate:
+a set of memories that is mostly fresh should not be entirely suppressed
+because one \code{episodic} entry from eighteen months ago failed the
+age check. The freshness filter narrows the set; only an empty set after
+filtering produces a \code{False} return on that path.
+
+Third, the default \code{estimate\_tokens} is word-count
+(\code{len(s.split())}). This is a deliberate underestimate of actual
+token count. The cost-benefit question should err on the side of
+injection: if word-count says the block fits, it almost certainly fits
+in tokens too. The conservative tokeniser approximation avoids
+introducing a \code{tiktoken} dependency in a module that is also used
+by lightweight evaluation scripts that do not have the binary available.
+Production deployments that need exact token accounting should pass
+\code{estimate\_tokens=lambda s: len(get\_encoder().encode(s))} at
+construction time.
+
+Chapter~8 introduces mem0 as the persistence and retrieval layer for
+long-term memories. The \code{retrieve\_raw\_memories} function built
+in \S\ref{sec:injection-pipeline} is the exact integration point: mem0's
+similarity-search results arrive as additional \code{RetrievedMemory}
+entries appended to the same list, flow through the same six steps, and
+are gated by the same four-question policy --- with no modification to
+any of the code written in this chapter.
