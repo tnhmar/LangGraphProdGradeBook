@@ -1,22 +1,1355 @@
-%% Chapter 8 — Structured Output and Instructor
-%% TODO: content
-\chapterquote{Unstructured output is a bug deferred to runtime.}{anon}
+%% ============================================================
+%%  Chapter 8 --- Persistence Requires Governance: Long-Term Memory with mem0
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
 
-This chapter covers \code{instructor}, Pydantic~v2 response models, retry
-logic, and output validation pipelines.
+\chapter{Chapter 8 --- Persistence Requires Governance: Long-Term Memory with mem0}
 
-\section{Why Structured Output Matters}
-\label{sec:why-structured-output}
-% TODO
+\chapterquote{A memory that outlives the session also outlives the mistake that wrote it.}{anon}
 
-\section{Instructor and Pydantic~v2}
-\label{sec:instructor-pydantic}
-% TODO
+The production failure this chapter prevents is silent persistence drift: the
+condition where an agent stores trivial chatter, stale user facts, duplicated
+preferences, or cross-tenant records in a long-term memory system and then
+faithfully retrieves them weeks later as if they were authoritative. The cost
+is not merely lower answer quality. It is compliance exposure, retrieval noise
+that degrades relevance, operational bloat in the vector store, and the most
+expensive failure of all: a system that can only explain why it answered badly
+by admitting that it remembered the wrong thing.
 
-\section{Retry and Correction Loops}
-\label{sec:retry-correction}
-% TODO
+The solution has four layers. The first layer is \emph{construction}: a single
+mem0 client, built once from validated configuration, with explicit deployment
+mode and backend choices. The second layer is \emph{governed writes}: a typed
+memory taxonomy, a five-check write gate, and metadata that gives every
+persisted record a lifecycle. The third layer is \emph{governed reads}: a
+retrieval pipeline that reuses Chapter~7's six-step injection contract,
+reranks what mem0 returns, and injects only the small set of memories worth
+paying for in prompt tokens. The fourth layer is \emph{operations}: expiry,
+pruning, inspection, optimistic locking, audit events, tenant isolation, and
+tests that prove the policy behaves under load rather than merely compiling.
 
-\section{Discriminated Unions in Practice}
-\label{sec:discriminated-unions}
-% TODO
+The sections follow dependency order. Section~\ref{sec:deployment-mode}
+establishes the interface and deployment boundary, because the rest of the
+chapter treats mem0 as a singleton dependency rather than an ad-hoc helper.
+Section~\ref{sec:config-not-code} fixes configuration next, because write and
+read policy are meaningless if the underlying store is unstable.
+Sections~\ref{sec:type-explicit} through~\ref{sec:semantic-extraction} govern
+what enters memory and what mem0 does with it after a write.
+Section~\ref{sec:retrieval-narrow} shows how long-term memory reuses the
+six-step pipeline that Chapter~7 introduced as the injection contract.
+The remaining sections move outward into lifecycle and operability: expiry,
+pruning, inspection, locking, auditing, multi-tenancy, and tests. That
+ordering matters because you cannot reason about deletion until you know what
+was written, and you cannot test retrieval until the write and read contracts
+are settled.
+
+This chapter introduces more than three persistent-memory terms, so
+Table~\ref{tab:mem0-taxonomy} defines them before any implementation detail.
+
+\begin{table}[ht]
+\centering
+\caption{Persistent-memory taxonomy introduced in Chapter~8}
+\label{tab:mem0-taxonomy}
+\begin{tabular}{llll}
+\toprule
+\textbf{Term} & \textbf{Role} & \textbf{Lifetime} & \textbf{Primary risk} \\
+\midrule
+\code{Memory}              & Self-hosted mem0 interface  & Process      & Misconfiguration \\
+\code{MemoryClient}        & Cloud mem0 interface        & Process      & Vendor boundary drift \\
+\code{MemoryType}          & Write/read taxonomy enum    & Per record   & Wrong policy branch \\
+\code{WriteDecision}       & Five-check gate result      & Per write    & Silent bad write \\
+\code{RetrievedMemory}     & Retrieval pipeline item     & Per read     & Injection noise \\
+\code{WriteAuditRecord}    & Write event payload         & Log window   & Missing provenance \\
+\code{RetrievalAuditRecord}& Read event payload          & Log window   & Unexplainable recall \\
+\code{ExpiryAuditRecord}   & Deletion event payload      & Log window   & Compliance blind spot \\
+\midrule
+Episodic memory   & \multicolumn{3}{l}{Session-grounded event, usually TTL-bound; primary risk: staleness} \\
+Semantic memory   & \multicolumn{3}{l}{Durable extracted fact; primary risk: conflict drift} \\
+Procedural memory & \multicolumn{3}{l}{Reusable workflow rule; primary risk: behavioural overreach} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The source layout for this chapter is:
+
+\begin{verbatim}
+src/
+  agent/
+    memory/
+      mem0_client.py          # §§8.1, 8.2, 8.13
+      memory_types.py         # §8.3
+      write_gate.py           # §8.4
+      memory_write_node.py    # §§8.5, 8.6, 8.11
+      memory_read_node.py     # §8.7
+      expiry_scheduler.py     # §§8.8, 8.9
+      memory_inspector.py     # §8.10
+      audit.py                # §8.12
+tests/
+  memory/
+    test_mem0_integration.py  # §8.14
+\end{verbatim}
+
+%% ------------------------------------------------------------
+\section{Deployment Mode Must Not Change Call Sites}
+\label{sec:deployment-mode}
+%% ------------------------------------------------------------
+
+The first design problem is deployment-environment contamination. A naive memory
+integration starts with one client locally, switches to a managed service in
+staging, and gradually accumulates \code{if~cloud: ... else: ...} forks at
+every write and search call site. The deployment decision has leaked into
+business logic, and the agent graph becomes untestable in isolation because
+each environment requires a different code path. The governing principle is
+that deployment mode is a construction-time choice; call sites know only
+that they hold a memory object.
+
+mem0 provides two entry points: \code{from~mem0~import~Memory} for
+self-hosted deployments wired to a local vector store, and
+\code{from~mem0~import~MemoryClient} for the cloud-managed service. The
+critical architectural fact is that both classes expose the same operational
+surface: \code{m.add()}, \code{m.search()}, \code{m.delete()}, and
+\code{m.get\_all()}. An agent that writes to the interface, not to a specific
+class, can be redeployed behind either without touching a single node.
+
+This chapter standardises on the self-hosted path throughout because the
+book's production model gives operators ownership over data placement,
+latency budgets, and deletion guarantees. The cloud client is a valid
+deployment alternative; it is not a different programming model.
+
+\begin{lstlisting}[language=Python,
+  caption={Both deployment modes expose the same write surface},
+  label={lst:mem0-interface}]
+# src/agent/memory/mem0_client.py
+from mem0 import Memory
+from mem0 import MemoryClient
+
+def build_self_hosted(config_dict: dict) -> Memory:
+    return Memory.from_config(config_dict)
+
+def build_cloud(api_key: str) -> MemoryClient:
+    return MemoryClient(api_key=api_key)
+
+def demo_same_surface(m, user_id: str) -> dict:
+    # This call is identical regardless of which builder produced m.
+    return m.add(
+        "User prefers terse release notes.",
+        user_id=user_id,
+        metadata={"type": "semantic"},
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:mem0-interface} deserve explanation.
+First, \code{demo\_same\_surface} accepts \code{m} without a type annotation
+rather than a union. This is deliberate: annotating as \code{Memory |
+MemoryClient} would import both classes at the call site, creating the coupling
+the function is supposed to eliminate. The interface contract is enforced by
+the shared method surface, not by a type annotation. Second, the listing
+demonstrates the sameness of the write call rather than contrasting the
+two construction signatures, because sameness is the design property the
+rest of the chapter depends on.
+
+A stable interface is not useful if every call site constructs its own client
+from different settings; the next section fixes configuration at a single point.
+
+%% ------------------------------------------------------------
+\section{Configuration Must Not Live in Code}
+\label{sec:config-not-code}
+%% ------------------------------------------------------------
+
+The naive wiring for long-term memory is to hardcode a hostname, an
+embedder name, and a collection name at the site of the first \code{m.add()}
+call. That works until the first migration, at which point half the fleet
+writes to one collection and half to another, retrieval quality drops, and
+nobody can reconstruct which records belong to which embedder generation.
+The governing principle, which Chapter~5 established for LLM settings, applies
+equally here: the entire backend configuration is a single validated object
+assembled once and injected everywhere as a dependency.
+
+mem0's configuration entry point is \code{Memory.from\_config(config\_dict)},
+which expects a dict with four top-level keys: \code{"llm"},
+\code{"embedder"}, \code{"vector\_store"}, and \code{"graph\_store"}. Missing
+any key raises a runtime error whose message does not identify which key is
+absent, making a builder function that makes the structure explicit far safer
+than constructing the dict inline. The \code{"llm"} key should point to the
+LiteLLM provider introduced in Chapter~5 so that mem0's internal extraction
+and conflict-resolution calls pass through the same routing, retry, and cost
+accounting layer the rest of the agent uses.
+
+\begin{warningbox}
+Changing the embedder after records have been written is a migration, not a
+configuration tweak. A Qdrant collection built with 1\,536-dimensional
+embeddings cannot be queried safely after switching to a 3\,072-dimensional
+model. Treat the embedder model name as schema: version it, and create a new
+collection with a migration job rather than silently changing it in settings.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={build\_mem0\_config and singleton get\_memory\_client},
+  label={lst:mem0-config}]
+# src/agent/memory/mem0_client.py
+from functools import lru_cache
+from mem0 import Memory
+
+COLLECTION_NAME = "agent_memories"
+
+def build_mem0_config(settings) -> dict:
+    return {
+        "llm": {
+            "provider": "litellm",
+            "config": {"model": settings.llm_model},
+        },
+        "embedder": {
+            "provider": "openai",
+            "config": {
+                "model":   "text-embedding-3-small",
+                "api_key": settings.openai_api_key.get_secret_value(),
+            },
+        },
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "collection_name": COLLECTION_NAME,
+                "host":            settings.qdrant_host,
+                "port":            settings.qdrant_port,
+            },
+        },
+        "graph_store": {
+            "provider": "neo4j",
+            "config":   {"url": settings.neo4j_url},
+        },
+    }
+
+@lru_cache(maxsize=1)
+def get_memory_client(settings) -> Memory:
+    return Memory.from_config(build_mem0_config(settings))
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:mem0-config} deserve explanation. First,
+\code{COLLECTION\_NAME} is a module-level constant, not a field in settings.
+This is a deliberate constraint: the collection name is shared infrastructure
+across all users and all deployments; making it configurable per-environment
+would allow a misconfiguration to silently route writes to the wrong
+collection. Second, \code{get\_memory\_client} is wrapped in
+\code{@lru\_cache(maxsize=1)}. The \code{Memory} object owns connections to
+Qdrant and Neo4j; constructing it per-request would establish and tear down
+those connections on every agent invocation. The cache ensures the client is
+constructed once per process even in environments where the calling code is
+executed many times. Third, the Neo4j graph store is listed explicitly rather
+than defaulted to \code{"in\_memory"}. The graph store is what enables mem0's
+conflict resolution for semantic memories; an in-memory graph store silently
+loses all relationship data on process restart, which is appropriate for tests
+but not for any deployment where semantic deduplication matters.
+
+With a singleton client in place and backend choices committed, the next
+question is what kind of thing is being written --- because type drives every
+downstream policy decision.
+
+%% ------------------------------------------------------------
+\section{Memory Type Must Be Explicit Before Every Write}
+\label{sec:type-explicit}
+%% ------------------------------------------------------------
+
+The temptation is to write everything with a single generic label and
+differentiate later in retrieval. This is the same mistake as storing all
+events in one untyped log and hoping queries will filter correctly.
+When the type is absent or inconsistent at write time, retrieval policy
+branches become meaningless, TTL assignment produces wrong lifetimes, and
+the injection formatter (Chapter~7 \S\ref{sec:compact-format}) cannot
+produce a labelled line because the label is unknown. The governing principle
+is that type must be resolved before \code{m.add()} is called, not after.
+
+Chapter~7 introduced \code{MemoryType} as a \code{Literal} string for the
+format layer. This section promotes it to a Python \code{Enum} so that the
+write gate, the read pipeline, and the audit records can branch on it with
+type safety. Three values cover the space of what an agent should persist.
+\emph{Episodic} memory is a specific past event grounded in a session: what
+the user asked, what the agent decided, what outcome was produced. It is
+time-indexed and usually TTL-bounded. \emph{Semantic} memory is a durable
+extracted fact about the user or world: ``user's timezone is UTC+9'',
+``user prefers imperative prose''. It is not session-indexed; it accumulates
+and is updated by mem0's internal conflict resolution. \emph{Procedural}
+memory is a workflow rule or learned preference for how to accomplish a
+class of tasks: ``when writing SQL, always qualify table names''. It
+instructs behaviour rather than recalling facts.
+
+\begin{notebox}
+Procedural memories are not injected through Chapter~7's memory block format.
+They describe how the agent should behave, not what it should recall; they
+belong in the \code{ROLE} slot of Chapter~6's context assembly node, not in
+the \code{HISTORY} slot. The injection node
+(\S\ref{sec:injection-pipeline} of Chapter~7) skips records whose type
+is \code{PROCEDURAL}. The context assembly node (Chapter~6
+\S\ref{sec:context-assembly-node}) reads them separately.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={MemoryType enum and LLM-backed classifier with safe fallback},
+  label={lst:memory-types}]
+# src/agent/memory/memory_types.py
+from enum import Enum
+from langchain_core.runnables import Runnable
+
+class MemoryType(str, Enum):
+    EPISODIC    = "episodic"
+    SEMANTIC    = "semantic"
+    PROCEDURAL  = "procedural"
+
+_CLASSIFY_PROMPT = (
+    "Classify the following text as exactly one of: "
+    "episodic, semantic, procedural. "
+    "Reply with the single word only.\n\nText: {content}"
+)
+
+def classify_memory_type(
+    content: str, llm: Runnable
+) -> MemoryType:
+    prompt = _CLASSIFY_PROMPT.format(content=content[:400])
+    raw    = llm.invoke(prompt).content.strip().lower()
+    try:
+        return MemoryType(raw)
+    except ValueError:
+        return MemoryType.EPISODIC
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:memory-types} deserve explanation. First,
+\code{MemoryType} inherits from both \code{str} and \code{Enum}, mirroring the
+pattern Chapter~6 used for \code{SlotName}. This makes a \code{MemoryType}
+value serialise as a plain string in audit records and Langfuse events without
+any custom encoder, while remaining a closed enumeration that the type checker
+validates at every call site. Second, the fallback on \code{ValueError} returns
+\code{EPISODIC} rather than raising. A classification failure should not abort
+the write; \code{EPISODIC} is the safest conservative choice because it carries
+the shortest TTL, meaning an incorrectly classified record will be expired
+rather than living indefinitely as a semantic or procedural entry.
+
+With type established, the write gate can now apply policy checks that are
+specific to each type's semantics.
+
+%% ------------------------------------------------------------
+\section{Every Write Must Justify Itself}
+\label{sec:write-gate}
+%% ------------------------------------------------------------
+
+The problem with writing every assistant turn to long-term memory is not
+storage cost --- it is retrieval poisoning. Every trivial exchange, duplicate
+preference, and fragmented tool observation that enters the store is a record
+that will be returned in future similarity searches, ranked alongside genuinely
+useful memories, and possibly injected into a prompt where it crowds out a
+more relevant fact. The governing principle is that a write must be approved by
+a gate that asks five questions, in order, before any \code{m.add()} call is
+made.
+
+The five checks are designed to fail fast: the gate short-circuits on the
+first failed check and returns a \code{WriteDecision} with \code{approved=False}
+and the name of the check that blocked the write. This makes the audit record
+(Section~\ref{sec:audit-trail}) actionable --- an operator can query
+``which check blocked the most writes this week'' and tune thresholds
+accordingly. The five checks are:
+
+\begin{enumerate}
+    \item \textbf{Significance} (\code{is\_significant}): does the content
+    exceed a minimum-information threshold? Content shorter than 20 words that
+    contains no named entity, no quantitative fact, and no stated preference
+    is considered trivial.
+
+    \item \textbf{Type classification} (\code{classify\_memory\_type}): can
+    the content be assigned a valid \code{MemoryType}? A classification that
+    returns \code{None} on a second pass aborts the write; this should not
+    happen with the fallback in \S\ref{sec:type-explicit}, but the gate
+    defends against future classifier changes.
+
+    \item \textbf{PII sensitivity} (\code{contains\_pii}): does the content
+    match patterns for credit card numbers, social security numbers, raw email
+    addresses, or passwords? Any match aborts the write and logs a
+    \code{PIIBlockedEvent}. The check uses a regex battery; it is fast and
+    imperfect. Do not use it as the sole PII control in a regulated
+    environment.
+
+    \item \textbf{Deduplication} (\code{is\_duplicate}): does
+    \code{m.search(content, filters=\{"user\_id": uid\}, limit=1)} return a
+    result with cosine similarity above 0.92? If so, the content is already in
+    the store and the write is redundant.
+
+    \item \textbf{TTL assignment} (\code{assign\_ttl}): what expiry timestamp
+    should this record carry? \code{EPISODIC} records expire in 90 days,
+    \code{SEMANTIC} in 365 days, and \code{PROCEDURAL} records do not expire.
+    The assignment always succeeds; the check exists to make the TTL decision
+    explicit and testable.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,
+  caption={WriteDecision dataclass and run\_write\_gate short-circuit logic},
+  label={lst:write-gate}]
+# src/agent/memory/write_gate.py
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from src.agent.memory.memory_types import MemoryType
+
+@dataclass
+class WriteDecision:
+    approved:        bool
+    reason:          str
+    blocked_check:   str
+    memory_type:     MemoryType | None
+    ttl_expires_at:  datetime | None
+    importance_score: float = 0.0
+    expected_version: int   = 1
+
+_PII_RE = re.compile(
+    r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b"  # credit card
+    r"|\b\d{3}-\d{2}-\d{4}\b"                      # SSN
+    r"|password\s*[:=]\s*\S+",
+    re.IGNORECASE,
+)
+
+def is_significant(content: str) -> bool:
+    return len(content.split()) >= 20
+
+def contains_pii(content: str) -> bool:
+    return bool(_PII_RE.search(content))
+
+def is_duplicate(content: str, user_id: str, m) -> bool:
+    results = m.search(content, filters={"user_id": user_id}, limit=1)
+    return bool(results and results[0].get("score", 0.0) >= 0.92)
+
+def assign_ttl(mt: MemoryType, now: datetime) -> datetime | None:
+    if mt == MemoryType.EPISODIC:  return now + timedelta(days=90)
+    if mt == MemoryType.SEMANTIC:  return now + timedelta(days=365)
+    return None  # PROCEDURAL never expires
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={run\_write\_gate composing the five checks into a single decision},
+  label={lst:write-gate-run}]
+# src/agent/memory/write_gate.py (continued)
+def run_write_gate(
+    content:  str,
+    user_id:  str,
+    m,
+    llm,
+    now:      datetime,
+) -> WriteDecision:
+    if not is_significant(content):
+        return WriteDecision(False, "content too short", "significance",
+                             None, None)
+    mt = classify_memory_type(content, llm)
+    if mt is None:
+        return WriteDecision(False, "unclassifiable", "type_classification",
+                             None, None)
+    if contains_pii(content):
+        return WriteDecision(False, "PII detected", "pii_sensitivity",
+                             mt, None)
+    if is_duplicate(content, user_id, m):
+        return WriteDecision(False, "duplicate", "deduplication", mt, None)
+    ttl = assign_ttl(mt, now)
+    return WriteDecision(True, "approved", "", mt, ttl)
+\end{lstlisting}
+
+Three decisions in Listings~\ref{lst:write-gate} and~\ref{lst:write-gate-run}
+deserve explanation. First, \code{WriteDecision} is a \code{dataclass} rather
+than a plain tuple or dict. The downstream write node, the audit emitter, and
+the test suite all read named fields; a dataclass makes that access type-safe
+and makes the decision's full structure visible in a single class definition.
+Second, \code{is\_duplicate} calls \code{m.search()} rather than maintaining a
+local cache. The gate runs before the write; the most authoritative answer to
+``does this exist'' is always the vector store, not an in-process approximation
+that may lag if another session wrote to the same user's memory concurrently.
+Third, the PII regex is intentionally coarse. It is the first line of a
+defence-in-depth stack, not the whole stack. Organisations subject to GDPR or
+HIPAA should layer a dedicated PII classification model on top of this regex
+check; the gate's contract is that it blocks obvious patterns fast, not that
+it catches everything.
+
+With a gate deciding what can be written, the next question is what metadata
+must accompany every approved write so the record carries its own lifecycle
+policy.
+
+%% ------------------------------------------------------------
+\section{Episodic Writes Must Carry Their Own Lifecycle}
+\label{sec:episodic-writes}
+%% ------------------------------------------------------------
+
+The problem with a bare \code{m.add(content)} call is that the record has no
+lifecycle. It cannot be expired, it cannot be pruned by importance, and it
+cannot be retrieved with a reliable timestamp because mem0's internal
+\code{created\_at} field may not reflect when in the session the fact was
+relevant. The governing principle is that every approved episodic write
+carries metadata that makes the record self-describing: what it is, how
+important it is, when it should expire, and what version it represents.
+
+The \code{m.add()} signature for a full episodic write passes the conversation
+turns as a list of role-dicts rather than a flat string. mem0's internal
+extraction pipeline uses the role structure --- distinguishing user statements
+from assistant inferences --- to decide what is worth extracting as a semantic
+fact. Passing a flat string collapses that distinction and reduces extraction
+quality.
+
+\begin{lstlisting}[language=Python,
+  caption={write\_episodic\_memory with full metadata and memory\_id capture},
+  label={lst:episodic-write}]
+# src/agent/memory/memory_write_node.py
+from datetime import datetime
+
+def score_importance(
+    messages: list[dict],
+    query_terms: list[str],
+) -> float:
+    text   = " ".join(m.get("content","") for m in messages)
+    words  = text.split()
+    length = min(len(words) / 100.0, 0.4)
+    term_hits = sum(1 for t in query_terms if t.lower() in text.lower())
+    overlap = min(term_hits / max(len(query_terms), 1), 0.6)
+    return round(length + overlap, 3)
+
+def write_episodic_memory(
+    messages:   list[dict],
+    user_id:    str,
+    session_id: str,
+    m,
+    gate,
+    now:        datetime,
+    query_terms: list[str] = [],
+) -> str | None:
+    if not gate.approved:
+        return None
+    importance = score_importance(messages, query_terms)
+    result = m.add(
+        messages,
+        user_id=user_id,
+        metadata={
+            "type":           gate.memory_type.value,
+            "ttl_expires_at": gate.ttl_expires_at.isoformat()
+                              if gate.ttl_expires_at else None,
+            "importance_score": importance,
+            "session_id":     session_id,
+            "version":        gate.expected_version,
+        },
+    )
+    return result.get("memory_id") or result.get("id")
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:episodic-write} deserve explanation. First,
+\code{score\_importance} uses word count and query-term overlap rather than
+an LLM call. An LLM-based importance scorer would add latency and cost to
+every approved write; a lightweight heuristic that returns a float in
+\([0, 1]\) is sufficient for the pruning threshold in \S\ref{sec:pruning}
+and for the audit record in \S\ref{sec:audit-trail}. Second,
+\code{ttl\_expires\_at} is serialised as an ISO 8601 string rather than stored
+as a \code{datetime} object. mem0's metadata payload is ultimately serialised
+to Qdrant's JSON payload store; a \code{datetime} object would cause a
+serialisation error at write time. The expiry job (\S\ref{sec:ttl-expiry})
+parses this string back to a \code{datetime} when it reads records.
+
+The write node persists episodic content explicitly. mem0 also runs its own
+extraction pipeline silently after every \code{m.add()}, which the next
+section explains and shows how to observe.
+
+%% ------------------------------------------------------------
+\section{Semantic Extraction Is Automatic, But Must Be Monitored}
+\label{sec:semantic-extraction}
+%% ------------------------------------------------------------
+
+The problem is that automatic extraction is invisible unless deliberately
+surfaced. After every \code{m.add()} call, mem0 runs an LLM-backed pipeline
+that parses the content for durable facts, writes them as semantic records to
+the Neo4j graph layer, and handles conflicts against existing semantic records
+by updating or deleting nodes rather than duplicating them. If this pipeline
+produces empty results on turns that clearly contain factual statements, or
+if it creates spurious facts from ambiguous phrasing, the operator has no way
+to detect the problem without explicitly logging the extraction output.
+The governing principle is that automatic behaviour must be exposed as a
+first-class observable event.
+
+mem0 surfaces extraction results in the return value of \code{m.add()} under
+the \code{"extracted\_memories"} key, as a list of dicts. Each dict has a
+\code{"memory"} field with the extracted text and an \code{"event"} field
+with one of four values: \code{"ADD"} (new record created), \code{"UPDATE"}
+(existing record modified by conflict resolution), \code{"DELETE"} (existing
+record removed as superseded), or \code{"NONE"} (no extraction action taken).
+Logging this list to Langfuse converts automatic extraction into auditable
+events.
+
+\begin{warningbox}
+The PII check at the write gate runs on the raw \code{content} argument before
+\code{m.add()} is called. It does not run on extracted semantic records,
+which may surface PII fragments that were embedded in longer text the gate
+considered clean. Call \code{pii\_scan\_extracted} on every extraction result
+before logging it to Langfuse or storing it in audit records.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={log\_semantic\_extractions with PII scan and Langfuse event emission},
+  label={lst:semantic-extraction}]
+# src/agent/memory/memory_write_node.py (continued)
+import re
+
+_PII_RE_SIMPLE = re.compile(
+    r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b|\b\d{3}-\d{2}-\d{4}\b",
+)
+
+def pii_scan_extracted(extracted: list[dict]) -> list[dict]:
+    return [
+        e for e in extracted
+        if not _PII_RE_SIMPLE.search(e.get("memory", ""))
+    ]
+
+def log_semantic_extractions(
+    add_result:      dict,
+    langfuse_client,
+    user_id:         str,
+    trace_id:        str,
+) -> list[str]:
+    raw = add_result.get("extracted_memories", [])
+    clean = pii_scan_extracted(raw)
+    events = [e.get("event", "NONE") for e in clean]
+    langfuse_client.event(
+        trace_id=trace_id,
+        name="semantic_extraction",
+        input={"user_id": user_id},
+        output={"count": len(clean), "events": events,
+                "memories": [e.get("memory","") for e in clean]},
+    )
+    return events
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:semantic-extraction} deserve explanation.
+First, \code{pii\_scan\_extracted} filters rather than redacts. Replacing PII
+with a placeholder string (``\texttt{[REDACTED]}'') would create an audit record
+that looks clean but carries a semantically broken sentence, which could be
+injected into a future prompt as misinformation. Dropping the record entirely
+is safer. Second, \code{log\_semantic\_extractions} returns the list of event
+strings. The caller stores this list in \code{AgentState["meta"]
+["last\_extraction\_events"]}, where the \code{MemoryInspector}
+(\S\ref{sec:memory-inspection}) includes it in compliance dumps as evidence
+of what the agent inferred from the session.
+
+With writes governed and observed, the chapter now turns to retrieval --- the
+part that determines what the model ultimately sees.
+
+%% ------------------------------------------------------------
+\section{Retrieval Must Narrow Before It Injects}
+\label{sec:retrieval-narrow}
+%% ------------------------------------------------------------
+
+The problem with passing mem0's raw search results directly to the context
+assembly node is that \code{m.search()} optimises for recall, not for prompt
+economy. Setting \code{limit=5} returns the five nearest vectors by cosine
+distance, but cosine distance ignores recency, penalises no one for age,
+and weights a record from three years ago identically to one from yesterday
+if their embeddings are close. The context window costs money; injecting
+five records when two would suffice is not caution, it is waste. The
+governing principle is that retrieval must reduce a wide candidate set through
+explicit, auditable steps before any record reaches a prompt.
+
+Chapter~7 \S\ref{sec:injection-pipeline} established the six-step injection
+pipeline as the contract: \code{retrieve\_raw\_memories}, \code{filter\_by\_scope},
+\code{score\_and\_rank}, \code{select\_top\_k}, \code{format\_memory\_block},
+and \code{inject\_memory\_block}. This section replaces the placeholder stub in
+\code{retrieve\_raw\_memories} with a real \code{m.search()} call and adds a
+recency decay reranker between retrieval and the top-k cut. All downstream
+steps from Chapter~7 are reused unchanged.
+
+\begin{notebox}
+Setting \code{limit=20} in \code{m.search()} intentionally over-fetches
+relative to the final top-5 selection. Fetching only 5 would bypass the
+reranking step: the 5 nearest vectors by cosine distance are not the same
+as the 5 best candidates after recency decay. The reranker needs a wider
+candidate pool to do useful work.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={retrieve\_raw\_memories with m.search() and rerank\_with\_recency},
+  label={lst:retrieval}]
+# src/agent/memory/memory_read_node.py
+from datetime import datetime, timezone
+from src.agent.memory.mem0_client import safe_search
+from src.agent.memory.memory_injection_node import RetrievedMemory
+
+MEM0_SEARCH_LIMIT = 20
+
+def decay(days_old: float, half_life: float = 30.0) -> float:
+    return 0.5 ** (days_old / half_life)
+
+def rerank_with_recency(
+    memories:        list[RetrievedMemory],
+    now:             datetime,
+    half_life_days:  float = 30.0,
+) -> list[RetrievedMemory]:
+    for m in memories:
+        created = m["created_at"]
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age = (now.replace(tzinfo=timezone.utc) - created).days
+        m["score"] = m["score"] * decay(age, half_life_days)
+    return sorted(memories, key=lambda x: x["score"], reverse=True)
+
+def retrieve_raw_memories(state, m, user_id: str) -> list[RetrievedMemory]:
+    query   = _last_query(state)
+    results = safe_search(m, query, user_id, limit=MEM0_SEARCH_LIMIT)
+    memories = [
+        RetrievedMemory(
+            id=r["id"],
+            type=r.get("metadata", {}).get("type", "episodic"),
+            created_at=_parse_dt(r.get("created_at", "")),
+            content=r["memory"],
+            score=r.get("score", 0.5),
+        )
+        for r in results
+    ]
+    if state.get("history"):
+        memories.append(RetrievedMemory(
+            id="history-summary", type="episodic",
+            created_at=datetime.utcnow(),
+            content=state["history"], score=1.0,
+        ))
+    return memories
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:retrieval} deserve explanation. First,
+\code{decay} applies exponential decay with a 30-day half-life. This means a
+record that is 30 days old has its cosine score halved; at 90 days, the score
+is one-eighth of its original value. The half-life is a parameter rather than
+a constant so that different memory types can use different decay rates
+--- episodic memories may warrant a shorter half-life than semantic facts about
+a user's long-standing preferences. Second, \code{m["score"]} is mutated
+in-place inside \code{rerank\_with\_recency} rather than building a new list.
+The \code{RetrievedMemory} TypedDict is a local data-flow object, not shared
+state; mutation is acceptable and avoids an extra allocation per candidate.
+Third, the history summary from \code{state["history"]} is appended with
+\code{score=1.0}. This is intentional: the compressed summary produced by
+Chapter~7's summarisation node represents content the agent has already decided
+is worth preserving; it should not compete with mem0 records in the recency
+ranking.
+
+With retrieval governed, the next operational concern is what happens to
+records that have lived long enough to be wrong, misleading, or simply
+irrelevant.
+
+%% ------------------------------------------------------------
+\section{Expiry Must Run on a Schedule, Not on Demand}
+\label{sec:ttl-expiry}
+%% ------------------------------------------------------------
+
+The problem with lazy expiry --- checking \code{ttl\_expires\_at} during
+retrieval and silently skipping expired records --- is that expired records
+remain in the vector store. They occupy index space, they appear in
+\code{m.get\_all()} responses, and they can still be returned by
+\code{m.search()} in the instant before the filter is applied. More
+importantly, lazy expiry is invisible: nobody knows how many expired records
+exist, and a compliance request for ``all memories we hold for user X''
+includes them. The governing principle is that expiry is a scheduled
+maintenance operation that physically removes records, not a retrieval
+filter that hides them.
+
+APScheduler's \code{BackgroundScheduler} is a daemon-thread scheduler that
+runs jobs inside the application process without requiring a separate worker
+or queue service. The scheduler is constructed once at application startup,
+the expiry job is registered with a \code{CronTrigger}, and the scheduler is
+shut down gracefully on process exit via \code{atexit}. A nightly run at
+02:00 UTC avoids peak session traffic in most timezones and keeps the
+delete-per-day count small, so Qdrant's write-ahead log does not accumulate
+a large delete batch.
+
+\begin{lstlisting}[language=Python,
+  caption={expire\_ttl\_memories and build\_expiry\_scheduler with CronTrigger},
+  label={lst:ttl-expiry}]
+# src/agent/memory/expiry_scheduler.py
+import atexit
+from datetime import datetime, timezone
+from typing import Callable
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+def expire_ttl_memories(
+    m,
+    user_ids:  set[str],
+    now:       datetime,
+) -> int:
+    deleted = 0
+    for uid in user_ids:
+        for record in m.get_all(user_id=uid):
+            ttl_str = record.get("metadata", {}).get("ttl_expires_at")
+            if not ttl_str:
+                continue
+            ttl = datetime.fromisoformat(ttl_str).replace(tzinfo=timezone.utc)
+            if now.replace(tzinfo=timezone.utc) >= ttl:
+                m.delete(record["id"])
+                deleted += 1
+    return deleted
+
+def build_expiry_scheduler(
+    m:             object,
+    get_user_ids:  Callable[[], set[str]],
+) -> BackgroundScheduler:
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        func    = lambda: expire_ttl_memories(m, get_user_ids(), datetime.utcnow()),
+        trigger = CronTrigger(hour=2, minute=0),
+        id      = "ttl_expiry",
+        replace_existing = True,
+    )
+    scheduler.start()
+    atexit.register(scheduler.shutdown)
+    return scheduler
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:ttl-expiry} deserve explanation. First,
+\code{get\_user\_ids} is passed as a callable rather than as a set, because the
+set of active users changes over time and the job runs nightly; a stale
+snapshot of user IDs would miss new users and may include deleted ones. The
+callable queries the current active-user registry (a Redis set or a Postgres
+table that the write node updates on every \code{m.add()} call) at job
+execution time, not at scheduler construction time. Second, \code{atexit.register(
+scheduler.shutdown)} ensures that APScheduler's background thread is joined
+cleanly when the process exits, rather than being killed mid-iteration of an
+active deletion loop. Without this, a deployment rollover can leave a partial
+deletion run with no log entry for the incomplete deletes. Third,
+\code{expire\_ttl\_memories} returns the count of deleted records. The caller
+constructs an \code{ExpiryAuditRecord} from this count and emits it to
+Langfuse; the count is the only field that cannot be derived from the audit
+record's other fields, so it must be returned explicitly rather than assumed.
+
+Records that are not yet expired but are never retrieved may still be worth
+removing; the next section handles that case.
+
+%% ------------------------------------------------------------
+\section{Unread Memories Should Be Archived Before Deletion}
+\label{sec:pruning}
+%% ------------------------------------------------------------
+
+TTL expiry removes memories because they are old. Importance-threshold pruning
+removes memories because they were never useful --- their \code{importance\_score}
+fell below a threshold and no retrieval audit record has ever included their ID.
+The distinction matters because an expired memory might still be wanted for
+audit purposes, whereas a never-retrieved, low-importance memory is just noise.
+The governing principle is that pruning is two-phase: archive first, delete
+second, so the record is recoverable during the archival window if a compliance
+or debugging need surfaces after deletion.
+
+The archive target is S3 rather than a second database table because S3
+provides lifecycle policies, bucket-level access controls, and cost-tiered
+storage that make it suited for long-term archival data. The archive job writes
+a JSON object per deleted record and only calls \code{m.delete()} after
+confirming the S3 write succeeded. If the S3 write fails, the record stays in
+Qdrant; the next weekly run retries the pair.
+
+\begin{lstlisting}[language=Python,
+  caption={archive\_to\_s3, prune\_low\_importance, and add\_pruning\_job},
+  label={lst:pruning}]
+# src/agent/memory/expiry_scheduler.py (continued)
+import json
+from dataclasses import dataclass, asdict
+
+@dataclass
+class PruneArchiveRecord:
+    memory_id:       str
+    user_id:         str
+    content:         str
+    metadata:        dict
+    archived_at:     str
+    importance_score: float
+
+def archive_to_s3(record: dict, s3_client, bucket: str,
+                  user_id: str) -> bool:
+    body = json.dumps(asdict(PruneArchiveRecord(
+        memory_id=record["id"], user_id=user_id,
+        content=record.get("memory",""),
+        metadata=record.get("metadata",{}),
+        archived_at=datetime.utcnow().isoformat(),
+        importance_score=record.get("metadata",{}).get("importance_score",0.0),
+    )))
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=f"archives/{user_id}/{record['id']}.json",
+            Body=body,
+        )
+        return True
+    except Exception:
+        return False
+
+def prune_low_importance(
+    m, s3_client, bucket: str,
+    user_ids: set[str], threshold: float = 0.2,
+) -> int:
+    pruned = 0
+    for uid in user_ids:
+        for rec in m.get_all(user_id=uid):
+            score = rec.get("metadata",{}).get("importance_score", 1.0)
+            if score < threshold:
+                if archive_to_s3(rec, s3_client, bucket, uid):
+                    m.delete(rec["id"])
+                    pruned += 1
+    return pruned
+
+def add_pruning_job(scheduler, m, s3_client, bucket, get_user_ids):
+    scheduler.add_job(
+        func=lambda: prune_low_importance(
+            m, s3_client, bucket, get_user_ids()),
+        trigger=CronTrigger(day_of_week="sun", hour=3),
+        id="importance_prune", replace_existing=True,
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:pruning} deserve explanation. First,
+\code{importance\_score} defaults to \code{1.0} when absent from metadata
+rather than to \code{0.0}. A missing score means the record was written without
+the score field --- either by a legacy path or by a test fixture. Defaulting to
+\code{1.0} causes the pruning job to skip such records rather than deleting
+them, which is the safer conservative choice. Second, \code{add\_pruning\_job}
+accepts the scheduler built by \code{build\_expiry\_scheduler} rather than
+constructing its own. Both jobs run on the same scheduler instance, which means
+both are started and stopped by the same lifecycle code, and both appear in the
+same APScheduler job list for monitoring.
+
+The records in Qdrant and S3 describe what the agent has stored. The next
+concern is how to surface that state for compliance and debugging without
+routing the retrieval through the agent's production hot path.
+
+%% ------------------------------------------------------------
+\section{Inspection Is a Compliance Surface, Not a Debug Tool}
+\label{sec:memory-inspection}
+%% ------------------------------------------------------------
+
+The problem with using \code{m.get\_all()} directly in ad-hoc scripts is that
+it has no access control, no audit trail, no serialisation contract, and no
+way to attach the result to a Langfuse trace. In regulated environments, a
+``show me everything stored for this user'' query is not debugging --- it is a
+GDPR Article~15 right-of-access response, and it must be signed, timestamped,
+and auditable. The governing principle is that memory inspection is a
+first-class operation implemented as a typed class, not a convenience function.
+
+\code{m.get\_all(user\_id=uid)} is expensive: it returns the full record set
+for a user and must not be called inside the agent graph's per-request path.
+The three legitimate use cases are a compliance export triggered by an operator
+API, a debug event attached to a Langfuse trace when \code{LLMSettings.debug}
+is \code{True}, and an evaluation fixture call in the test suite
+(\S\ref{sec:test-suite}).
+
+\begin{lstlisting}[language=Python,
+  caption={MemoryInspector with compliance export and debug event emission},
+  label={lst:memory-inspector}]
+# src/agent/memory/memory_inspector.py
+import hashlib, hmac, json
+from dataclasses import dataclass
+
+@dataclass
+class MemoryExportRecord:
+    memory_id:       str
+    content:         str
+    type:            str
+    created_at:      str
+    ttl_expires_at:  str | None
+    importance_score: float
+
+class MemoryInspector:
+    def __init__(self, m, langfuse_client) -> None:
+        self._m  = m
+        self._lf = langfuse_client
+
+    def get_all_for_user(self, user_id: str) -> list[dict]:
+        return self._m.get_all(user_id=user_id)
+
+    def emit_debug_event(self, user_id: str, state: dict) -> None:
+        records = self.get_all_for_user(user_id)
+        self._lf.event(
+            trace_id = state["meta"].get("langfuse_trace_id"),
+            name     = "memory_inspector",
+            input    = {"user_id": user_id},
+            output   = {
+                "count":             len(records),
+                "records":           records,
+                "extraction_events": state["meta"].get(
+                    "last_extraction_events", []),
+            },
+        )
+
+    def export_for_gdpr(
+        self, user_id: str, signing_key: bytes,
+    ) -> tuple[list[MemoryExportRecord], str]:
+        records = self.get_all_for_user(user_id)
+        exports = [MemoryExportRecord(
+            memory_id=r["id"],
+            content=r.get("memory",""),
+            type=r.get("metadata",{}).get("type",""),
+            created_at=r.get("created_at",""),
+            ttl_expires_at=r.get("metadata",{}).get("ttl_expires_at"),
+            importance_score=r.get("metadata",{}).get("importance_score",0.0),
+        ) for r in records]
+        payload = json.dumps([e.__dict__ for e in exports], sort_keys=True)
+        sig = hmac.new(signing_key, payload.encode(), hashlib.sha256).hexdigest()
+        return exports, sig
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:memory-inspector} deserve explanation. First,
+the GDPR export signs the JSON payload with an HMAC rather than with a
+public-key signature. HMAC is sufficient for integrity verification between the
+operator and the user when both parties share the signing key; it avoids the
+certificate infrastructure that asymmetric signing would require. The user
+receives the payload and the hex signature; they can verify with any SHA-256
+HMAC implementation. Second, \code{emit\_debug\_event} reads the trace ID from
+\code{state["meta"]["langfuse\_trace\_id"]} rather than constructing a new
+trace. The debug event must be attached to the session trace that produced the
+memory state being inspected, so the Langfuse timeline shows it in context
+with the writes and retrievals that occurred during the same session.
+
+Inspection reveals what exists. The next section addresses a problem that
+inspection can surface but cannot fix: two sessions writing conflicting updates
+to the same record.
+
+%% ------------------------------------------------------------
+\section{Concurrent Writes to the Same Record Need a Version Check}
+\label{sec:optimistic-locking}
+%% ------------------------------------------------------------
+
+The concurrency problem is subtle because mem0 does not expose transactions.
+When two sessions for the same user run simultaneously --- which is common in
+multi-tab browser clients or background polling agents --- both may retrieve the
+same semantic record, both may modify it based on what they see, and both may
+call \code{m.add()} on the updated content. mem0's deduplication check is not
+an atomic compare-and-swap; it is a similarity search. The later write wins
+and the earlier write's update is lost, silently. The governing principle is
+that the record must carry its own version counter, and a write must abort if
+the version it expected to overwrite has already changed.
+
+Optimistic locking is the appropriate choice here rather than pessimistic
+locking (holding a distributed lock around the read-modify-write cycle)
+because memory writes are infrequent relative to read-only operations, the
+cost of a retry is low, and a distributed lock would add a Redis or Zookeeper
+dependency that is disproportionate for a background write. The version field
+is stored in \code{metadata["version"]} and incremented on every successful
+write. The write node reads the current version at the start of the write
+attempt, embeds the incremented value in the write, and aborts if a
+concurrent write has already incremented the version.
+
+\begin{lstlisting}[language=Python,
+  caption={versioned\_write with optimistic-lock retry loop},
+  label={lst:optimistic-lock}]
+# src/agent/memory/memory_write_node.py (continued)
+
+class MemoryConflictError(RuntimeError):
+    pass
+
+def fetch_current_version(
+    memory_id: str, user_id: str, m
+) -> int:
+    results = m.search(memory_id, filters={"user_id": user_id}, limit=1)
+    if not results:
+        return 0
+    return results[0].get("metadata", {}).get("version", 0)
+
+def versioned_write(
+    messages:          list[dict],
+    user_id:           str,
+    m,
+    gate,
+    expected_version:  int,
+    max_retries:       int = 3,
+) -> str | None:
+    if not gate.approved:
+        return None
+    for attempt in range(max_retries):
+        current = fetch_current_version(
+            messages[0].get("content","")[:80], user_id, m
+        )
+        if current != expected_version:
+            expected_version = current
+            continue
+        result = m.add(
+            messages, user_id=user_id,
+            metadata={
+                "type":            gate.memory_type.value,
+                "ttl_expires_at":  gate.ttl_expires_at.isoformat()
+                                   if gate.ttl_expires_at else None,
+                "version":         expected_version + 1,
+            },
+        )
+        return result.get("memory_id") or result.get("id")
+    raise MemoryConflictError(
+        f"Write conflict unresolved after {max_retries} retries "
+        f"for user {user_id}"
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:optimistic-lock} deserve explanation. First,
+the retry loop updates \code{expected\_version} to the fetched \code{current}
+value on a mismatch rather than keeping the original expected value. This
+means the second retry reads a fresh version rather than re-attempting a
+write against a version that is already known to be stale. The content being
+written is the same; only the version metadata changes. Second,
+\code{MemoryConflictError} is a \code{RuntimeError} rather than a
+\code{ValueError}. A conflict after three retries is not a validation
+error --- the content is valid. It is a runtime condition that signals
+unusual write contention for this user; the calling node should log it and
+skip the write rather than propagating the exception up the graph stack and
+terminating the session.
+
+With write correctness addressed, the chapter now turns to audit: making every
+memory operation visible for debugging, compliance, and evaluation.
+
+%% ------------------------------------------------------------
+\section{Every Memory Operation Produces a Structured Event}
+\label{sec:audit-trail}
+%% ------------------------------------------------------------
+
+The problem with relying on unstructured log lines for memory observability is
+that log lines are parse-dependent. Answering ``how many writes did the PII
+check block this week for user X?'' requires writing a log parser that is
+specific to a log format that may change. A structured Langfuse event with
+typed fields can be queried directly, aggregated across sessions, and joined
+with retrieval events to build attribution chains. The governing principle is
+that every write, retrieval, and expiry operation emits a structured event with
+fields that support the four questions operators actually ask: what happened,
+to whose data, when, and why.
+
+The three audit record types are \code{WriteAuditRecord},
+\code{RetrievalAuditRecord}, and \code{ExpiryAuditRecord}. They are
+\code{dataclass} objects rather than plain dicts so that the emitter function
+can pass them as typed arguments and the test suite can assert on named fields.
+
+\begin{lstlisting}[language=Python,
+  caption={Three audit dataclasses and their Langfuse emitters},
+  label={lst:audit-records}]
+# src/agent/memory/audit.py
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal
+
+@dataclass
+class WriteAuditRecord:
+    memory_id:        str | None
+    user_id:          str
+    session_id:       str
+    memory_type:      str
+    approved:         bool
+    blocked_check:    str | None
+    importance_score: float
+    ttl_expires_at:   str | None
+    conflict_retries: int
+    timestamp:        datetime
+
+@dataclass
+class RetrievalAuditRecord:
+    user_id:                  str
+    session_id:               str
+    query:                    str
+    candidate_count:          int
+    selected_ids:             list[str]
+    injected:                 bool
+    injection_blocked_reason: str | None
+    timestamp:                datetime
+
+@dataclass
+class ExpiryAuditRecord:
+    memory_id:        str
+    user_id:          str
+    expiry_type:      Literal["ttl", "importance"]
+    importance_score: float | None
+    archived_to_s3:   bool
+    timestamp:        datetime
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={emit\_ functions attaching audit records to Langfuse traces},
+  label={lst:audit-emitters}]
+# src/agent/memory/audit.py (continued)
+from dataclasses import asdict
+
+def emit_write_audit(record: WriteAuditRecord, lf, trace_id: str) -> None:
+    lf.event(trace_id=trace_id, name="memory_write_audit",
+             input={"user_id": record.user_id,
+                    "approved": record.approved,
+                    "blocked_check": record.blocked_check},
+             output=asdict(record))
+
+def emit_retrieval_audit(
+    record: RetrievalAuditRecord, lf, trace_id: str
+) -> None:
+    lf.event(trace_id=trace_id, name="memory_retrieval_audit",
+             input={"user_id": record.user_id, "query": record.query},
+             output=asdict(record))
+
+def emit_expiry_audit(record: ExpiryAuditRecord, lf) -> None:
+    # Expiry runs outside any session; no trace_id is available.
+    lf.event(name="memory_expiry_audit",
+             input={"memory_id": record.memory_id,
+                    "expiry_type": record.expiry_type},
+             output=asdict(record))
+\end{lstlisting}
+
+Two decisions in Listings~\ref{lst:audit-records} and~\ref{lst:audit-emitters}
+deserve explanation. First, \code{ExpiryAuditRecord} events are emitted without
+a \code{trace\_id}. Expiry runs from a scheduled background job that has no
+session context; creating a synthetic trace ID would make the events appear
+in the Langfuse UI as orphaned sessions, confusing the session-level analytics.
+A trace-ID-free event lands in Langfuse's global event stream, where it can be
+queried independently. Second, both the \code{input} and \code{output} fields
+of each event carry the full dataclass as the output while projecting only the
+most-queried fields into \code{input}. Langfuse's dashboard filter works on
+\code{input} fields; surfacing \code{user\_id}, \code{approved}, and
+\code{query} at the top level makes it possible to build compliance dashboards
+without parsing the full output blob.
+
+The audit trail answers questions about individual operations. The final
+system-level question is whether operations from one user can ever touch
+another user's data.
+
+%% ------------------------------------------------------------
+\section{Tenant Isolation Belongs at Every Call Site}
+\label{sec:tenant-isolation}
+%% ------------------------------------------------------------
+
+The temptation is to enforce isolation architecturally --- by creating a
+separate Qdrant collection per user --- and then trust that the infrastructure
+prevents cross-tenant access. This is the wrong pattern for two reasons.
+Creating thousands of Qdrant collections for thousands of users incurs per-collection
+overhead in the Qdrant service, makes cross-user analytics (model evaluation,
+usage reporting) require fan-out over every collection, and encodes user
+identifiers into infrastructure resource names, creating a data governance
+problem when users are deleted or merged. The governing principle is that
+isolation is a single-collection problem solved by enforcing \code{user\_id}
+as a mandatory filter at every call site.
+
+\begin{warningbox}
+Never call \code{m.search()} without \code{filters=\{"user\_id": uid\}}.
+A search without the filter returns records from every user in the collection.
+mem0 does not raise an error when the filter is absent; it silently returns
+cross-tenant results. The \code{safe\_search} wrapper below makes the
+omission a hard error rather than a silent data leak.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={safe\_search, safe\_add, and safe\_delete enforcing user\_id at every call},
+  label={lst:tenant-isolation}]
+# src/agent/memory/mem0_client.py (continued)
+
+USER_ID_REQUIRED_ERROR = "user_id is required for all mem0 operations"
+
+def safe_search(
+    m, query: str, user_id: str, limit: int = 20
+) -> list[dict]:
+    assert user_id, USER_ID_REQUIRED_ERROR
+    return m.search(query, filters={"user_id": user_id}, limit=limit)
+
+def safe_add(
+    m, messages: list[dict] | str, user_id: str, metadata: dict
+) -> dict:
+    assert user_id, USER_ID_REQUIRED_ERROR
+    metadata.setdefault("user_id", user_id)
+    return m.add(messages, user_id=user_id, metadata=metadata)
+
+def safe_delete(m, memory_id: str, user_id: str) -> None:
+    assert user_id, USER_ID_REQUIRED_ERROR
+    results = m.search(memory_id[:80], filters={"user_id": user_id}, limit=1)
+    if not results:
+        return
+    found_id = results[0].get("id")
+    if found_id == memory_id:
+        m.delete(memory_id)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:tenant-isolation} deserve explanation. First,
+\code{safe\_delete} verifies ownership before deleting. mem0's \code{m.delete()}
+accepts any memory ID without checking who owns it; passing the wrong ID ---
+due to a bug in the ID propagation chain --- would silently delete another
+user's record. The ownership check is a similarity search rather than a direct
+ID lookup because mem0 does not expose a \code{get\_by\_id} method at this API
+level. Second, \code{safe\_add} writes \code{user\_id} into the metadata dict
+as a redundant field in addition to the \code{user\_id} keyword argument. This
+makes the tenant identifier present in the Qdrant payload directly, where it
+can be filtered using Qdrant's native payload filter API for analytics queries
+that bypass the mem0 client.
+
+With isolation guaranteed at every call site, the only remaining gap is
+demonstrating that the entire stack behaves correctly under adversarial
+conditions. The test suite closes that gap.
+
+%% ------------------------------------------------------------
+\section{Tests Must Prove Policy, Not Just Coverage}
+\label{sec:test-suite}
+%% ------------------------------------------------------------
+
+The problem with a test suite that achieves high line coverage but only tests
+the happy path is that it proves the gate compiles, not that it governs.
+The five write-gate checks, the retrieval reranker, the expiry job, the
+version conflict, and the multi-tenant isolation all have failure modes that
+only manifest when specific conditions are met: a short message, a high
+similarity score, an expired timestamp, a concurrent version bump, or a
+missing \code{user\_id}. The governing principle is that each test targets one
+failure mode with a fixture constructed to trigger it.
+
+All tests mock \code{Memory} using \code{unittest.mock.MagicMock}. No live
+Qdrant or Neo4j instance is required. \code{m.add()} returns
+\code{\{"memory\_id": "test-id-1"\}}; \code{m.search()} returns a configurable
+fixture list; \code{m.get\_all()} returns a fixed list. The mock isolates the
+gate and pipeline logic from network latency and makes fixture construction
+deterministic.
+
+\begin{lstlisting}[language=Python,
+  caption={mock\_memory fixture and two representative policy tests},
+  label={lst:test-suite}]
+# tests/memory/test_mem0_integration.py
+import pytest
+from unittest.mock import MagicMock
+from datetime import datetime, timedelta
+from src.agent.memory.write_gate import run_write_gate
+from src.agent.memory.expiry_scheduler import expire_ttl_memories
+
+@pytest.fixture
+def mock_memory():
+    m = MagicMock()
+    m.add.return_value   = {"memory_id": "test-id-1"}
+    m.search.return_value = []
+    m.get_all.return_value = []
+    m.delete.return_value  = None
+    return m
+
+@pytest.fixture
+def mock_llm():
+    llm = MagicMock()
+    llm.invoke.return_value = MagicMock(content="episodic")
+    return llm
+
+def test_pii_blocks_credit_card(mock_memory, mock_llm):
+    content = ("User's card is 4111 1111 1111 1111 "
+               "and they want to pay for the subscription.")
+    decision = run_write_gate(content, "u1", mock_memory, mock_llm,
+                              datetime.utcnow())
+    assert not decision.approved
+    assert decision.blocked_check == "pii_sensitivity"
+    mock_memory.add.assert_not_called()
+
+def test_ttl_expiry_deletes_only_expired(mock_memory):
+    now  = datetime.utcnow()
+    past = (now - timedelta(days=1)).isoformat()
+    future = (now + timedelta(days=1)).isoformat()
+    mock_memory.get_all.return_value = [
+        {"id": "old-1", "metadata": {"ttl_expires_at": past}},
+        {"id": "new-1", "metadata": {"ttl_expires_at": future}},
+        {"id": "no-ttl", "metadata": {}},
+    ]
+    deleted = expire_ttl_memories(mock_memory, {"u1"}, now)
+    assert deleted == 1
+    mock_memory.delete.assert_called_once_with("old-1")
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:test-suite} deserve explanation. First, the
+\code{mock\_llm} fixture returns \code{"episodic"} as the classification
+response. This is not an arbitrary choice; it ensures the type-classification
+check passes and the test can reach the PII check, which is the check under
+test. Returning an invalid classification string would cause the test to fail
+at the wrong check, making it a test of the classifier fallback rather than of
+the PII gate. Second, \code{test\_ttl\_expiry\_deletes\_only\_expired} includes
+a record with no \code{ttl\_expires\_at} field alongside the expired and
+non-expired records. This tests the guard clause in \code{expire\_ttl\_memories}
+that skips records without a TTL --- a guard that exists because procedural
+memories are written without a TTL and must never be deleted by the expiry
+job.
+
+Chapter~9 extends this test suite into full evaluation: multi-turn session
+fixtures, precision@5 measurement against a labelled retrieval dataset, and a
+prompt-drift regression test that verifies model output does not shift when
+memory injection is disabled versus enabled. The infrastructure built in this
+chapter --- the write gate, the retrieval pipeline, the audit records, and the
+safe call wrappers --- becomes the fixture surface that Chapter~9's session
+replay harness queries to attribute output changes to specific memory events.
