@@ -51,7 +51,7 @@ consequential. Pydantic provides three things a dataclass does not: free JSON
 serialisation via \code{model\_dump()}, which means the policy can be stored
 inside \code{AgentState} and survive a checkpoint round-trip; field validators
 that enforce invariants at construction time, not at the first use of a value
-in a guard condition; and \code{model\_config = \{"frozen": True\}}, which makes
+in a guard condition; and \code{model\_config = \{\"frozen\": True\}}, which makes
 the object immutable after construction so no node can silently relax a limit
 during a run.
 
@@ -107,7 +107,7 @@ class TerminationPolicy(BaseModel):
 Do not store a live \code{TerminationPolicy} instance in \code{AgentState}.
 The checkpointer serialises state as JSON; Pydantic objects are not
 JSON-serialisable by default. Store \code{policy.model\_dump()} and reconstruct
-with \code{TerminationPolicy.model\_validate(state["_policy"])} when a node needs
+with \code{TerminationPolicy.model\_validate(state[{}"\_policy"{}])} when a node needs
 the object. Chapter~3 shows this pattern in \code{make\_initial\_state}.
 \end{warningbox}
 
@@ -191,7 +191,7 @@ happens to be present is a monitoring error.
 \code{recursion\_limit} alone is not sufficient. The failure mode it does not
 cover is the one that occurs when \code{cycle\_count} is not incremented
 correctly. Consider a node bug that returns an empty dict instead of
-\code{\{"cycle\_count": state["cycle\_count"] + 1\}}. From LangGraph's perspective,
+\code{\{\"cycle\_count\": state[\"cycle\_count\"] + 1\}}. From LangGraph's perspective,
 the graph is still executing---each node execution counts toward the recursion
 limit---but from the application's perspective, the cycle counter never advances.
 The application-level guard never fires. The graph hits \code{recursion\_limit}
