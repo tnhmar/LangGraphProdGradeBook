@@ -1,5 +1,5 @@
 %% ============================================================
-%%  Chapter 5 — LLM Abstraction, Reliability & Cost Enforcement
+%%  Chapter 5 — LLM Infrastructure: Reliability, Cost, and Configuration
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
 %% ============================================================
 
@@ -10,9 +10,9 @@ By the end of Chapter~4 your agent has a validated, strongly typed contract
 between the model and the rest of the runtime. Every node that consumes model
 output receives a Pydantic object, and every parse failure either repairs itself
 or escalates cleanly. What the previous chapters deliberately left to one side
-is the question of what happens below that contract: who decides which model to
-call, what happens when the call fails at the network or provider level, and who
-pays attention to the bill.
+is the question of what happens \emph{below} that contract: who decides which
+model to call, what happens when the call fails at the network or provider
+level, and who pays attention to the bill.
 
 These are not operational afterthoughts. In a production agent system the LLM
 call is the single most expensive, slowest, and most failure-prone operation in
@@ -22,24 +22,24 @@ If the infrastructure around that call is naive---a bare \code{litellm.completio
 with no fallback and no budget guard---then the agent is one provider hiccup
 away from a cascading failure and one runaway loop away from a costly bill.
 
-This chapter builds the full LLM infrastructure layer. You will configure a
-LiteLLM router that abstracts all provider calls behind a single interface while
-pinning exact model versions. You will add Tenacity decorators that retry on
-retriable errors and pass immediately on non-retriable ones. You will implement
-a circuit breaker from first principles so you understand the three-state
-machine rather than hiding it behind a library call. You will wire LiteLLM's
-callback system to an \code{AgentState} budget field that tracks cost in real
-time, and you will implement a budget circuit breaker that stops the graph
-cleanly when the budget is exhausted. You will build a fallback cascade that
-logs every degradation event to Langfuse. Finally, you will externalise every
-model name and configuration value into Pydantic Settings so that no hardcoded
-string ever appears in application code.
+This chapter builds that infrastructure in three layers. The first layer
+\emph{routes} calls: a LiteLLM Router abstracts all provider calls behind a
+single interface, pins exact model versions, and defines an ordered fallback
+cascade. The second layer \emph{protects} calls: Tenacity decorators retry
+transient faults per exception class, and a circuit breaker stops the runtime
+from hammering a provider that is down for minutes rather than milliseconds.
+The third layer \emph{governs} calls: a callback-driven cost tracker accumulates
+real spend into \code{AgentState}, a budget circuit breaker converts an overage
+into a clean graph stop, and a \code{FallbackRouter} logs every degradation
+event to Langfuse. A final section externalises every model name, key, and
+parameter into Pydantic Settings so that no hardcoded string appears in
+application code.
 
 The three custom exception classes introduced here---\code{BudgetExceededError},
 \code{CircuitOpenError}, and \code{RetryExhaustedError}---map to three distinct
-graph-edge outcomes. Table~\ref{tab:exception-routing} summarises the mapping
-before you build it, so you can keep the whole picture in mind as each piece
-appears.
+graph-edge outcomes. Table~\ref{tab:exception-routing} summarises that mapping
+before you build any of the components, so you can keep the whole architecture
+in view as each piece appears.
 
 \begin{table}[ht]
 \centering
@@ -55,6 +55,16 @@ appears.
 \bottomrule
 \end{tabular}
 \end{table}
+
+The sections of this chapter are ordered by dependency: first choose where
+calls go (\S\ref{sec:litellm-router}), then decide which failures deserve
+another attempt (\S\ref{sec:tenacity}), then decide when to stop calling a
+broken provider entirely (\S\ref{sec:circuit-breaker}), then measure spend
+(\S\ref{sec:cost-tracking}), then give overspend a clean graph exit
+(\S\ref{sec:budget-circuit-breaker}), then make the cascade fully observable
+(\S\ref{sec:fallback-routing}), and finally externalise every value that would
+otherwise be a hardcoded string (\S\ref{sec:settings}). Each section hands a
+resolved problem to the next.
 
 The source layout for this chapter is:
 
@@ -76,15 +86,15 @@ src/
 \end{verbatim}
 
 %% ------------------------------------------------------------
-\section{LiteLLM Router: Provider Fallback and Model Version Pinning}
+\section{Why a Router Exists}
 \label{sec:litellm-router}
 %% ------------------------------------------------------------
 
 The first question to resolve is why you need a router at all. A bare
 \code{litellm.completion(model="gpt-4o", ...)} works perfectly well in
 development, but it carries three production problems. First, it binds the call
-site to a single provider. If that provider degrades, the call fails and there is
-no recovery path. Second, the model string \code{"gpt-4o"} is an alias that
+site to a single provider. If that provider degrades, the call fails and there
+is no recovery path. Second, the model string \code{"gpt-4o"} is an alias that
 OpenAI can silently remap to a newer version at any time, breaking prompts that
 were tuned against a specific checkpoint. Third, there is no single place to
 configure timeouts, retries, or API base URLs; each call site accumulates its
@@ -164,7 +174,7 @@ class RouterFactory:
             model_list=model_list,
             fallbacks=[{"primary": ["fallback_1", "fallback_2"]}],
             routing_strategy="priority",
-            num_retries=0,        # retries are handled by §5.2 decorators
+            num_retries=0,        % retries are handled by §5.2 decorators
             timeout=settings.request_timeout_sec,
         )
 \end{lstlisting}
@@ -187,8 +197,12 @@ from appearing in logs, \code{repr()}, or serialised state. Section~5.7 explains
 the full settings hierarchy.
 \end{warningbox}
 
+The router centralises \emph{where} calls go. The next question is
+\emph{which failures deserve another attempt} --- and the answer depends
+entirely on the type of failure, not on a single global retry count.
+
 %% ------------------------------------------------------------
-\section{Tenacity Decorators: Per-Exception Retry Strategies}
+\section{Retries Depend on Failure Type}
 \label{sec:tenacity}
 %% ------------------------------------------------------------
 
@@ -305,8 +319,14 @@ exception class directly. The \code{resilient\_call} wrapper converts
 edge routing in Section~5.5 can distinguish it from a first-attempt failure.
 \end{notebox}
 
+Retries handle faults that resolve within seconds. The next failure mode is
+different in kind: a provider that is unhealthy for minutes. Retrying against
+that provider burns the full Tenacity budget on every call. The answer is a
+circuit breaker that fails immediately once the provider is known to be down,
+and probes cautiously for recovery.
+
 %% ------------------------------------------------------------
-\section{Circuit Breaker: A Three-State Machine}
+\section{When to Stop Calling a Broken Provider}
 \label{sec:circuit-breaker}
 %% ------------------------------------------------------------
 
@@ -383,10 +403,6 @@ class LLMCircuitBreaker:
         self._last_failure_time: float | None = None
         self._lock              = threading.Lock()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def call(
         self,
         fn: Callable[..., ModelResponse],
@@ -403,8 +419,6 @@ class LLMCircuitBreaker:
                         f"{self._seconds_until_reset():.1f}s"
                     )
 
-        # CLOSED or HALF_OPEN: attempt the call outside the lock so
-        # we do not block other threads during a potentially slow I/O.
         try:
             result = fn(*args, **kwargs)
             self._record_success()
@@ -413,16 +427,10 @@ class LLMCircuitBreaker:
             self._record_failure()
             raise
 
-    # ------------------------------------------------------------------
-    # State transitions
-    # ------------------------------------------------------------------
-
     def _transition(self, new_state: CircuitState) -> None:
-        # Caller must hold self._lock
         self.state = new_state
 
     def _should_attempt_reset(self) -> bool:
-        # Caller must hold self._lock
         if self._last_failure_time is None:
             return False
         elapsed = time.monotonic() - self._last_failure_time
@@ -437,7 +445,6 @@ class LLMCircuitBreaker:
     def _record_success(self) -> None:
         with self._lock:
             if self.state == CircuitState.HALF_OPEN:
-                # Probe succeeded: fully close and reset timeout
                 self._failure_count   = 0
                 self._current_timeout = self._base_timeout
                 self._transition(CircuitState.CLOSED)
@@ -450,7 +457,6 @@ class LLMCircuitBreaker:
             self._last_failure_time = time.monotonic()
 
             if self.state == CircuitState.HALF_OPEN:
-                # Probe failed: reopen with doubled timeout
                 self._current_timeout *= 2
                 self._transition(CircuitState.OPEN)
             elif (
@@ -479,18 +485,32 @@ Chapter~11 revisits this class to produce an \code{async}-compatible variant
 using \code{asyncio.Lock} and \code{asyncio.get\_event\_loop().run\_in\_executor}
 for high-concurrency deployments.
 
+With routing, retries, and circuit breaking in place, the runtime now has
+defences against provider faults. The remaining operational risk is financial:
+the agent could run for many cycles and accumulate a large bill before any node
+notices. The next section addresses that by making cost visible in real time,
+directly inside \code{AgentState}.
+
 %% ------------------------------------------------------------
-\section{Cost Tracking: Callback to AgentState Budget}
+\section{Tracking Spend in Real Time}
 \label{sec:cost-tracking}
 %% ------------------------------------------------------------
 
-LiteLLM emits a \code{success\_callback} after every completed call. The
-callback receives the full response object including token usage. This is the
-correct place to accumulate cost: it fires exactly once per successful call,
-after the response has been validated, and it has access to
-\code{litellm.completion\_cost()} which understands per-model pricing.
+The natural place to accumulate cost is at the call site --- a line like
+\code{budget += estimate\_tokens(prompt) * price\_per\_token} after each
+\code{router.completion()} call. That approach has a fatal flaw: you do not know
+the actual token count until the response arrives, per-model pricing is not
+a constant you should hardcode, and the estimate can be wrong in ways that
+compound silently across cycles.
 
-The \code{CostTracker} class registers a method as the callback and accumulates
+LiteLLM already solves this. It emits a \code{success\_callback} after every
+completed call, passes the full response object including token usage, and
+exposes \code{litellm.completion\_cost()} which knows the current price schedule
+for each supported model. This is the correct accumulation point: it fires
+exactly once per successful call, after the response has been validated, with
+accurate usage data.
+
+The \code{CostTracker} class registers a method as that callback and accumulates
 cost into a \code{TokenBudget} Pydantic model. \code{TokenBudget} lives inside
 \code{AgentState} so that every node in the graph can read the current spend
 without importing the tracker directly. When an accumulation would push
@@ -537,7 +557,6 @@ class CostTracker:
     def __init__(self, budget: TokenBudget, router: litellm.Router) -> None:
         self._budget = budget
         self._lock   = threading.Lock()
-        # Register on the Router instance, not on litellm globally
         router.success_callback = [self.success_callback]
 
     def success_callback(
@@ -599,8 +618,13 @@ immediately after a call completes. Section~5.5 shows the graph-side wiring that
 reads this flag and routes accordingly.
 \end{notebox}
 
+Now that spend is visible inside every graph cycle, the runtime needs a policy
+for what an overage means at the graph level. The answer is not a retry and not
+an exception that bubbles up through the runner. It is a clean, structured
+graph stop---the subject of the next section.
+
 %% ------------------------------------------------------------
-\section{Budget Circuit Breaker: Graceful Stop on Overage}
+\section{Treating Budget Overage as a Graph Exit}
 \label{sec:budget-circuit-breaker}
 %% ------------------------------------------------------------
 
@@ -741,7 +765,7 @@ b.add_conditional_edges(
     "reason_node",
     should_continue_or_stop,
     {
-        "continue":       "validation_node",
+        "continue":        "validation_node",
         "budget_exceeded": "handle_budget_exceeded",
     },
 )
@@ -758,8 +782,13 @@ persists \code{stop\_reason} to episodic memory so that retrospective analysis
 can distinguish budget stops from normal completions. Chapter~12 surfaces it in
 the operator dashboard.
 
+The budget exit works, but it operates on a single tier. The production system
+need a wider defensive layer: one that tries cheaper providers before giving up,
+and that logs every tier attempt for post-mortem analysis. That is the job of
+the fallback cascade.
+
 %% ------------------------------------------------------------
-\section{Fallback Routing Cascade: Three Tiers, Full Observability}
+\section{Fallback Cascade with Full Observability}
 \label{sec:fallback-routing}
 %% ------------------------------------------------------------
 
@@ -769,8 +798,9 @@ observability stack. When the primary model fails and LiteLLM silently routes to
 the fallback, you have no event in Langfuse, no update to \code{AgentState}, and
 no opportunity to check whether the budget permits the fallback call. The
 \code{FallbackRouter} class makes the cascade explicit: each tier is a named
-\code{FallbackTier} object with its own circuit breaker, and every attempt---
-successful or not---is logged as a Langfuse event with a consistent schema.
+\code{FallbackTier} object with its own circuit breaker, and every
+attempt---successful or not---is logged as a Langfuse event with a consistent
+schema.
 
 \begin{lstlisting}[language=Python,
   caption={FallbackRouter with per-tier circuit breakers and Langfuse logging},
@@ -798,7 +828,7 @@ logger = logging.getLogger(__name__)
 class FallbackTier:
     model_alias:      str
     circuit_breaker:  LLMCircuitBreaker
-    cost_ceiling_usd: float   # skip tier if remaining budget < this value
+    cost_ceiling_usd: float
 
 
 class StaticFallbackResponse(BaseModel):
@@ -820,7 +850,7 @@ class FallbackRouter:
         tiers:    list[FallbackTier],
         tracker:  CostTracker,
         langfuse: Langfuse,
-        router,           # litellm.Router from RouterFactory
+        router,
     ) -> None:
         self._tiers    = tiers
         self._tracker  = tracker
@@ -833,7 +863,7 @@ class FallbackRouter:
         state:   AgentState,
         config:  RunnableConfig,
     ) -> Union[ModelResponse, StaticFallbackResponse]:
-        budget   = self._tracker.get_budget_snapshot()
+        budget    = self._tracker.get_budget_snapshot()
         remaining = budget.limit_usd - budget.used_usd
 
         for tier_index, tier in enumerate(self._tiers):
@@ -851,14 +881,15 @@ class FallbackRouter:
                     resilient_call, self._router, call_payload
                 )
                 call_cost = float(
-                    getattr(response, "_hidden_params", {}).get("response_cost", 0.0)
+                    getattr(response, "_hidden_params", {}).get(
+                        "response_cost", 0.0
+                    )
                 )
                 self._log_attempt(
                     tier=tier, tier_index=tier_index,
                     success=True, cost_usd=call_cost,
                     reason=None,
                 )
-                # Update AgentState fields for downstream nodes and tests
                 state["last_model_used"]    = tier.model_alias
                 state["last_call_cost_usd"] = call_cost
                 return response
@@ -876,7 +907,6 @@ class FallbackRouter:
                 )
                 continue
 
-        # All tiers exhausted: return static fallback
         self._log_attempt(
             tier=FallbackTier("static", None, 0.0),  # type: ignore[arg-type]
             tier_index=len(self._tiers),
@@ -915,8 +945,13 @@ Langfuse trace hierarchy and shows how \code{llm\_call\_attempt} events nest
 under the parent agent trace. Chapter~12 covers the alerting rules that fire
 when consecutive \code{success=False} events exceed a threshold.
 
+With all three infrastructure layers in place---routing, protection, and
+governance---the last risk is configuration drift: model names, API keys, and
+budget limits that live in source code rather than the environment. The next
+section eliminates that risk entirely.
+
 %% ------------------------------------------------------------
-\section{RunnableConfig and Pydantic Settings: Zero Hardcodes}
+\section{Configuration Must Not Live in Code}
 \label{sec:settings}
 %% ------------------------------------------------------------
 
@@ -972,16 +1007,16 @@ class LLMSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="LLM_",
         env_file=(".env", ".env.production"),
-        secrets_dir="/run/secrets",    # Docker secrets support
+        secrets_dir="/run/secrets",
         case_sensitive=False,
     )
 
-    primary_model:          str       # LLM_PRIMARY_MODEL
-    fallback_model_1:       str       # LLM_FALLBACK_MODEL_1
-    fallback_model_2:       str       # LLM_FALLBACK_MODEL_2
-    openai_api_key:         SecretStr # LLM_OPENAI_API_KEY
-    anthropic_api_key:      SecretStr # LLM_ANTHROPIC_API_KEY
-    total_budget_usd:       float     # LLM_TOTAL_BUDGET_USD
+    primary_model:          str
+    fallback_model_1:       str
+    fallback_model_2:       str
+    openai_api_key:         SecretStr
+    anthropic_api_key:      SecretStr
+    total_budget_usd:       float
     failure_threshold:      int   = 5
     recovery_timeout_sec:   float = 60.0
     request_timeout_sec:    float = 30.0
@@ -996,8 +1031,8 @@ class LLMSettings(BaseSettings):
         """Reject bare aliases like 'gpt-4o'; require 'openai/gpt-4o-2024-08-06'."""
         if not _MODEL_PIN_RE.match(v):
             raise ValueError(
-                f"Model name must be in 'provider/model-version' format, got: {v!r}. "
-                f"Using bare aliases risks silent version drift."
+                f"Model name must be in 'provider/model-version' format, "
+                f"got: {v!r}. Using bare aliases risks silent version drift."
             )
         return v
 
