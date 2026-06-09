@@ -1,0 +1,349 @@
+%% ============================================================
+%%  PREAMBLE — Engineering AI Agents for Production, Volume 2
+%%  Extracted from volume2.tex.  Input ONCE from main.tex.
+%% ============================================================
+
+\documentclass[
+  11pt,
+  twoside,
+  openright
+]{book}
+
+\usepackage{polyglossia}
+\setdefaultlanguage{english}
+
+\usepackage{fontspec}
+\setmainfont{TeX Gyre Termes}[
+  BoldFont   = TeX Gyre Termes Bold,
+  ItalicFont = TeX Gyre Termes Italic
+]
+\setsansfont{TeX Gyre Heros}[
+  BoldFont   = TeX Gyre Heros Bold,
+  ItalicFont = TeX Gyre Heros Italic
+]
+\setmonofont{TeX Gyre Cursor}[
+  Scale    = 0.88,
+  BoldFont = TeX Gyre Cursor Bold
+]
+
+\usepackage{geometry}
+\geometry{
+  papersize  = {7in, 10in},
+  top        = 1in,
+  bottom     = 1.1in,
+  inner      = 1in,
+  outer      = 0.875in,
+  headheight = 14pt,
+  twoside
+}
+
+\usepackage{xcolor}
+\definecolor{BookBlue}       {HTML}{1A4A8A}
+\definecolor{BookDark}       {HTML}{1C1C1E}
+\definecolor{BookMid}        {HTML}{4A4A4A}
+\definecolor{LearnBg}        {HTML}{EEF7EE}
+\definecolor{LearnBorder}    {HTML}{27AE60}
+\definecolor{TipBg}          {HTML}{EAF4FB}
+\definecolor{TipBorder}      {HTML}{2980B9}
+\definecolor{WarningBg}      {HTML}{FEF9E7}
+\definecolor{WarningBorder}  {HTML}{F39C12}
+\definecolor{NoteBg}         {HTML}{F4F4F4}
+\definecolor{NoteBorder}     {HTML}{888888}
+\definecolor{TakeawayBg}     {HTML}{F0F0FF}
+\definecolor{TakeawayBorder} {HTML}{5B4FBE}
+\definecolor{CodeBg}         {HTML}{F7F7F7}
+\definecolor{CodeComment}    {HTML}{6A737D}
+\definecolor{CodeKeyword}    {HTML}{D73A49}
+\definecolor{CodeString}     {HTML}{032F62}
+\definecolor{CodeConstant}   {HTML}{005CC5}
+\definecolor{CodeAnnotation} {HTML}{6A737D}
+
+\usepackage{microtype}
+\usepackage{setspace}
+\setstretch{1.18}
+
+\usepackage{csquotes}
+\usepackage{parskip}
+\setlength{\parskip}{6pt}
+\setlength{\parindent}{0pt}
+
+\widowpenalty=10000
+\clubpenalty=10000
+\displaywidowpenalty=10000
+\predisplaypenalty=10000
+\raggedbottom
+\emergencystretch=1.5em
+\hbadness=3000
+\vbadness=3000
+
+\usepackage{needspace}
+\usepackage{etoolbox}
+\preto\section{\needspace{5\baselineskip}}
+\preto\subsection{\needspace{4\baselineskip}}
+\preto\subsubsection{\needspace{3\baselineskip}}
+
+\usepackage{titlesec}
+\renewcommand{\bottomtitlespace}{0.15\textheight}
+
+\titleformat{\part}[display]
+  {\centering\sffamily\Huge\bfseries\color{BookBlue}}
+  {\sffamily\large\mdseries\partname\ \thepart}{20pt}{}
+
+\titleformat{\chapter}[display]
+  {\sffamily\huge\bfseries\color{BookBlue}}
+  {\sffamily\normalsize\mdseries\chaptertitlename\ \thechapter}{12pt}{}
+\titlespacing*{\chapter}{0pt}{0pt}{24pt}
+
+\titleformat{\section}
+  {\sffamily\Large\bfseries\color{BookBlue}}
+  {\thesection}{1em}{}
+\titlespacing*{\section}{0pt}{18pt}{6pt}
+
+\titleformat{\subsection}
+  {\sffamily\large\bfseries\color{BookDark}}
+  {\thesubsection}{1em}{}
+\titlespacing*{\subsection}{0pt}{14pt}{4pt}
+
+\titleformat{\subsubsection}
+  {\sffamily\normalsize\bfseries\color{BookDark}}
+  {\thesubsubsection}{1em}{}
+\titlespacing*{\subsubsection}{0pt}{10pt}{2pt}
+
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE]{\small\sffamily\color{BookMid}\leftmark}
+\fancyhead[RO]{\small\sffamily\color{BookMid}\rightmark}
+\fancyfoot[LE,RO]{\small\sffamily\color{BookMid}\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\fancypagestyle{plain}{
+  \fancyhf{}
+  \fancyfoot[LE,RO]{\small\sffamily\color{BookMid}\thepage}
+  \renewcommand{\headrulewidth}{0pt}
+}
+
+\makeatletter
+\renewcommand{\cleardoublepage}{%
+  \clearpage
+  \if@twoside
+    \ifodd\c@page\else
+      \thispagestyle{empty}\hbox{}\newpage
+      \if@twocolumn\hbox{}\newpage\fi
+    \fi
+  \fi
+}
+\makeatother
+
+\usepackage{rotating}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{longtable}
+\renewcommand{\arraystretch}{1.35}
+
+%% Ragged-right paragraph column type: no underfull hbox warnings in
+%% narrow p{} columns.  Requires ragged2e (loaded below).
+\newcolumntype{P}[1]{>{\RaggedRight\arraybackslash}p{#1}}
+
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\captionsetup{
+  font      = {small,sf},
+  labelfont = {bf,color=BookBlue},
+  skip      = 6pt
+}
+
+\usepackage{listings}
+\lstset{
+  backgroundcolor   = \color{CodeBg},
+  %% 9pt avoids the "Font shape OML/cmm/m/it not available at 9.5" warning;
+  %% OML/cmm and OMS/cmsy only ship at integer sizes in TeX Live.
+  basicstyle        = \ttfamily\fontsize{9}{11}\selectfont,
+  keywordstyle      = \color{CodeKeyword}\bfseries,
+  stringstyle       = \color{CodeString}\itshape,
+  commentstyle      = \color{CodeComment}\itshape,
+  numbers           = left,
+  numberstyle       = \tiny\color{BookMid},
+  numbersep         = 6pt,
+  breaklines        = true,
+  frame             = single,
+  framerule         = 0.4pt,
+  rulecolor         = \color{NoteBorder},
+  showstringspaces  = false,
+  tabsize           = 2,
+  captionpos        = b,
+  breakatwhitespace = false,
+  columns           = fullflexible,
+  linewidth         = \linewidth,
+  postbreak         = {},
+  xleftmargin       = 1.5em,
+  framexleftmargin  = 1.5em,
+  aboveskip         = 6pt,
+  belowskip         = 4pt,
+}
+
+\lstdefinelanguage{Java}{
+  morekeywords={
+    abstract,assert,boolean,break,byte,case,catch,char,class,const,continue,
+    default,do,double,else,enum,extends,final,finally,float,for,goto,if,
+    implements,import,instanceof,int,interface,long,native,new,package,
+    private,protected,public,return,short,static,strictfp,super,switch,
+    synchronized,this,throw,throws,transient,try,void,volatile,while,
+    module,requires,exports,opens,uses,provides,to,with,transitive,
+    var,record,sealed,permits,non-sealed,yield
+  },
+  morekeywords=[2]{true,false,null},
+  morekeywords=[3]{@interface},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+  morestring=[b]',
+  alsoletter={.},
+  keywordstyle=\color{CodeKeyword}\bfseries,
+  keywordstyle=[2]\color{CodeConstant},
+  keywordstyle=[3]\color{CodeAnnotation},
+  stringstyle=\color{CodeString},
+  commentstyle=\color{CodeComment}\itshape,
+  breaklines=true,
+  breakatwhitespace=false,
+  breakindent=0pt,
+  columns=fullflexible,
+  keepspaces=true,
+  postbreak=\mbox{\textcolor{gray}{$\hookrightarrow$}\space},
+  showstringspaces=false,
+}
+
+\lstdefinelanguage{yaml}{
+  morecomment=[l]{\#},
+  morestring=[b]",
+  morestring=[b]',
+  literate=
+    *{true}{{\color{CodeKeyword}true}}{4}
+    {false}{{\color{CodeKeyword}false}}{5}
+    {null}{{\color{CodeKeyword}null}}{4},
+  sensitive=true,
+  keywordstyle=\color{CodeKeyword}\bfseries,
+  stringstyle=\color{CodeString},
+  commentstyle=\color{CodeComment}\itshape,
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+\lstdefinelanguage{json}{
+  morestring=[b]",
+  morestring=[b]',
+  morecomment=[l]//,
+  morecomment=[s]{/*}{*/},
+  sensitive=true,
+  keywordstyle=\color{CodeKeyword}\bfseries,
+  stringstyle=\color{CodeString},
+  commentstyle=\color{CodeComment}\itshape,
+}
+
+\DeclareRobustCommand{\code}[1]{\texttt{#1}}
+\providecommand{\term}[1]{\textit{#1}}
+\providecommand{\chapterquote}[2]{%
+  \vspace{1em}
+  \begin{quote}\itshape#1\end{quote}
+  \begin{flushright}--- #2\end{flushright}
+  \vspace{1em}
+}
+
+%% \githubref{fully.qualified.ClassName} — renders a "Full source:" callout
+%% after code listings, pointing readers to the companion repository.
+\newcommand{\githubref}[1]{%
+  \vspace{2pt}%
+  {\small\sffamily\color{BookMid}%
+   Full source: \texttt{#1}}%
+  \vspace{4pt}%
+}
+
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+
+\newtcolorbox{learningbox}{
+  colback=LearnBg, colframe=LearnBorder,
+  before skip=12pt, fonttitle=\sffamily\bfseries\small,
+  title={Learning Objective}, breakable, lines before break=3,
+  left=8pt, right=8pt, top=6pt, bottom=6pt,
+  boxrule=0.6pt, width=\linewidth
+}
+\newtcolorbox{tipbox}{
+  colback=TipBg, colframe=TipBorder,
+  before skip=12pt, fonttitle=\sffamily\bfseries\small,
+  title={Tip}, breakable, lines before break=3,
+  left=8pt, right=8pt, top=6pt, bottom=6pt,
+  boxrule=0.6pt, width=\linewidth
+}
+\newtcolorbox{warningbox}{
+  colback=WarningBg, colframe=WarningBorder,
+  before skip=12pt, fonttitle=\sffamily\bfseries\small,
+  title={Warning}, breakable, lines before break=3,
+  left=8pt, right=8pt, top=6pt, bottom=6pt,
+  boxrule=0.6pt, width=\linewidth
+}
+\newtcolorbox{notebox}{
+  colback=NoteBg, colframe=NoteBorder,
+  before skip=12pt, fonttitle=\sffamily\bfseries\small,
+  title={Note}, breakable, lines before break=3,
+  left=8pt, right=8pt, top=6pt, bottom=6pt,
+  boxrule=0.6pt, width=\linewidth
+}
+%% takeawaybox: optional title argument — default is "Key Takeaway".
+%% \begin{takeawaybox}           → title "Key Takeaway"
+%% \begin{takeawaybox}[My Title] → title "My Title"
+\newtcolorbox{takeawaybox}[1][Key Takeaway]{
+  colback=TakeawayBg, colframe=TakeawayBorder,
+  before skip=12pt, fonttitle=\sffamily\bfseries\small,
+  title={#1}, breakable, lines before break=3,
+  left=8pt, right=8pt, top=6pt, bottom=6pt,
+  boxrule=0.6pt, width=\linewidth
+}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\PassOptionsToPackage{hyphens}{url}
+\usepackage{hyperref}
+\usepackage{imakeidx}
+\makeindex[columns=2, title=Index, intoc=true]
+\urlstyle{tt}
+\makeatletter
+\g@addto@macro\UrlBreaks{\do\.\do\_\do\-}
+\makeatother
+
+\hypersetup{
+  colorlinks  = true,
+  linkcolor   = BookBlue,
+  urlcolor    = BookBlue,
+  citecolor   = BookBlue,
+  pdftitle    = {Engineering AI Agents for Production},
+  pdfauthor   = {Haythem Aber},
+  pdfsubject  = {Volume 2 --- Infrastructure, Observability, Security, and Production Case Studies},
+  pdfkeywords = {AI agents, Java, production, observability, security, Kubernetes}
+}
+
+\usepackage{tikz}
+%% positioning: enables `right=of X`, `below=of X` node placement syntax
+%% shapes.geometric + shapes.misc: rounded-rect, diamond, etc. for diagrams
+%% calc: coordinate arithmetic (e.g. $(A)!0.5!(B)$)
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, shapes.misc, calc}
+\usepackage{pdflscape}
+\usepackage{ragged2e}
+
+\newcommand{\component}[1]{\textsf{\textbf{#1}}}
+\newcommand{\seechapter}[1]{\textit{(See Chapter~\ref{#1})}}
+\newcommand{\seepart}[1]{\textit{(See Part~\ref{#1})}}
+
+\newcommand{\partclose}[1]{%
+  \cleardoublepage
+  \vspace*{\fill}
+  \begin{center}\sffamily\Large\color{BookBlue}#1\end{center}
+  \vspace*{\fill}
+  \cleardoublepage
+}
