@@ -1,22 +1,325 @@
-%% Chapter 9 — LiteLLM: Provider Abstraction and Fallback Routing
-%% TODO: content
-\chapterquote{Provider lock-in is a risk you choose, not one you inherit.}{anon}
+%% ============================================================
+%%  Chapter 9 --- Behavior Must Be Versioned: Procedural Memory
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
 
-This chapter covers LiteLLM's unified API, router configuration, fallback
-chains, cost tracking, and token usage callbacks.
+\chapter{Chapter 9 --- Behavior Must Be Versioned: Procedural Memory}
 
-\section{The LiteLLM Router}
-\label{sec:litellm-router}
-% TODO
+\chapterquote{If an agent remembers facts but forgets how to work, it will fail correctly and uselessly.}{anon}
 
-\section{Fallback Chains and Retry Budgets}
-\label{sec:fallback-chains}
-% TODO
+The production failure this chapter prevents is behavioural drift hidden behind apparently stable infrastructure. An agent can retain correct user facts, route to the right tools, and still regress because the workflow instructions that tell it how to perform a task changed invisibly, were overwritten without review, or cannot be rolled back after a bad deployment. That failure is expensive because it looks like model unreliability when the real cause is unversioned procedure: the system forgot not what the world is, but how it is supposed to act.
 
-\section{Accurate Token Accounting}
-\label{sec:token-accounting}
-% TODO
+The solution has three layers. The first is \emph{versioned procedure}: system prompts and workflow templates are treated as source code with explicit provenance, reviewable diffs, and immutable references. The second is \emph{task-scoped retrieval}: the agent identifies the current task type, retrieves the matching procedural template, and injects it into the \code{ROLE} slot --- the place Chapter~6 defined as the behavioural contract for the current turn. The third is \emph{typed execution control}: tool pre-conditions and post-conditions become schema-checked contracts, and tests prove not only that retrieval works but that a rollback to an earlier version really changes agent behaviour.
 
-\section{Model Aliases and A/B Testing}
-\label{sec:model-aliases}
-% TODO
+The sections follow dependency order. Section~\ref{sec:prompts-are-code} establishes why prompts belong in git rather than a database, because every later section assumes procedure is auditable and reversible. Section~\ref{sec:templates-are-records} turns those prompt files into a typed \code{ProceduralRecord}, because retrieval policy requires a structured object rather than raw text. Section~\ref{sec:retrieval-targets-role} shows how the \code{PerceiveNode} retrieves and injects procedural memory into the \code{ROLE} slot that Chapter~6 introduced as the home of role-defining instructions. Section~\ref{sec:tools-need-contracts} governs tools with typed pre- and post-conditions, because procedure that cannot constrain tool use is not operational. Section~\ref{sec:rollback-must-be-tested} closes by proving version rollback through tests, since versioning is meaningless if the system cannot demonstrate that reverting to an older commit hash changes behaviour.
+
+This chapter introduces more than three procedural-memory terms, so Table~\ref{tab:procedural-taxonomy} defines them before the implementation details begin.
+
+\begin{table}[ht]
+\centering
+\caption{Procedural-memory taxonomy introduced in Chapter~9}
+\label{tab:procedural-taxonomy}
+\begin{tabular}{llll}
+\toprule
+\textbf{Term} & \textbf{Role} & \textbf{Lifetime} & \textbf{Primary risk} \\
+\midrule
+\code{ProceduralRecord} & Versioned workflow template & Per version & Hidden behavioural drift \\
+\code{task\_type} & Retrieval key for workflow selection & Per request & Wrong template chosen \\
+\code{commit\_hash} & Immutable prompt identifier & Per template version & Unreproducible behaviour \\
+\code{ROLE} slot & Behavioural prompt section & Per request & Fact/procedure confusion \\
+\code{ToolEntry} & Typed tool registry record & Process lifetime & Invalid tool invocation \\
+\code{pre\_condition} & Validator before tool call & Per invocation & Unsafe execution \\
+\code{post\_condition} & Validator after tool call & Per invocation & Silent malformed output \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The source layout for this chapter is:
+
+\begin{verbatim}
+prompts/
+  research/
+    base_v1.jinja2             # §9.1
+src/
+  agent/
+    memory/
+      procedural/
+        prompt_loader.py       # §9.1
+        procedural_record.py   # §9.2
+        perceive_node.py       # §9.3
+  tools/
+    tool_registry.py           # §9.4
+tests/
+  memory/
+    test_procedural_memory.py  # §9.5
+\end{verbatim}
+
+%% ------------------------------------------------------------
+\section{Prompts That Change Behaviour Belong in Source Control}
+\label{sec:prompts-are-code}
+%% ------------------------------------------------------------
+
+The design problem is procedural opacity. A naive team stores system prompts in a database table or an admin console because prompts look like content rather than code, but that choice removes line-level diffs, weakens review discipline, and turns behavioural regressions into archaeology. The governing principle is that any prompt line that changes agent behaviour is load-bearing source code and must therefore be committed, reviewed, diffed, and rolled back like any other executable artefact.
+
+The reason is not cultural preference. It is operational traceability. Chapter~8 treated long-term memory records as governed state because they could outlive the session; procedural memory deserves the same discipline because a changed instruction can outlive the deployment that introduced it. A database row can tell you what the prompt is now. Git can tell you what it was, why it changed, who approved the change, and exactly which lines introduced the regression. That is the minimum bar for a production system whose behaviour must be explained after an incident.
+
+Inline annotations on load-bearing lines are worth the small visual cost. A prompt file often contains lines that look interchangeable to reviewers who do not spend their days tuning models. Annotating those lines with the failure modes they prevent --- for example, refusing to fabricate a tool call when no tool matches the task --- turns prompt review from stylistic commentary into engineering review.
+
+\begin{notebox}
+Procedural memory is not a hidden prompt cache. It is the explicit, versioned description of how the agent should work for a class of tasks. Storing it in git rather than a database is what makes rollback, blame, and code review possible when a behavioural regression reaches production.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={Annotated procedural prompt template and file-based loader},
+  label={lst:prompt-loader}]
+# prompts/research/base_v1.jinja2
+You are a research agent operating under strict workflow discipline.
+Do not invent tools or tool arguments. {# prevents hallucinated tool calls #}
+Prefer evidence already present in the session before external retrieval. {# prevents unnecessary search cost #}
+When uncertainty remains after retrieval, state the uncertainty explicitly. {# prevents false confidence #}
+
+Current role context:
+{{ role_slot }}
+
+Relevant working memory:
+{{ memory_block }}
+
+# src/agent/memory/procedural/prompt_loader.py
+from jinja2 import Environment, FileSystemLoader
+
+PROMPT_BASE_DIR = "prompts/"
+
+def get_prompt_path(task_type: str, name: str, version: int) -> str:
+    return f"{task_type}/{name}_v{version}.jinja2"
+
+def load_prompt_from_file(path: str, variables: dict[str, str]) -> str:
+    env = Environment(loader=FileSystemLoader(PROMPT_BASE_DIR))
+    template = env.get_template(path)
+    return template.render(**variables)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:prompt-loader} deserve explanation. First, the template is plain text with minimal Jinja2 interpolation rather than being assembled through Python string concatenation. Plain text is diffable at the line level; concatenated strings scatter behavioural instructions across code and make review of prompt changes needlessly difficult. Second, the template comments describe failure modes rather than author intent. ``This line sounds better'' is not an engineering rationale; ``prevents hallucinated tool calls'' is. The reviewer needs to know what would break if the line were removed.
+
+Once procedural prompts are committed artefacts, the next problem is turning those files into typed objects that the graph can retrieve and reason about rather than merely render.
+
+%% ------------------------------------------------------------
+\section{Workflow Templates Need Typed Provenance}
+\label{sec:templates-are-records}
+%% ------------------------------------------------------------
+
+The next design problem is that raw prompt text is not enough to support retrieval, audit, or rollback. A plain string can be rendered, but it cannot answer which version is active, which commit introduced it, or what conditions must hold before it is safe to use. The governing principle is that procedural memory is represented as a typed record whose metadata makes behaviour reproducible.
+
+The core abstraction is \emph{ProceduralRecord}: a Pydantic model that treats a workflow template as a versioned operational artefact. The record contains the template text, but also the information required to reconstruct and govern it: a human-readable name, a monotonically increasing version, an immutable commit hash, the \code{task\_type} used for retrieval, and lists of named pre-conditions and post-conditions that connect the template to the tool execution layer introduced later in this chapter.
+
+LangSmith Prompt Hub can serve as a distribution mechanism for these records, but it does not weaken the immutability rule. Chapter~6 \S6.5 established a hard rule for prompt retrieval: always pull by commit hash, never by a mutable alias such as ``latest''. A procedural template that is fetched by ``latest'' is not a versioned artefact at all; it is a time-dependent behaviour source that cannot be reproduced after the fact.
+
+\begin{warningbox}
+Never use \code{pull\_prompt(name, commit="latest")} for procedural memory. A mutable reference defeats auditability and makes rollback unverifiable, because the same retrieval call can return different instructions on different days.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={ProceduralRecord and hash-pinned Prompt Hub retrieval},
+  label={lst:procedural-record}]
+# src/agent/memory/procedural/procedural_record.py
+from pydantic import BaseModel
+from langsmith import pull_prompt
+
+class ProceduralRecord(BaseModel):
+    name:            str
+    version:         int
+    commit_hash:     str
+    task_type:       str
+    template_text:   str
+    pre_conditions:  list[str]
+    post_conditions: list[str]
+
+ProceduralRegistry = dict[tuple[str, int], ProceduralRecord]
+
+def pull_from_hub(
+    name: str,
+    commit_hash: str,
+    task_type: str,
+    version: int,
+) -> ProceduralRecord:
+    prompt = pull_prompt(name, commit=commit_hash)
+    return ProceduralRecord(
+        name=name,
+        version=version,
+        commit_hash=commit_hash,
+        task_type=task_type,
+        template_text=str(prompt),
+        pre_conditions=[],
+        post_conditions=[],
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:procedural-record} deserve explanation. First, \code{commit\_hash} is stored as a first-class field rather than inferred from \code{version}. Versions are human coordination devices; commit hashes are immutable identifiers. Both are useful, but only the hash guarantees exact reproducibility. Second, \code{pre\_conditions} and \code{post\_conditions} are stored as lists of names rather than embedded callables. A record must be serialisable and loggable; a callable is neither. The names bind later to validator functions in the registry layer. Third, \code{template\_text} stores the pulled prompt text directly. That duplicates what exists in the Prompt Hub, but it ensures the record remains self-contained once constructed and avoids a second remote dependency during request handling.
+
+A typed record makes procedure retrievable. The next question is where in the prompt assembly pipeline that procedure belongs, because procedural instructions are neither facts nor evidence.
+
+%% ------------------------------------------------------------
+\section{Task-Scoped Procedure Belongs in the ROLE Slot}
+\label{sec:retrieval-targets-role}
+%% ------------------------------------------------------------
+
+The design problem is contextual misplacement. A naive implementation retrieves a workflow template and appends it to whatever prompt field is easiest to reach, often the same memory block that carries episodic and semantic recall. That fails because procedural instructions do not compete with recalled facts on relevance; they define the behavioural stance for the current task. The governing principle is that procedural memory is retrieved by \code{task\_type} and injected into the \code{ROLE} slot --- the slot Chapter~6 introduced as the behavioural contract for the active turn.
+
+That placement creates a clean separation of concerns across the architecture built so far. Chapter~7 treated short-term memory as working context inside \code{MessagesState}; Chapter~8 treated long-term memory as governed persistence of facts, events, and durable preferences. Procedural memory is different from both. It is not about what the agent knows; it is about what workflow it should follow. Injecting it into \code{HISTORY} or \code{EVIDENCE} would cause it to be ranked, trimmed, or summarised like recall content, which is conceptually wrong and operationally fragile.
+
+The \code{PerceiveNode} does not invent the task type. It reads \code{AgentState["meta"]["task\_type"]} from an upstream classifier or router and retrieves the highest available version for that type unless a pinned version is present for rollback or experiment control. Before injection, it runs the record's named pre-conditions. If any fail, it falls back to a default system prompt instead of raising, because absence of a procedural template is a degradable condition, not a session-fatal one.
+
+\begin{lstlisting}[language=Python,
+  caption={PerceiveNode retrieves by task type and writes into the ROLE slot},
+  label={lst:perceive-node}]
+# src/agent/memory/procedural/perceive_node.py
+from src.agent.memory.procedural.prompt_loader import load_prompt_from_file
+
+DEFAULT_SYSTEM_PROMPT = "You are a careful assistant."
+PRE_CONDITION_REGISTRY: dict[str, callable] = {}
+
+def run_pre_conditions(conditions: list[str], state: dict) -> bool:
+    return all(PRE_CONDITION_REGISTRY[name](state) for name in conditions)
+
+def retrieve_procedural(state: dict, registry) -> object | None:
+    task_type = state["meta"]["task_type"]
+    pinned    = state["meta"].get("pinned_version")
+    versions  = [v for (t, v) in registry if t == task_type]
+    if not versions:
+        return None
+    version = pinned if pinned is not None else max(versions)
+    return registry.get((task_type, version))
+
+def perceive_node(state: dict, registry, variables: dict[str, str]) -> dict:
+    record = retrieve_procedural(state, registry)
+    if record is None or not run_pre_conditions(record.pre_conditions, state):
+        state["role"] = DEFAULT_SYSTEM_PROMPT
+        return state
+    path = f"{record.task_type}/{record.name}_v{record.version}.jinja2"
+    state["role"] = load_prompt_from_file(path, variables)
+    return state
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:perceive-node} deserve explanation. First, \code{retrieve\_procedural} chooses \code{max(versions)} when no version is pinned, rather than storing a separate ``current version'' pointer. A mutable pointer would create another state source that could drift from the committed prompt set; the highest committed version is deterministic and reviewable. Second, the fallback writes \code{DEFAULT\_SYSTEM\_PROMPT} into \code{state["role"]} instead of leaving the slot empty. An empty \code{ROLE} slot would force downstream prompt assembly to branch on absence; a conservative default keeps the rest of the graph simple and makes the degradation explicit. Third, pre-conditions are executed before the prompt file is loaded. Failing fast avoids unnecessary file I/O and keeps the semantic meaning clear: the record is invalid for this state, not the rendered text.
+
+Procedure can now steer model behaviour, but a workflow template that cannot constrain tool usage is only half a contract. The next section makes tool pre- and post-conditions part of the same typed procedural surface.
+
+%% ------------------------------------------------------------
+\section{Tools Need Contracts, Not Ad-Hoc Guards}
+\label{sec:tools-need-contracts}
+%% ------------------------------------------------------------
+
+The problem is execution ambiguity. A prompt can instruct the agent to call a tool only under certain conditions, but if the tool layer itself has no typed representation of those conditions, the rule remains advisory. Teams often encode tool safety in scattered \code{if} statements around the call site, which makes the constraint hard to discover, impossible to enumerate centrally, and easy to bypass when new tools are added. The governing principle is that every tool entry in the registry carries typed pre-conditions and post-conditions expressed as Pydantic models whose validators form an executable contract.
+
+This design does two things at once. Before a tool call, the registry constructs the tool's pre-condition model from the proposed arguments; a validation failure means the tool must not run. After the tool returns, the registry constructs the post-condition model from the output; a failure means the tool returned a shape or semantic state the rest of the graph cannot trust. This separates behavioural policy from tool implementation while keeping both machine-checkable.
+
+The key is that the registry stores the model types, not just raw callables. A callable guard hidden inside a tool function is opaque: it cannot be listed, inspected, converted into schema, or tested independently. A Pydantic model is explicit structure. Its validators can still contain arbitrarily rich logic, but the contract becomes visible to both humans and tooling.
+
+\begin{lstlisting}[language=Python,
+  caption={ToolEntry and ToolRegistry enforce typed pre- and post-conditions},
+  label={lst:tool-registry}]
+# src/agent/tools/tool_registry.py
+from pydantic import BaseModel, ValidationError
+
+class ToolEntry(BaseModel):
+    name:           str
+    description:    str
+    fn:             callable
+    pre_condition:  type[BaseModel]
+    post_condition: type[BaseModel]
+
+class ToolOutputError(RuntimeError):
+    pass
+
+class ToolRegistry:
+    def __init__(self) -> None:
+        self._tools: dict[str, ToolEntry] = {}
+
+    def register(self, entry: ToolEntry) -> None:
+        self._tools[entry.name] = entry
+
+    def invoke(self, name: str, args: dict):
+        entry = self._tools[name]
+        entry.pre_condition(**args)
+        output = entry.fn(**args)
+        entry.post_condition.model_validate(output)
+        return output
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={A concrete tool with validator-backed pre- and post-conditions},
+  label={lst:tool-contracts-example}]
+# src/agent/tools/tool_registry.py (continued)
+from pydantic import model_validator
+
+class SearchArgs(BaseModel):
+    query: str
+
+    @model_validator(mode="after")
+    def query_must_be_meaningful(self):
+        if len(self.query.split()) < 2:
+            raise ValueError("query too short for external search")
+        return self
+
+class SearchResult(BaseModel):
+    documents: list[str]
+
+    @model_validator(mode="after")
+    def must_return_at_least_one_doc(self):
+        if not self.documents:
+            raise ValueError("search produced no documents")
+        return self
+\end{lstlisting}
+
+Three decisions in Listings~\ref{lst:tool-registry} and~\ref{lst:tool-contracts-example} deserve explanation. First, the registry validates the post-condition with \code{model\_validate(output)} rather than assuming the tool already returned a model instance. Real tool functions often return plain dicts or API client objects; validating the raw output ensures the contract is enforced at the boundary rather than relying on discipline inside the tool. Second, \code{ToolOutputError} is defined even though the minimal listing does not yet raise it. The conceptual point is that post-condition failure is not the same category of problem as invalid user arguments; a later chapter on observability will attach distinct telemetry to input validation and output-contract failure. Third, the example validators encode semantic constraints rather than shape alone. ``A query string exists'' is not enough; a one-word query may be syntactically valid and operationally useless.
+
+Procedure is now versioned, retrievable, and able to constrain tool use. The last unsolved problem is proving that versioning is real --- that reverting to an earlier commit hash measurably changes what the agent would do.
+
+%% ------------------------------------------------------------
+\section{Rollback Is Real Only If Tests Can Observe It}
+\label{sec:rollback-must-be-tested}
+%% ------------------------------------------------------------
+
+The final design problem is false confidence in versioning. Teams often congratulate themselves for storing version numbers and commit hashes without ever proving that selecting an older version actually changes agent behaviour. If the retrieval path ignores the pinned version, if the loader silently resolves ``latest'', or if the tests only assert that a record exists, rollback is ceremonial rather than operational. The governing principle is that the test suite must demonstrate observable behavioural change when a prior commit hash is selected.
+
+That proof does not require a live model call. The behavioural contract of procedural memory is the rendered \code{ROLE} slot, so the rollback test asserts on the role text produced under two versions of the same template. One fixture constructs a registry containing \code{v1} and \code{v2} of the same \code{task\_type}; another state fixture pins \code{v1}. The unpinned path should retrieve \code{v2}; the pinned path should retrieve \code{v1}; and the resulting role text must differ. A separate test forces a pre-condition failure and confirms the node falls back to \code{DEFAULT\_SYSTEM\_PROMPT}. Together these tests prove both the positive and negative control paths.
+
+\begin{lstlisting}[language=Python,
+  caption={Version-selection and rollback tests for procedural memory},
+  label={lst:procedural-tests}]
+# tests/memory/test_procedural_memory.py
+import pytest
+from src.agent.memory.procedural.procedural_record import ProceduralRecord
+from src.agent.memory.procedural.perceive_node import perceive_node
+
+@pytest.fixture
+def registry_two_versions():
+    v1 = ProceduralRecord(
+        name="base", version=1, commit_hash="abc111",
+        task_type="research", template_text="Be concise.",
+        pre_conditions=[], post_conditions=[])
+    v2 = ProceduralRecord(
+        name="base", version=2, commit_hash="def222",
+        task_type="research", template_text="Be concise and cite uncertainty.",
+        pre_conditions=[], post_conditions=[])
+    return {("research", 1): v1, ("research", 2): v2}
+
+def test_retrieve_returns_highest_version(registry_two_versions, monkeypatch):
+    monkeypatch.setattr(
+        "src.agent.memory.procedural.perceive_node.load_prompt_from_file",
+        lambda path, variables: "role-v2")
+    state = {"meta": {"task_type": "research"}}
+    out = perceive_node(state, registry_two_versions, {})
+    assert out["role"] == "role-v2"
+
+def test_rollback_pins_to_v1(registry_two_versions, monkeypatch):
+    monkeypatch.setattr(
+        "src.agent.memory.procedural.perceive_node.load_prompt_from_file",
+        lambda path, variables: "role-v1" if "_v1" in path else "role-v2")
+    state = {"meta": {"task_type": "research", "pinned_version": 1}}
+    out = perceive_node(state, registry_two_versions, {})
+    assert out["role"] == "role-v1"
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:procedural-tests} deserve explanation. First, the tests monkeypatch \code{load\_prompt\_from\_file} rather than touching the filesystem. The goal is to prove version selection and role-slot output, not template-file I/O. Isolating the loader makes the test about retrieval policy rather than path handling. Second, the assertions compare the final \code{state["role"]} value rather than the selected record object. Behavioural rollback matters because it changes what the model receives. A test that only asserts the registry returned \code{version=1} proves metadata selection, not behavioural effect.
+
+Chapter~10 turns these procedural contracts into observability surfaces: prompt commit hashes, validator failures, and role-slot variants become trace metadata, so behavioural regressions can be detected as they happen rather than reconstructed after the fact.
