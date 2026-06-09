@@ -1,22 +1,808 @@
-%% Chapter 6 — Procedural Memory and Tool Registry
-%% TODO: content
-\chapterquote{A tool the agent cannot find is a tool that does not exist.}{anon}
+%% ============================================================
+%%  Chapter 6 — Prompt Architecture & Context Assembly
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
 
-This chapter covers the tool registry pattern, dynamic tool loading, tool
-description quality, and schema versioning.
+\chapterquote{A context window is not a notepad. It is a budget. Spend it
+like one.}{anon}
 
-\section{The Tool Registry Pattern}
-\label{sec:tool-registry}
-% TODO
+By the end of Chapter~5 the agent has a robust LLM infrastructure layer:
+routing, retries, circuit breaking, cost tracking, and externalised
+configuration. Every call to the model is protected. What is not yet
+protected is what the model receives. In a long-horizon agent loop the
+context window fills incrementally with history, retrieved evidence,
+tool schemas, and goal state. Left unmanaged, it overflows. The model
+receives a truncated, mid-sentence input. The output degrades. The goal
+drifts. The budget burns on cycles that are reasoning over noise.
 
-\section{Tool Descriptions as Contracts}
-\label{sec:tool-descriptions}
-% TODO
+The production failure this chapter prevents is silent context pollution:
+the condition where the assembled prompt is technically within the context
+limit but carries stale history, low-relevance evidence, over-wide tool
+schemas, and a goal statement that has been crowded to the edge of the
+window or evicted entirely. That condition produces hallucination,
+goal drift, and KV-cache misses that double latency on every cycle ---
+all without raising an exception or triggering a retry.
 
-\section{Dynamic Tool Loading}
-\label{sec:dynamic-tool-loading}
-% TODO
+The solution is to treat the context window as a typed, budgeted data
+structure rather than a string. This chapter builds that structure in
+six layers. The first layer (\S\ref{sec:slot-budget}) defines the schema:
+six named slots with fixed priorities, independent trim policies, and a
+Pydantic model that makes the budget explicit and testable. The second
+layer (\S\ref{sec:tokenizer}) enforces the budget: a \code{tiktoken}
+measurement and trim pipeline that drops content before overflow, never
+after, using strategies calibrated to each slot's semantics. The third
+layer (\S\ref{sec:context-assembly-node}) composes the prompt as a pure
+graph node, making context assembly observable, testable, and replaceable
+without touching the Reason node. The fourth layer
+(\S\ref{sec:kv-cache}) adds a structural constraint: the stable prefix
+rule that preserves KV-cache reuse across cycles. The fifth layer
+(\S\ref{sec:prompt-hub}) externalises the prompt template itself into a
+version-pinned LangSmith Prompt Hub entry, eliminating silent regression
+from template drift. The sixth layer (\S\ref{sec:goal-summary}) anchors
+the agent's purpose: a structured \code{GoalSummary} object re-injected
+into the \code{ACTIVE\_GOAL} slot on every cycle so the model never loses
+sight of what it is trying to accomplish.
 
-\section{Tool Schema Versioning}
-\label{sec:tool-schema-versioning}
-% TODO
+This chapter introduces six slot names and three error types that appear
+throughout the rest of the book. Table~\ref{tab:slot-taxonomy} maps each
+term to its role before you build any of the components.
+
+\begin{table}[ht]
+\centering
+\caption{Slot taxonomy, trim priority, and error types introduced in Chapter~6}
+\label{tab:slot-taxonomy}
+\begin{tabular}{llll}
+\toprule
+\textbf{Slot / Term} & \textbf{Default tokens} & \textbf{Trim priority} & \textbf{Trimmable} \\
+\midrule
+\code{ROLE}         & 512   & ---   & No \\
+\code{ACTIVE\_GOAL} & 256   & ---   & No \\
+\code{EVIDENCE}     & 4\,096 & 2nd   & Yes \\
+\code{TOOLS}        & 1\,024 & 3rd   & Yes \\
+\code{HISTORY}      & 8\,192 & 1st   & Yes \\
+\code{HEADROOM}     & 512   & ---   & No (sentinel) \\
+\midrule
+\code{SlotOverflowError}          & \multicolumn{3}{l}{Raised when a non-trimmable slot exceeds its budget} \\
+\code{ContextWindowExceededError} & \multicolumn{3}{l}{Raised when the assembled prompt overflows after all trimming} \\
+\code{CachePrefixUnstableError}   & \multicolumn{3}{l}{Raised when the system-message prefix is not byte-identical across renders} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The sections are ordered by dependency: you cannot trim a slot until you
+have a schema to measure it against (\S\ref{sec:slot-budget}); you cannot
+assemble the prompt until you have a trimmer
+(\S\ref{sec:tokenizer}); you cannot enforce the cache rule until the
+assembly node exists (\S\ref{sec:context-assembly-node},
+\S\ref{sec:kv-cache}); and the goal summary cannot be rendered without
+the slot budget and tokenizer already in place
+(\S\ref{sec:goal-summary}).
+
+The source layout for this chapter is:
+
+\begin{verbatim}
+src/
+  agent/
+    nodes/
+      context_assembly.py    # §6.3
+    prompt/
+      slot_budget.py         # §6.1
+      tokenizer.py           # §6.2
+      cache_guard.py         # §6.4
+      hub.py                 # §6.5
+      goal_summary.py        # §6.6
+\end{verbatim}
+
+%% ------------------------------------------------------------
+\section{A Prompt Is a Typed, Budgeted Data Structure}
+\label{sec:slot-budget}
+%% ------------------------------------------------------------
+
+The fundamental problem with treating a prompt as a free-form string is
+that a string has no allocation policy. When the context window fills,
+there is no principled answer to the question: what should be dropped,
+and in what order? In practice, the answer defaults to whatever happens
+to be at the end of the string --- which is usually the most recent
+observations, exactly the content that should be preserved. The result
+is that history and goal state are lost while stale role preamble
+occupies the top of the window.
+
+The correct model is a budget with named slots. Each slot has a fixed
+allocation, a trim priority, and a policy for whether trimming is
+permissible at all. The \code{ROLE} slot --- the system message ---
+contains the agent's behavioural policy and output contract; it must never
+be truncated. The \code{ACTIVE\_GOAL} slot carries the current goal
+state; losing it mid-run is catastrophic. The \code{HISTORY} slot is the
+largest trimmable slot and should be shed first. The \code{HEADROOM}
+slot is a sentinel: it is never filled with content but reserves tokens
+to prevent the off-by-one overflows that occur when a tokeniser estimate
+and a provider's actual counter disagree by a few tokens.
+
+The \code{SlotBudget} Pydantic model enforces this allocation statically.
+It is \code{frozen=True} because a budget that can be mutated after
+construction is not a budget --- it is a variable. The
+\code{total\_fits\_context} validator ensures that the sum of all
+allocations never exceeds the model's context window, catching
+configuration errors at import time rather than at the moment the first
+call overflows. Section~\ref{sec:context-assembly-node} reads
+\code{SlotBudget} from \code{RunnableConfig} so that each graph
+invocation can carry its own budget without mutating shared state.
+
+\begin{lstlisting}[language=Python,
+  caption={SlotBudget model with validators and SlotName enum},
+  label={lst:slot-budget}]
+# src/agent/prompt/slot_budget.py
+from __future__ import annotations
+from enum import Enum
+from pydantic import BaseModel, model_validator
+
+
+class SlotName(str, Enum):
+    ROLE        = "role"
+    ACTIVE_GOAL = "active_goal"
+    EVIDENCE    = "evidence"
+    TOOLS       = "tools"
+    HISTORY     = "history"
+    HEADROOM    = "headroom"
+
+
+class SlotBudget(BaseModel):
+    model_config = {"frozen": True}
+    context_window: int = 128_000
+    role:           int = 512
+    active_goal:    int = 256
+    evidence:       int = 4_096
+    tools:          int = 1_024
+    history:        int = 8_192
+    headroom:       int = 512
+
+    @model_validator(mode="after")
+    def total_fits_context(self) -> "SlotBudget":
+        allocated = (
+            self.role + self.active_goal + self.evidence
+            + self.tools + self.history + self.headroom
+        )
+        if allocated > self.context_window:
+            raise ValueError(
+                f"Slot allocations sum to {allocated} tokens but "
+                f"context_window is {self.context_window}."
+            )
+        return self
+
+
+DEFAULT_BUDGET = SlotBudget()
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:slot-budget} deserve explanation.
+
+First, \code{SlotName} inherits from both \code{str} and \code{Enum}.
+This means a \code{SlotName} value serialises as a plain string in
+Langfuse metadata and JSON logs without any custom encoder, while still
+being a closed enumeration that the type checker validates at every call
+site.
+
+Second, \code{frozen=True} is set at the class level, not per-field.
+Pydantic's \code{frozen} config makes every field immutable after
+construction and makes the model hashable. The hashability is not
+cosmetic: \code{SlotBudget} is passed as an argument to
+\code{@lru\_cache}-wrapped tokeniser functions in
+\S\ref{sec:tokenizer}, where hashability is a prerequisite for
+caching.
+
+Third, the validator sums all six slots against \code{context\_window}.
+The headroom allocation is included in that sum intentionally. If a
+calculation elsewhere treats headroom as free space rather than a
+reserved allocation, that assumption will surface as a validation failure
+here rather than as a silent overflow at runtime. Chapter~9's
+frozen-\code{SlotBudget} tests rely on this validator to catch
+misconfigured test fixtures before any node runs.
+
+With the budget schema defined, the next question is how to measure
+whether any piece of content fits within its slot's allocation --- and
+what to drop when it does not.
+
+%% ------------------------------------------------------------
+\section{Trim Before Overflow, Never After}
+\label{sec:tokenizer}
+%% ------------------------------------------------------------
+
+The canonical mistake in context management is to assemble the full
+prompt and then truncate it to the context limit. Truncation at the
+assembly boundary cuts wherever the string ends, which means the model
+receives a sentence fragment, a broken JSON structure, or half a tool
+schema. The output that follows is unpredictable. The correct approach
+is the inverse: measure each slot's content against its allocation
+before assembly, drop excess content according to a per-slot strategy,
+and only then compose the final prompt. The assembled prompt is always
+valid by construction.
+
+The tokeniser module has three responsibilities. It provides a cached
+encoder instance so the tiktoken binary is loaded once per process, not
+per call. It provides a \code{count\_tokens} function that measures
+content accurately. It provides a \code{trim\_to\_budget} function that
+applies one of two strategies: \code{oldest\_first} for \code{HISTORY}
+(which preserves recent exchanges --- the most contextually relevant),
+and \code{lowest\_score} for \code{EVIDENCE} (which preserves
+high-relevance chunks, dropping low-signal retrieved content first).
+Chapter~8's \code{EvidenceChunk.score} field provides the relevance
+signal consumed by the \code{lowest\_score} strategy.
+
+\begin{warningbox}
+\code{cl100k\_base} is the correct default encoder for GPT-4o and most
+OpenAI-family models. It is also a reasonable approximation for Anthropic
+models. However, the exact token count for a given string differs
+slightly between providers. The \code{HEADROOM} slot exists precisely to
+absorb those discrepancies. Do not remove it and do not set it below 256
+tokens.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Cached encoder, token counter, and SlotOverflowError},
+  label={lst:tokenizer}]
+# src/agent/prompt/tokenizer.py
+import logging
+from functools import lru_cache
+from typing import Literal
+import tiktoken
+from langchain_core.messages import BaseMessage
+from src.agent.prompt.slot_budget import SlotName
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=8)
+def get_encoder(name: str = "cl100k_base") -> tiktoken.Encoding:
+    return tiktoken.get_encoding(name)
+
+
+def count_tokens(text: str, encoder: tiktoken.Encoding) -> int:
+    return len(encoder.encode(text))
+
+
+class SlotOverflowError(ValueError):
+    def __init__(self, slot: SlotName, count: int, budget: int) -> None:
+        super().__init__(
+            f"Slot {slot.value!r} contains {count} tokens "
+            f"but budget is {budget}."
+        )
+        self.slot   = slot
+        self.count  = count
+        self.budget = budget
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={trim\_to\_budget: oldest-first and lowest-score strategies},
+  label={lst:trim-strategy}]
+# src/agent/prompt/tokenizer.py (continued)
+
+def trim_to_budget(
+    messages: list[BaseMessage],
+    budget:   int,
+    encoder:  tiktoken.Encoding,
+    strategy: Literal["oldest_first", "lowest_score"] = "oldest_first",
+) -> tuple[list[BaseMessage], int]:
+    """Return (trimmed_messages, tokens_used). Never raises."""
+    if strategy == "oldest_first":
+        while messages:
+            total = sum(count_tokens(m.content, encoder) for m in messages)
+            if total <= budget:
+                break
+            # Drop the oldest user+assistant pair (atomic unit).
+            drop     = 2 if len(messages) >= 2 else 1
+            dropped  = messages[:drop]
+            messages = messages[drop:]
+            logger.debug(
+                "trim_to_budget: dropped %d msg(s), ~%d tokens",
+                drop,
+                sum(count_tokens(m.content, encoder) for m in dropped),
+            )
+    else:  # lowest_score — used for EVIDENCE
+        messages = sorted(
+            messages,
+            key=lambda m: getattr(m, "score", 0.0),
+            reverse=True,
+        )
+        kept: list[BaseMessage] = []
+        used = 0
+        for msg in messages:
+            t = count_tokens(msg.content, encoder)
+            if used + t <= budget:
+                kept.append(msg)
+                used += t
+        messages = kept
+
+    tokens_used = sum(count_tokens(m.content, encoder) for m in messages)
+    return messages, tokens_used
+\end{lstlisting}
+
+Two decisions in Listings~\ref{lst:tokenizer} and~\ref{lst:trim-strategy}
+deserve explanation.
+
+First, the \code{oldest\_first} strategy drops messages in pairs of two,
+not individually. A lone assistant message without its preceding user
+message is meaningless context --- it answers a question the model can
+no longer see. Dropping in pairs preserves coherence across the remaining
+history. If the list has an odd length (which can occur after a
+mid-session recovery), the strategy drops a single message at the
+boundary rather than raising.
+
+Second, \code{trim\_to\_budget} returns \code{(trimmed, tokens\_used)}
+rather than just the trimmed list. The \code{tokens\_used} return value
+is written into \code{\_slot\_token\_counts} in the assembly node
+(\S\ref{sec:context-assembly-node}), which is then passed to Langfuse as
+span metadata. Without the per-slot count at the call site, the Langfuse
+span would require a second full encoding pass to reconstruct it.
+
+With measurement and trimming in place, the final question is where in
+the graph these operations live and who calls them in what order.
+
+%% ------------------------------------------------------------
+\section{Prompt Construction Is a Graph Node}
+\label{sec:context-assembly-node}
+%% ------------------------------------------------------------
+
+The tempting implementation is to build the prompt inside the Reason
+node: read state, format a string, call the model. That works in
+development. In production it creates an untestable coupling between
+context assembly logic and model invocation. When the assembled prompt
+is wrong --- wrong slot order, incorrect trim, a goal that was evicted
+--- there is no way to test the assembly in isolation without also
+invoking the model. There is no Langfuse span for the assembly step, so
+there is no per-slot token count in the trace. There is no way to swap
+the assembly strategy without touching the model call.
+
+The correct design is a dedicated \code{context\_assembly\_node}: a pure
+\code{(state, config) -> dict} function that reads six sources from
+\code{AgentState}, fills six slots in trim-priority order, enforces
+per-slot budgets, assembles a \code{ChatPromptTemplate}, and writes the
+result back to \code{AgentState.assembled\_prompt}. The Reason node reads
+\code{assembled\_prompt} and never calls the template directly. Assembly
+and reasoning are independently testable, independently observable, and
+independently replaceable.
+
+\begin{notebox}
+Trim order is structural, not conventional. \code{HISTORY} is trimmed
+first because it is the largest slot and the least semantically critical
+for the current cycle. \code{EVIDENCE} is trimmed second because
+relevance scoring can guide what to drop. \code{TOOLS} is trimmed third
+because the tool list rarely changes mid-run. \code{ROLE} and
+\code{ACTIVE\_GOAL} are never trimmed. Changing the order changes the
+agent's behaviour under pressure; treat this ordering as a design
+decision that must be documented and tested.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={ContextAssemblyNode: pure state transform with Langfuse instrumentation},
+  label={lst:context-assembly}]
+# src/agent/nodes/context_assembly.py
+from langchain_core.prompts import ChatPromptTemplate
+from langfuse.decorators import observe
+from langgraph.types import RunnableConfig
+from src.agent.state import AgentState
+from src.agent.prompt.slot_budget import SlotName, DEFAULT_BUDGET
+from src.agent.prompt.tokenizer import get_encoder, trim_to_budget, SlotOverflowError
+from src.agent.prompt.goal_summary import GoalSummary
+
+
+class ContextWindowExceededError(RuntimeError):
+    """Raised after all permissible trimming still leaves the prompt
+    over budget. This is a configuration error, not a retriable condition.
+    """
+
+
+@observe(name="context_assembly_node")
+def context_assembly_node(state: AgentState, config: RunnableConfig) -> dict:
+    budget  = config["configurable"].get("slot_budget") or DEFAULT_BUDGET
+    encoder = get_encoder()
+    counts: dict[str, int] = {}
+
+    role_text   = state["role_prompt"]
+    role_tokens = len(encoder.encode(role_text))
+    if role_tokens > budget.role:
+        raise SlotOverflowError(SlotName.ROLE, role_tokens, budget.role)
+    counts[SlotName.ROLE.value] = role_tokens
+
+    goal_text = GoalSummary(**state["goal_summary"]).render(
+        budget=budget.active_goal, encoder=encoder
+    )
+    counts[SlotName.ACTIVE_GOAL.value] = len(encoder.encode(goal_text))
+
+    history, counts[SlotName.HISTORY.value] = trim_to_budget(
+        list(state.get("messages", [])), budget.history, encoder, "oldest_first"
+    )
+    evidence, counts[SlotName.EVIDENCE.value] = trim_to_budget(
+        state.get("evidence_messages", []), budget.evidence, encoder, "lowest_score"
+    )
+    tools_text = state.get("tools_schema", "")
+    tools_msgs = [m for m in [tools_text] if m]
+    tools_msgs, counts[SlotName.TOOLS.value] = trim_to_budget(
+        tools_msgs, budget.tools, encoder, "oldest_first"
+    )
+
+    total = sum(counts.values())
+    if total > budget.context_window - budget.headroom:
+        raise ContextWindowExceededError(
+            f"Prompt uses {total} tokens; limit after headroom is "
+            f"{budget.context_window - budget.headroom}."
+        )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", role_text),
+        ("human",  goal_text),
+        *[(m.type, m.content) for m in evidence],
+        *[(m.type, m.content) for m in tools_msgs],
+        *[(m.type, m.content) for m in history],
+    ])
+    return {
+        "assembled_prompt":   prompt.format_messages(),
+        "_slot_token_counts": counts,
+    }
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:context-assembly} deserve
+explanation.
+
+First, the \code{slot\_budget} is read from
+\code{config["configurable"]} rather than imported as a module-level
+constant. This means a test can pass a \code{SlotBudget} with a
+2\,000-token context window and 100-token slots without patching any
+global state. Chapter~9's isolation tests exercise this exact pattern to
+verify trim behaviour deterministically on small fixture states.
+
+Second, \code{ContextWindowExceededError} is a \code{RuntimeError}, not
+a \code{ValueError}. It signals a misconfiguration --- the operator has
+set slot allocations that cannot fit in the declared model context window
+--- that should crash the graph at startup or on first invocation, not
+be silently retried. A retry would produce the same error on every cycle.
+
+Third, the \code{\_slot\_token\_counts} dict is written to state with a
+leading underscore by convention. Chapter~23's Langfuse instrumentation
+reads this field from the node's output dict and attaches it as span
+metadata automatically, without any additional encoding pass inside the
+observability layer.
+
+The assembly node composes the prompt correctly. The next constraint is
+less obvious: the order of content within the prompt has latency and
+cost implications at the provider level, because of how the KV cache
+operates across consecutive calls.
+
+%% ------------------------------------------------------------
+\section{Stable Prefixes Preserve KV-Cache Reuse}
+\label{sec:kv-cache}
+%% ------------------------------------------------------------
+
+Every major LLM provider caches the key-value representations of prompt
+tokens across calls. When the first \emph{N} tokens of two consecutive
+calls are byte-identical --- the same characters in the same order ---
+the provider can reuse the cached KV representation for those tokens
+rather than recomputing them. The latency saving is proportional to the
+size of the reused prefix: a 512-token system message that is reused
+saves roughly 512 token-generations of compute on every cycle, which at
+scale translates directly to latency reduction and cost reduction.
+
+KV-cache reuse is broken by a single character change in the prefix. If
+a timestamp, a run ID, a session variable, or a username is
+interpolated into the system message, the prefix changes on every call
+and the cache is useless. This is a common mistake because system
+prompts are often written as templates with dynamic fields, and the
+temptation to personalise the role message is strong. The engineering
+rule is absolute: the \code{ROLE} slot must be a compile-time constant.
+All dynamic content --- goal state, history, evidence --- lives in the
+human message, after the cache boundary.
+
+\begin{warningbox}
+Tool descriptions injected into the \code{ROLE} slot are a frequent
+source of cache instability. Tool descriptions belong in the
+\code{TOOLS} slot, which is in the human message. A role message that
+includes dynamically-selected tool descriptions will change its hash on
+every cycle where the available tool set changes, destroying cache reuse
+across the entire prefix.
+\end{warningbox}
+
+\begin{notebox}
+The stability rule applies to the \emph{rendered} string, not to the
+template source. A \code{ChatPromptTemplate} that contains only static
+fields in its system message is safe. A template that interpolates any
+\code{AgentState} field into the system message violates the rule, even
+if the interpolated value happens to be identical across cycles in
+practice. The only safe test is to render the system message twice with
+different state instances and assert byte equality.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={assert\_stable\_prefix with difflib diagnostic and CachePrefixUnstableError},
+  label={lst:cache-guard}]
+# src/agent/prompt/cache_guard.py
+from __future__ import annotations
+import difflib
+from src.agent.prompt.slot_budget import SlotName
+
+
+class CachePrefixUnstableError(AssertionError):
+    def __init__(self, diff_at_char: int, slot: SlotName) -> None:
+        super().__init__(
+            f"Cache prefix for slot {slot.value!r} diverges at "
+            f"character offset {diff_at_char}. Dynamic content has "
+            f"leaked into the stable prefix."
+        )
+        self.diff_at_char = diff_at_char
+        self.slot         = slot
+
+
+def assert_stable_prefix(
+    render_a: str,
+    render_b: str,
+    slot: SlotName = SlotName.ROLE,
+) -> None:
+    """Raise CachePrefixUnstableError if the two renders differ.
+
+    Called inside context_assembly_node only when LLMSettings.debug=True
+    so that the overhead of two render passes is never paid in production.
+    Always called by Chapter 28's CI template-change regression test.
+    """
+    if render_a == render_b:
+        return
+    for opcode in difflib.SequenceMatcher(None, render_a, render_b).get_opcodes():
+        if opcode[0] != "equal":
+            raise CachePrefixUnstableError(diff_at_char=opcode[1], slot=slot)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:cache-guard} deserve explanation.
+
+First, the \code{difflib.SequenceMatcher} diagnostic reports the exact
+character offset where the two renders diverge. Without it, a
+\code{CachePrefixUnstableError} is a binary pass/fail with no
+information about what leaked into the prefix. With it, the engineer
+sees immediately that the divergence is at character offset 412 ---
+which maps to the timestamp field that was incorrectly interpolated into
+the role template --- and can fix the template without a guessing loop.
+
+Second, \code{assert\_stable\_prefix} is guarded by
+\code{LLMSettings.debug} in the assembly node. The check requires two
+render passes of the system message. In production, that overhead is
+paid on every cycle for zero benefit; the system message does not change
+between cycles. In CI, the check is always executed by the
+template-change test described in Chapter~28, and by the linting step
+in Chapter~13 that runs on every template modification.
+
+The system message is now stable. The remaining question is where the
+content of that system message comes from, and how to ensure it does not
+change silently between deployments.
+
+%% ------------------------------------------------------------
+\section{A Template Version Is a Dependency: Pin It}
+\label{sec:prompt-hub}
+%% ------------------------------------------------------------
+
+Pulling a prompt template from a registry without pinning its version is
+the same mistake as writing \code{pip install langchain} without a
+version specifier. The template can change between deployments with no
+code diff, no review, and no rollback path. A model tuned against one
+template version silently receives a different one at the next deploy.
+The regression appears in evaluation metrics weeks later, after many
+confounding changes have been made, and the root cause is expensive to
+isolate.
+
+LangSmith Prompt Hub supports version pinning through commit hashes.
+Calling \code{hub.pull("prod-agent-role:a3f9c2d")} always returns the
+exact template at that commit, regardless of what the \code{latest}
+pointer resolves to. The commit hash must live in
+\code{LLMSettings.prompt\_commit\_hash} --- not hardcoded in the call
+site. A call site that embeds the hash directly is impossible to update
+across environments without a code change. For A/B testing, the
+\code{configurable} field in \code{RunnableConfig} carries a
+\code{prompt\_variant} hash that selects between two pinned template
+versions at invocation time, with no code change and no global state
+mutation.
+
+\begin{lstlisting}[language=Python,
+  caption={PromptPinConfig, load\_pinned\_prompt with hub fallback, and A/B variant selection},
+  label={lst:prompt-hub}]
+# src/agent/prompt/hub.py
+from __future__ import annotations
+from functools import lru_cache
+from pathlib import Path
+from pydantic import BaseModel, SecretStr
+from langchain import hub
+from langchain_core.prompts import ChatPromptTemplate
+
+
+class PromptPinConfig(BaseModel):
+    model_config = {"frozen": True}
+    name:          str
+    commit_hash:   str
+    fallback_path: Path | None = None
+
+
+@lru_cache(maxsize=16)
+def load_pinned_prompt(
+    config:            PromptPinConfig,
+    langsmith_api_key: SecretStr,
+) -> ChatPromptTemplate:
+    """Load a version-pinned prompt from LangSmith Hub.
+
+    Falls back to config.fallback_path if the Hub is unreachable.
+    lru_cache ensures the network round-trip is made once per process.
+    """
+    ref = f"{config.name}:{config.commit_hash}"
+    try:
+        return hub.pull(ref, api_key=langsmith_api_key.get_secret_value())
+    except Exception:
+        if config.fallback_path and config.fallback_path.exists():
+            return ChatPromptTemplate.from_file(str(config.fallback_path))
+        raise
+
+
+def select_prompt_variant(
+    base:         PromptPinConfig,
+    variant_hash: str | None,
+) -> PromptPinConfig:
+    """Return base with commit_hash replaced if variant_hash is set.
+
+    Reads from config["configurable"].get("prompt_variant") in the
+    assembly node. Returns base unchanged when variant_hash is None.
+    """
+    if variant_hash is None:
+        return base
+    return base.model_copy(update={"commit_hash": variant_hash})
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:prompt-hub} deserve explanation.
+
+First, \code{load\_pinned\_prompt} is wrapped in \code{@lru\_cache}.
+The arguments are \code{PromptPinConfig} (a frozen Pydantic model,
+therefore hashable) and \code{SecretStr} (also hashable). The cache
+ensures the LangSmith Hub is queried once at graph construction time;
+subsequent invocations in the same process pay no network cost. In tests,
+\code{load\_pinned\_prompt.cache\_clear()} resets the cache between
+cases that use different commit hashes.
+
+Second, the fallback path is a local \code{.langchain/} file checked
+into the repository. Its purpose is to allow the graph to start up
+during a LangSmith outage without blocking the deployment pipeline. The
+fallback template contains no secrets --- only the prompt text --- so
+checking it in is safe. Chapter~13's CI step validates that
+\code{prompt\_commit\_hash} in \code{.env.production} resolves to a real
+Hub commit before any deployment proceeds, catching stale pins before
+they reach production.
+
+Third, \code{select\_prompt\_variant} returns a new
+\code{PromptPinConfig} rather than mutating the base config. The base
+config is a shared constant loaded at graph construction time; the
+variant config is a short-lived object that exists only for the duration
+of a single graph invocation. Chapter~23's Langfuse instrumentation
+records the \code{commit\_hash} from whichever config was used so that
+offline analysis can attribute quality differences to specific template
+versions with precision.
+
+The template is now stable, versioned, and loaded efficiently. The final
+structural question is whether the model, across many cycles, continues
+to work on the right goal --- or whether the original intent has drifted
+out of the context window's effective attention range.
+
+%% ------------------------------------------------------------
+\section{The Goal Must Survive Every Cycle}
+\label{sec:goal-summary}
+%% ------------------------------------------------------------
+
+The most insidious form of context degradation is not a token overflow
+that raises an exception. It is silent goal drift: the original objective
+is technically present in the context window but has been pushed so far
+back by accumulated history and evidence that the model's attention
+effectively ignores it. The agent continues taking actions, calling
+tools, and producing outputs --- all coherent locally, all disconnected
+from the original intent. By the time the drift is visible in outputs,
+many cycles and significant budget have been wasted.
+
+The solution is not to make the system prompt longer. System prompt
+verbosity does not guarantee that a long-context model anchors on goal
+state at the end of a 40-cycle run. The solution is structural: a
+compact, deterministic \code{GoalSummary} object is re-injected into the
+\code{ACTIVE\_GOAL} slot on every cycle, positioned immediately after the
+system message at the highest-priority position available in the human
+message. It is not history; it is not evidence; it is the agent's
+mandate, restated precisely at the beginning of every cycle's variable
+content.
+
+\code{GoalSummary} is a Pydantic model with four fields.
+\code{original\_goal} is never truncated. \code{current\_step} is
+updated by the Reflect node after each cycle; Chapter~1's
+\code{reflect\_decision} maps to a step label and calls
+\code{update\_step} before writing state back. \code{constraints} is a
+\code{list[str]} where each entry is one sentence; the \code{render()}
+method trims this list by priority to fit the slot. \code{priority} is a
+\code{Literal["critical","high","normal"]} that governs whether the last
+constraint is partially truncated or silently dropped when the slot is
+tight. Chapter~2 shows how to include the termination policy as a
+constraint: \code{"Cost limit: \$2.00 maximum per run"} becomes a
+first-class constraint that the model sees on every cycle.
+
+\begin{lstlisting}[language=Python,
+  caption={GoalSummary with priority-aware render() and update\_step},
+  label={lst:goal-summary}]
+# src/agent/prompt/goal_summary.py
+from __future__ import annotations
+from typing import Literal
+from pydantic import BaseModel
+import tiktoken
+from src.agent.prompt.tokenizer import count_tokens, SlotOverflowError
+from src.agent.prompt.slot_budget import SlotName
+
+
+class GoalSummary(BaseModel):
+    original_goal: str
+    current_step:  str
+    constraints:   list[str] = []
+    priority:      Literal["critical", "high", "normal"] = "normal"
+
+    def render(self, budget: int, encoder: tiktoken.Encoding) -> str:
+        base        = f"Goal: {self.original_goal}\nStep: {self.current_step}"
+        base_tokens = count_tokens(base, encoder)
+        if base_tokens > budget:
+            raise SlotOverflowError(SlotName.ACTIVE_GOAL, base_tokens, budget)
+        remaining = budget - base_tokens
+        kept: list[str] = []
+        for constraint in self.constraints:
+            t = count_tokens(constraint, encoder)
+            if remaining - t >= 0:
+                kept.append(constraint)
+                remaining -= t
+            elif self.priority == "critical":
+                # Partial truncation: a visible fragment is better than silence.
+                words, partial = constraint.split(), ""
+                for word in words:
+                    candidate = (partial + " " + word).strip()
+                    if count_tokens(candidate, encoder) <= remaining:
+                        partial = candidate
+                    else:
+                        break
+                if partial:
+                    kept.append(partial + " [truncated]")
+                break
+            else:
+                break   # drop remaining constraints for high/normal priority
+        parts = [base]
+        if kept:
+            parts.append("Constraints:\n" + "\n".join(f"- {c}" for c in kept))
+        return "\n".join(parts)
+
+    def update_step(self, new_step: str) -> "GoalSummary":
+        return self.model_copy(update={"current_step": new_step})
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:goal-summary} deserve explanation.
+
+First, \code{original\_goal} is never truncated under any priority
+level. If the original goal text alone exceeds the \code{ACTIVE\_GOAL}
+slot budget, \code{render()} raises \code{SlotOverflowError}. This is
+intentional: a truncated goal is strictly worse than an error, because
+the model would silently act on a fragment of the objective. The correct
+fix is to increase the \code{active\_goal} allocation in
+\code{SlotBudget} for goals that are genuinely long, or to compress the
+goal text before constructing \code{GoalSummary}.
+
+Second, the \code{critical} priority path attempts word-level truncation
+of the last constraint rather than dropping it entirely. The reasoning
+is that even a partial constraint --- ``Cost limit: \$2.00 per
+[truncated]'' --- is more useful to the model than silence, because it
+signals that a constraint exists even if its full text is unavailable.
+The \code{[truncated]} suffix is a deliberate signal to the model, not a
+hide-the-overflow artefact. Chapter~9's unit tests assert that a
+\code{critical}-priority \code{GoalSummary} never silently drops its
+first constraint, even at extreme slot pressure.
+
+Third, \code{update\_step} returns \code{model\_copy(update=\{...\})}
+rather than mutating \code{self}. \code{GoalSummary} instances live in
+\code{AgentState}, which is a \code{TypedDict}. State in LangGraph is
+replaced on write, not mutated in place; returning a new instance is the
+correct pattern and avoids subtle bugs when the same \code{GoalSummary}
+object is referenced from a checkpoint snapshot loaded by the recovery
+node described in Chapter~3.
+
+Chapter~7 extends this foundation into the full short-term memory layer:
+\code{MessagesState}, \code{trim\_messages()}, and a summarisation node
+that compresses accumulated \code{HISTORY} into a compact form before it
+would otherwise saturate the slot. The context assembly pipeline built
+here is the substrate that the memory layer writes into --- and the
+\code{HISTORY} slot trim strategy built in \S\ref{sec:tokenizer} is the
+first line of defence before summarisation ever fires.
