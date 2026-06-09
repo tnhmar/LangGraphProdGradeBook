@@ -42,7 +42,7 @@ chapter you make that union the explicit contract between the model call and the
 rest of the runtime.
 
 Each of the three variants gets its own Pydantic~v2 \code{BaseModel}. There is
-no single "assistant response" model with optional fields for every possible
+no single ``assistant response'' model with optional fields for every possible
 shape. Optional fields create mixed states that are syntactically valid and
 semantically meaningless: a record with both a tool name and a final answer, or
 neither. A discriminated union, keyed by a \code{type} field, rules those states
@@ -108,7 +108,7 @@ untyped blob.
 %% ------------------------------------------------------------
 
 Instructor wraps a LiteLLM client so that calls to \code{.create()} accept a
-\code{response_model=} argument. Under the hood, it can use three strategies to
+\code{response\_model=} argument. Under the hood, it can use three strategies to
 coerce the model into structured output: native tool calling, native JSON mode,
 or JSON wrapped in a markdown code block. The mode you choose is a property of
 both the model provider and the reliability you need.
@@ -175,7 +175,7 @@ per mode.
 %% ------------------------------------------------------------
 
 In Chapter~1 the Reason node called Instructor directly and wrote the parsed
-object into \code{last_action}. Validation lived inline inside the node. That is
+object into \code{last\_action}. Validation lived inline inside the node. That is
 convenient but wrong for three reasons:
 
 \begin{itemize}
@@ -194,20 +194,20 @@ repair.
 Three private fields are added to the state for this purpose:
 
 \begin{itemize}
-  \item \code{_raw_model_output: str | None} --- the last raw JSON string the
+  \item \code{\_raw\_model\_output: str | None} --- the last raw JSON string the
         model produced,
-  \item \code{_validation_error: str | None} --- the last Pydantic
+  \item \code{\_validation\_error: str | None} --- the last Pydantic
         \code{ValidationError} string, and
-  \item \code{_validation_attempt: int} --- the number of consecutive failed
+  \item \code{\_validation\_attempt: int} --- the number of consecutive failed
         validation attempts for the current cycle.
 \end{itemize}
 
 Listing~\ref{lst:validation-node} shows the node. It is a pure
 \code{(state) -> dict} callable like the other nodes, decorated with
 \code{@observe} so Langfuse captures it as a separate span. On success it writes
-\code{last_action} as a fully parsed union and clears the error fields. On
-failure it increments \code{_validation_attempt}, records the error, and leaves
-\code{last_action} untouched.
+\code{last\_action} as a fully parsed union and clears the error fields. On
+failure it increments \code{\_validation\_attempt}, records the error, and leaves
+\code{last\_action} untouched.
 
 \begin{lstlisting}[language=Python,
   caption={Validation as its own node between Reason and Action},
@@ -264,8 +264,8 @@ retries---up to a maximum.
 
 The maximum must not be a magic number buried inside the node. It is part of the
 termination policy. Chapter~2 introduced \code{TerminationPolicy} with fields
-for \code{max_cycles}, \code{token_ceiling}, \code{wall_clock_timeout}, and
-\code{cost_cap}. Here you add a new field \code{validation_max_retries} with a
+for \code{max\_cycles}, \code{token\_ceiling}, \code{wall\_clock\_timeout}, and
+\code{cost\_cap}. Here you add a new field \code{validation\_max\_retries} with a
 sane default and a validation rule.
 
 \begin{lstlisting}[language=Python,
@@ -351,7 +351,7 @@ need any special-case cost accounting for retries: they are just extra cycles.
 \label{sec:validation-escalation}
 %% ------------------------------------------------------------
 
-When validation has failed \code{validation_max_retries} times in a row for the
+When validation has failed \code{validation\_max\_retries} times in a row for the
 same raw output, further retries are wishful thinking. At that point the runtime
 needs to surface the failure explicitly and stop.
 
@@ -362,8 +362,8 @@ does not talk to the Reflect node directly; instead it sets state in a way that
 causes the existing routing logic to choose the escalation branch.
 
 Listing~\ref{lst:validation-escalation} shows a small helper for the escalation
-update. It writes a structured summary into \code{final_answer}, sets
-\code{reflect_decision} to \code{"ESCALATE"}, and leaves the error fields
+update. It writes a structured summary into \code{final\_answer}, sets
+\code{reflect\_decision} to \code{"ESCALATE"}, and leaves the error fields
 intact for diagnostics.
 
 \begin{lstlisting}[language=Python,
@@ -416,10 +416,10 @@ def _build_escalation_update(
 \end{lstlisting}
 
 The Validation node calls this helper in its failure branch when
-\code{route_after_validation} has returned \code{"escalate"}. The Reflect node
-then sees \code{reflect_decision == "ESCALATE"} and Chapter~1's
-\code{route_from_reflect} function routes directly to \code{END}. The
-\code{termination_status} in the \code{CycleTrace} is set to \code{"FAILURE"} by
+\code{route\_after\_validation} has returned \code{"escalate"}. The Reflect node
+then sees \code{reflect\_decision == "ESCALATE"} and Chapter~1's
+\code{route\_from\_reflect} function routes directly to \code{END}. The
+\code{termination\_status} in the \code{CycleTrace} is set to \code{"FAILURE"} by
 Chapter~2's helpers, distinguishing this path from voluntary human escalation.
 
 %% ------------------------------------------------------------
@@ -465,14 +465,14 @@ def _emit_validation_failure_event(
 
 The helper is called in the Validation node's \code{except ValidationError}
 branch. For simple deployments this \code{metadata} record is enough: Langfuse
-Studio can filter observations where \code{event == "validation_failure"} and
+Studio can filter observations where \code{event == "validation\_failure"} and
 show you error distributions by model and output type.
 
 For larger fleets you can extend this into a dedicated Langfuse event type and a
 data-warehouse export. The schema does not change; only the plumbing does.
 
 \begin{notebox}
-As in Chapter~1's tests, set \code{LANGFUSE_ENABLED=false} in your test
+As in Chapter~1's tests, set \code{LANGFUSE\_ENABLED=false} in your test
 configuration so that unit tests for the Validation node do not make network
 calls. The helper function becomes a no-op when the SDK is disabled.
 \end{notebox}
@@ -485,8 +485,8 @@ calls. The helper function becomes a no-op when the SDK is disabled.
 The last step is to insert the Validation node into the graph and exercise the
 repair and escalation paths in tests.
 
-On the graph side, Reason writes \code{_raw_model_output} instead of a parsed
-\code{last_action}. Validation consumes that field and writes \code{last_action}
+On the graph side, Reason writes \code{\_raw\_model\_output} instead of a parsed
+\code{last\_action}. Validation consumes that field and writes \code{last\_action}
 on success. The edge from Reason now points to Validation; the edge from
 Validation points to Action or Reason depending on the routing function.
 
@@ -513,7 +513,7 @@ b.add_conditional_edges(
 
 Chapter~28 will add a full integration test suite for the graph. For now you
 focus on unit tests that treat Validation as a pure function of state. Each test
-constructs a minimal \code{AgentState}, populates \code{_raw_model_output}, and
+constructs a minimal \code{AgentState}, populates \code{\_raw\_model\_output}, and
 asserts on the node's return value.
 
 \begin{lstlisting}[language=Python,
