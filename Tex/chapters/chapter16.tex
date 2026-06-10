@@ -107,8 +107,8 @@ below as an annotated ASCII diagram.
 
 \begin{figure}[h]
 \centering
+\resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
-  %% Base node styles
   layer/.style={
     rectangle,
     draw=BookBlue,
@@ -129,7 +129,6 @@ below as an annotated ASCII diagram.
     align=center,
     font=\sffamily\small
   },
-  %% Arrow style
   flow/.style={
     ->,
     >=Stealth,
@@ -149,8 +148,6 @@ below as an annotated ASCII diagram.
   }
 ]
 
-%% ── Layer nodes (top to bottom) ──────────────────────────────
-
 \node[layer] (host) {
   \textbf{\color{BookBlue}HOST}\\[3pt]
   \texttt{LangGraph StateGraph}\\[2pt]
@@ -167,8 +164,6 @@ below as an annotated ASCII diagram.
   {\footnotesize Runs \texttt{initialize()} + \texttt{tools/list}.}
 };
 
-%% ── Servers (side by side below client) ──────────────────────
-
 \node[server, below left=14mm and 18mm of client] (serverA) {
   \textbf{FastMCP Server A}\\[2pt]
   {\footnotesize \texttt{POST /mcp :8000}}\\
@@ -183,21 +178,14 @@ below as an annotated ASCII diagram.
   {\footnotesize \textit{local dev / CI only}}
 };
 
-%% ── Arrows ────────────────────────────────────────────────────
-
-%% Host ↔ Client: bidirectional, labelled
 \draw[flow] (host.south) -- node[label, right=2pt]
   {\texttt{list[BaseTool]}} (client.north);
 
-%% Client → Server A: solid (production path)
 \draw[flow] (client.south) -- node[label, left=2pt]
   {\texttt{streamable\_http}} (serverA.north);
 
-%% Client → Server B: dashed (dev-only path)
 \draw[sideflow] (client.south) -- node[label, right=2pt]
   {\texttt{stdio}} (serverB.north);
-
-%% ── Role boundary annotations ─────────────────────────────────
 
 \node[label, right=4pt of host.east, anchor=west,
       text width=28mm] {
@@ -209,7 +197,8 @@ below as an annotated ASCII diagram.
   \textit{Role boundary:}\\no business logic\\below this line
 };
 
-\end{tikzpicture}
+\end{tikzpicture}%
+}% end resizebox
 \caption{MCP role boundaries and data flow.
   Solid arrows carry production traffic; the dashed arrow indicates
   the stdio transport, which is restricted to local development and CI\@.
