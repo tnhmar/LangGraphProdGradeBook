@@ -1,8 +1,1009 @@
 %% ============================================================
-%%  Chapter 16 --- MCP: Hosts, Clients & Servers
+%%  Chapter 16 — MCP: Hosts, Clients & Servers
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Final revised version — June 2026
 %% ============================================================
 
-\chapterquote{A tool that cannot be discovered is a tool that does not exist.}{anon}
+\chapter{MCP: Hosts, Clients, and Servers}
+\label{chap:mcp}
 
-% TODO: Chapter 16 content
+The failure mode that motivates this chapter is invisible until it is
+expensive: an agent that embeds HTTP logic, credential management, and
+schema definitions directly inside its own graph.
+When a second agent needs the same capability, the implementation is
+copied. When the schema changes, every copy breaks independently.
+When the service moves behind authentication, every caller is patched
+in isolation. The result is not a platform --- it is a distributed ball
+of mud whose failure surface grows with every new agent added to the
+system.
+
+The Model Context Protocol (MCP) resolves this through a three-layer
+capability-delivery architecture. A \emph{server} owns a capability
+domain and publishes it as a versioned, schema-carrying interface.
+A \emph{client} speaks the MCP wire protocol, opens sessions against
+servers, and translates those capabilities into objects the agent runtime
+can consume. A \emph{host} owns the reasoning loop and never touches the
+wire protocol; it receives typed tool objects and nothing else.
+Each layer changes independently: servers scale horizontally, clients
+swap transports, and the host graph evolves without knowledge of either.
+
+The sections in this chapter follow the dependency order imposed by those
+layers. Section~\ref{sec:mcp-roles} draws the role boundaries before any
+code exists, because conflating host and client is the single most common
+mistake in MCP integrations. Section~\ref{sec:mcp-decorators} builds the
+server-side capability surface. Section~\ref{sec:mcp-transport} explains
+why the transport that works on a developer's laptop fails under production
+load. Section~\ref{sec:mcp-toolkit} converts server capabilities into
+LangGraph tool nodes. Section~\ref{sec:mcp-multi} extends that wiring to
+N~servers. Section~\ref{sec:mcp-oauth} ensures credentials never appear
+in source. Section~\ref{sec:mcp-capstone} assembles all six layers into a
+single runnable system.
+
+\begin{table}[h]
+\centering
+\caption{MCP domain terms introduced in this chapter}
+\label{tab:mcp-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+Host &
+  The process that owns the LLM reasoning loop.
+  In this book, always a compiled LangGraph \code{StateGraph}.
+  Consumes tool objects; never touches MCP wire format. \\
+Client &
+  The in-process adapter that speaks MCP wire format, opens
+  \code{ClientSession} objects, and delivers a \code{list[BaseTool]}
+  to the host. \\
+Server &
+  An independently-deployed capability provider built with FastMCP.
+  Has no knowledge of the host graph topology. \\
+Tool &
+  A callable published by a server.
+  Its JSON Schema is generated from the function's Python signature;
+  its natural-language description comes from the function's docstring. \\
+Resource &
+  A data endpoint at a URI template; fetched by the client on demand
+  via \code{resources/read}, never pushed by the server. \\
+Prompt &
+  A server-side message template fetched via \code{prompts/get};
+  keeps prompt logic versioned alongside the capability it describes. \\
+Streamable HTTP &
+  The MCP transport that exposes a \code{POST /mcp} endpoint.
+  The only transport suitable for horizontally-scaled
+  production deployments. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{lstlisting}[language=bash,
+                   caption={Chapter~16 source layout},
+                   label={lst:ch16-layout}]
+ch16/
+├── servers/
+│   ├── inventory_server.py   # @mcp.tool() x2, uvicorn :8000
+│   ├── pricing_server.py     # @mcp.tool() x2, uvicorn :8001
+│   └── orders_server.py      # @mcp.tool() x2, uvicorn :8002
+├── auth/
+│   └── bearer_provider.py    # MCPAuthSettings + BearerTokenProvider
+└── agent/
+    └── capstone_agent.py     # MultiServerMCPClient + StateGraph
+\end{lstlisting}
+
+
+%% ------------------------------------------------------------------
+\section{The Three Roles Cannot Share a Process Boundary}
+\label{sec:mcp-roles}
+%% ------------------------------------------------------------------
+
+The design problem every MCP integration faces first is attribution:
+which piece of code is responsible for which concern.
+The naive approach is to give the agent class a method that opens an
+HTTP connection, parses a JSON response, and presents the result to
+the LLM. This works for one tool on one server and breaks the moment
+either side changes independently --- which in production they always do.
+The principle is strict role separation: each MCP actor has exactly
+one responsibility, and the interfaces between them are the only stable
+surface.
+
+Table~\ref{tab:mcp-terms} defined the three roles. Their runtime
+boundaries are best understood as a data-flow sequence, reproduced
+below as an annotated ASCII diagram.
+
+\begin{lstlisting}[language=bash,
+                   caption={MCP role boundaries and data flow},
+                   label={lst:mcp-boundary}]
+┌──────────────────────────────────────────────┐
+│  HOST: LangGraph StateGraph                  │
+│  Owns the LLM reasoning loop.                │
+│  Receives list[BaseTool] — nothing else.     │
+│  Never imports mcp.* wire-protocol modules.  │
+└───────────────────┬──────────────────────────┘
+                    │  list[BaseTool]
+┌───────────────────▼──────────────────────────┐
+│  CLIENT: MultiServerMCPClient                │
+│  Speaks MCP wire protocol.                   │
+│  Opens one ClientSession per server.         │
+│  Runs initialize() capability handshake.     │
+│  Fetches tools/list → populates BaseTool.    │
+└──────┬──────────────────────┬────────────────┘
+       │  streamable_http      │  stdio
+┌──────▼──────────┐   ┌───────▼──────────────┐
+│ FastMCP Server A│   │ FastMCP Server B      │
+│ POST /mcp :8000 │   │ subprocess (dev only) │
+└─────────────────┘   └──────────────────────┘
+\end{lstlisting}
+
+Two properties of this diagram must be understood before any code is
+written. First, the host never imports anything from the MCP wire-protocol
+layer. It receives a \code{list[BaseTool]} from the client, passes it to
+\code{ToolNode} and \code{model.bind\_tools()}, and proceeds. From the
+host's perspective, those tools could have come from any source. Replacing
+the transport --- from stdio to HTTP, or rotating authentication schemes
+--- requires no change to the graph. Second, the client holds all session
+state. The host never holds a reference to a \code{ClientSession} object.
+
+\begin{notebox}
+The MCP session lifecycle has three mandatory phases.
+\texttt{initialize()} performs the capability handshake and negotiates
+protocol version. \texttt{tools/list} retrieves the tool manifest.
+Subsequent \texttt{tools/call} messages dispatch individual invocations.
+\code{MultiServerMCPClient} executes all three phases transparently;
+the host sees only the output of the second: a \code{list[BaseTool]}
+with \code{name}, \code{description}, and \code{args\_schema} populated
+from the server manifest.
+\end{notebox}
+
+The three imports below express the role boundary in code.
+No logic appears; the point is that each import belongs to exactly one
+layer and the layers share no modules.
+
+\begin{lstlisting}[language=Python,
+                   caption={One import per MCP role},
+                   label={lst:mcp-role-imports}]
+# Server role — SDK variant (mcp >= 1.2)
+from mcp.server.fastmcp import FastMCP
+
+# Client role — langchain-mcp-adapters
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+# Host role — LangGraph
+from langgraph.graph import StateGraph
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:mcp-role-imports} deserve explanation.
+\code{FastMCP} is imported from \code{mcp.server.fastmcp}, which is the
+official MCP Python SDK (\code{pip install mcp}); FastMCP~1.0 was
+incorporated into this SDK in 2024.
+The standalone \code{fastmcp} package (\code{pip install fastmcp}) uses
+\code{@mcp.tool} without parentheses, while the SDK uses \code{@mcp.tool()}
+with parentheses; this chapter uses the SDK variant throughout because it
+is the package \code{langchain-mcp-adapters} itself depends on, confirmed
+in its own quickstart documentation.
+The \code{MultiServerMCPClient} is the only client-layer symbol the host
+ever references; it abstracts transport, session, and protocol negotiation
+behind a single \code{await client.get\_tools()} call.
+
+Understanding what each role does \emph{not} own is as important as
+understanding what it does. The server owns no knowledge of the agent
+topology. The client owns no business logic. The host owns no transport
+configuration. With those boundaries established, the next question is
+what the server must publish for the client to produce a useful tool list.
+
+%% ------------------------------------------------------------------
+\section{A Tool's Docstring Is Its Public Contract}
+\label{sec:mcp-decorators}
+%% ------------------------------------------------------------------
+
+The design problem in server construction is information asymmetry: the
+LLM must decide which tool to call based solely on the tool's description,
+but that description is generated from the same source the developer writes
+for human readers. The naive approach is terse docstrings that satisfy a
+linter but carry no semantic content --- \emph{``Search products.''} instead
+of a precise description of what the function returns, in what format,
+and when it should be called relative to other tools. This produces
+incorrect LLM tool selection under any input that could plausibly match
+more than one tool. The principle is that the docstring is a public API
+contract between the server author and every LLM that will ever consume
+this tool; it must be written to that standard.
+
+FastMCP's \code{@mcp.tool()} decorator serialises the decorated
+function's docstring verbatim into the MCP \code{tools/list} response.
+That response populates the \code{description} field of each
+\code{BaseTool} object. There is no secondary documentation mechanism:
+a missing docstring produces an empty \code{description}; a vague one
+produces incorrect routing.
+
+\begin{warningbox}
+FastMCP generates JSON Schema from Python type annotations through Pydantic.
+If a parameter has no \code{Annotated[T,~Field(description="...")]} wrapper,
+its schema entry carries no description and the LLM receives no guidance on
+what value to supply. Missing parameter descriptions are the most common
+cause of tool-call argument errors in production.
+Every parameter of every \code{@mcp.tool()} function must carry an
+\code{Annotated} field with a non-empty \code{description}.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+                   caption={FastMCP server with \texttt{@mcp.tool()},
+                            \texttt{@mcp.resource()}, and \texttt{@mcp.prompt()}},
+                   label={lst:mcp-decorators}]
+from mcp.server.fastmcp import FastMCP
+from pydantic import Field
+from typing import Annotated
+
+mcp = FastMCP(
+    "inventory",
+    instructions="Inventory management: search products, fetch specs.",
+)
+
+@mcp.tool()
+async def search_products(
+    query: Annotated[str, Field(
+        description="Full-text product search query")],
+    limit: Annotated[int, Field(
+        description="Max results to return, 1-50")] = 10,
+) -> list[dict]:
+    """Search the product catalogue and return matching SKUs with stock.
+
+    Returns a list of dicts with keys: sku (str), name (str),
+    stock (int), price_usd (float). Returns an empty list when
+    no products match. Call this first to confirm a SKU exists
+    before calling get_product_spec.
+    """
+    ...  # implementation omitted
+
+@mcp.resource("inventory://products/{sku}")
+async def get_product_spec(sku: str) -> str:
+    """Return the full product specification as Markdown text.
+    Raises ValueError if the SKU does not exist."""
+    ...
+
+@mcp.prompt()
+def low_stock_alert(threshold: int = 5) -> list[dict]:
+    """Instruct the agent to prioritise SKUs with low stock."""
+    return [{"role": "system",
+             "content": f"Flag any SKU with stock <= {threshold}."}]
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:mcp-decorators} deserve explanation.
+The \code{search\_products} docstring contains three distinct pieces of
+information: what the function returns, the exact schema of the return
+value, and the calling precondition relative to another tool in the same
+server. All three are necessary for correct multi-step LLM tool sequencing;
+none of them is available from the function signature alone.
+The \code{@mcp.resource()} decorator takes a URI template; the client
+fetches resources on demand via \code{resources/read}, making them
+pull-only --- the server never pushes resource content to the client.
+The \code{@mcp.prompt()} decorator returns a \code{list[dict]} matching
+the MCP \code{PromptMessage} schema (\code{role}/\code{content} keys);
+it is fetched via \code{prompts/get}, which means prompt logic is
+versioned and deployed alongside the capability it describes rather
+than scattered across host graphs.
+
+\begin{notebox}
+The \code{FastMCP} constructor's \code{instructions} parameter becomes
+the server-level system prompt sent to the client during the
+\code{initialize()} capability handshake.
+It scopes all tools on this server in the LLM's context window.
+Keep it to one sentence naming the domain; longer instructions compete
+with tool descriptions for the model's attention.
+\end{notebox}
+
+A completed server definition is necessary but not sufficient for
+production deployment. The transport the server uses to receive requests
+determines whether it can survive a real traffic pattern.
+
+%% ------------------------------------------------------------------
+\section{The Transport That Works Locally Will Fail in Production}
+\label{sec:mcp-transport}
+%% ------------------------------------------------------------------
+
+The design problem is that the most convenient server transport couples
+the server's lifecycle to the host's process. When the client starts an
+MCP server as a subprocess using the stdio transport, the server cannot
+exist without the host, cannot be restarted independently, cannot be
+load-balanced, and cannot expose a health-check endpoint.
+The naive approach is to keep this transport in production because it
+requires no network configuration. This is a deployment anti-pattern:
+any failure of the host process --- a crash, a rolling update, a
+scaling event --- kills all in-flight tool calls on every server it
+was running. The principle is process isolation: a production server
+must be an independently-addressable service whose lifecycle the host
+does not control.
+
+The stdio transport initialises with \code{mcp.run(transport="stdio")}.
+The client starts the server as a child process and communicates over
+pipes via \code{StdioServerParameters}. This is zero-configuration
+and correct for local development and CI, but the server cannot
+outlive the client process, cannot accept connections from more than
+one client simultaneously, and cannot sit behind a reverse proxy.
+
+\emph{Streamable HTTP} is the transport the MCP specification recommends
+for production. The server exposes a single \code{POST /mcp} endpoint
+(\code{mcp.run(transport="streamable-http")}).
+Each session is a stateless HTTP exchange, enabling horizontal
+replication and independent restarts without disrupting other sessions.
+
+\begin{notebox}
+The transport name string differs between the server and the client.
+The server's \code{mcp.run()} call uses the hyphenated form
+\code{"streamable-http"} as specified by the MCP protocol.
+The \code{MultiServerMCPClient} config dict uses the underscored form
+\code{"streamable\_http"} as required by the \code{langchain-mcp-adapters}
+library. Passing the hyphenated form to \code{MultiServerMCPClient}
+silently falls back to the default transport rather than raising an error.
+Keep the two forms straight: hyphens on the server, underscores on the
+client.
+\end{notebox}
+
+For production, wrapping the FastMCP server in a FastAPI application
+adds three capabilities the bare \code{mcp.run()} launcher cannot
+provide: a \code{/health} endpoint for load-balancer probes, a standard
+middleware stack for logging and error handling, and proper lifespan
+management for resource acquisition and release.
+The FastMCP server exposes its ASGI app through
+\code{mcp.get\_asgi\_app()}, which can be mounted into any
+ASGI-compatible framework.
+
+\begin{lstlisting}[language=Python,
+                   caption={FastMCP server mounted into FastAPI, served by uvicorn},
+                   label={lst:mcp-production-server}]
+# ch16/servers/inventory_server.py  (transport + launch section)
+import uvicorn
+from fastapi import FastAPI
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("inventory")
+# @mcp.tool() definitions from Listing 16.2 go here
+
+# mcp.get_asgi_app() returns the raw ASGI callable.
+# Mounting it into FastAPI adds /health and middleware.
+api = FastAPI(title="Inventory MCP Server")
+api.mount("/mcp", mcp.get_asgi_app())
+
+@api.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "server": mcp.name}
+
+if __name__ == "__main__":
+    # String "module:app" is required for workers > 1.
+    # Passing the object directly disables multi-process mode.
+    uvicorn.run(
+        "inventory_server:api",
+        host="0.0.0.0",
+        port=8000,
+        workers=4,
+        log_level="info",
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:mcp-production-server} deserve
+explanation. \code{mcp.get\_asgi\_app()} extracts the ASGI callable
+from the FastMCP server; mounting it at \code{"/mcp"} on the FastAPI
+application preserves the \code{POST /mcp} path the client expects.
+The \code{uvicorn.run()} call uses a string reference
+(\code{"inventory\_server:api"}) rather than the object directly;
+this is required for the \code{workers=4} argument to take effect
+because uvicorn's multi-worker mode forks new processes and needs a
+string-importable entry point --- passing the object restricts the
+server to a single worker regardless of the \code{workers} parameter,
+silently ignoring the scaling intent. The \code{/health} route exists
+specifically to satisfy Kubernetes readiness probes and load-balancer
+health checks, neither of which can reach an MCP endpoint without first
+receiving a 200 response on a non-MCP path.
+
+\begin{warningbox}
+Do not use \code{mcp.run()} in production server files.
+It is a development convenience wrapper with no worker model, no
+graceful shutdown hooks, and no integration with process supervisors
+(systemd, Docker, Kubernetes). The only visual difference between
+a working and a broken production server file is often this single
+method call.
+\end{warningbox}
+
+The client-side transport configuration for a server deployed with this
+pattern uses \code{"streamable\_http"} (underscore) and points to the
+mounted path.
+
+\begin{lstlisting}[language=Python,
+                   caption={Client transport configuration for a production server},
+                   label={lst:mcp-transport-config}]
+# This dict is the only change needed when moving
+# a server from stdio to streamable_http.
+# Note: transport key uses underscore (client convention),
+# not hyphen (server/MCP-spec convention).
+server_config: dict = {
+    "transport": "streamable_http",   # underscore, not hyphen
+    "url": "http://localhost:8000/mcp",
+    "headers": {
+        "Authorization": "Bearer <token>",  # replaced in Section 16.6
+    },
+}
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:mcp-transport-config} deserve
+explanation. The comment on the \code{transport} line is not decorative;
+the hyphen/underscore asymmetry between the server and client APIs
+is a live source of silent misconfiguration in the ecosystem, and
+making it visible at the definition site is cheaper than debugging a
+silent transport fallback. The \code{headers} field is valid only for
+\code{streamable\_http} and \code{sse} transports; passing it with a
+\code{stdio} config silently has no effect rather than raising an error,
+so the placeholder comment anchors where the real token injection of
+Section~\ref{sec:mcp-oauth} will appear.
+
+With the server deployed and the transport configured, the remaining
+question is how the client converts the server's capability manifest
+into objects the host can consume.
+
+%% ------------------------------------------------------------------
+\section{The Client Is the Only Layer That Speaks Protocol}
+\label{sec:mcp-toolkit}
+%% ------------------------------------------------------------------
+
+The design problem at the host-client boundary is a type mismatch:
+a LangGraph \code{StateGraph} operates on \code{BaseTool} objects and
+knows nothing about MCP sessions, capability manifests, or wire-protocol
+messages. The naive approach is to have agent code call
+\code{ClientSession} methods directly, embedding protocol concerns
+inside the host graph. This dissolves the role boundary established in
+Section~\ref{sec:mcp-roles}: the host becomes responsible for session
+lifecycle, and the client layer becomes an unnecessary abstraction.
+The principle is that \code{MultiServerMCPClient.get\_tools()} is the
+single crossing point between the protocol layer and the host layer;
+everything the host needs crosses that boundary, and nothing else does.
+
+\code{MultiServerMCPClient} accepts a config dict mapping logical server
+names to transport configurations. Calling
+\code{await client.get\_tools()} opens a \code{ClientSession} per
+configured server, performs the \code{initialize()} handshake, fetches
+each server's \code{tools/list} response, and returns a flat
+\code{list[BaseTool]} whose \code{name}, \code{description}, and
+\code{args\_schema} fields are populated from the server manifests.
+
+\begin{warningbox}
+\code{client.get\_tools()} is a coroutine and must be awaited.
+Writing \code{tools = client.get\_tools()} without \code{await}
+assigns a coroutine object, not a list.
+\code{ToolNode(coroutine)} accepts this without raising at construction
+time, but the node will fail on its first invocation with a type error
+that points to dispatch logic rather than to this line.
+Always verify the return type with \code{assert isinstance(tools, list)}
+during development.
+\end{warningbox}
+
+The tool list returned by \code{get\_tools()} is passed to two places
+in the host graph: \code{ToolNode(tools)} creates the dispatch node,
+and \code{model.bind\_tools(tools)} attaches the tool schemas to the
+model so it knows which tools are available. Both must receive the
+same list; an inconsistency between them produces a model that requests
+tools the dispatch node cannot route.
+
+\begin{lstlisting}[language=Python,
+                   caption={Wiring \code{MultiServerMCPClient} to a LangGraph \code{StateGraph}},
+                   label={lst:mcp-toolkit-wiring}]
+import asyncio
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.graph import StateGraph, MessagesState, START
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain.chat_models import init_chat_model
+
+async def build_graph() -> StateGraph:
+    client = MultiServerMCPClient({
+        "inventory": {
+            "transport": "streamable_http",
+            "url": "http://localhost:8000/mcp",
+        }
+    })
+    tools = await client.get_tools()   # coroutine — must await
+
+    model = init_chat_model("openai:gpt-4.1")
+
+    def call_model(state: MessagesState) -> dict:
+        # bind_tools inside the node, not at graph construction time
+        return {"messages": [
+            model.bind_tools(tools).invoke(state["messages"])
+        ]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("call_model", call_model)
+    builder.add_node("tools", ToolNode(tools))  # "tools" — exact key
+    builder.add_edge(START, "call_model")
+    builder.add_conditional_edges("call_model", tools_condition)
+    builder.add_edge("tools", "call_model")
+    return builder.compile()
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:mcp-toolkit-wiring} deserve
+explanation. \code{model.bind\_tools(tools)} is called inside
+\code{call\_model} rather than at graph construction time; this ensures
+that if the tool list is refreshed between invocations (for example,
+after a server upgrade publishes new capabilities), the model always
+receives the current schema without requiring a graph rebuild.
+The \code{add\_node} key for the dispatch node is the string
+\code{"tools"}, not a variable; \code{tools\_condition} from
+\code{langgraph.prebuilt} is hardcoded to route to this exact string,
+and a different key raises a \code{KeyError} at runtime that points
+to the conditional-edge evaluation rather than to the
+\code{add\_node} call, making it difficult to trace.
+The \code{build\_graph()} function is \code{async} because
+\code{get\_tools()} is a coroutine; the entire graph construction
+is deferred to the \code{asyncio.run()} call at the entry point,
+which is the correct pattern for async LangGraph programs.
+
+\begin{notebox}
+\code{langchain-mcp-adapters} also exposes a lower-level path:
+\code{from langchain\_mcp\_adapters.tools import load\_mcp\_tools}.
+This function accepts an already-open \code{ClientSession} and returns
+tools from that session.
+Use it with the \code{async with client.session("server-name") as session}
+context manager when you need explicit session lifetime control --- for
+example, to pin a long-lived session and avoid the per-call session
+overhead on latency-sensitive paths.
+For the common case, \code{get\_tools()} is the correct entry point.
+\end{notebox}
+
+A single-server graph is straightforward. The next problem is that
+production systems have multiple capability domains, and the host graph
+must not require modification when a new one is added.
+
+%% ------------------------------------------------------------------
+\section{The Host Graph Must Not Know How Many Servers Exist}
+\label{sec:mcp-multi}
+%% ------------------------------------------------------------------
+
+The design problem in multi-server integration is coupling between
+operational topology and graph logic. If the host graph must be modified
+every time a new server is added, the graph becomes a registration point
+for infrastructure decisions. The naive approach is to call
+\code{get\_tools()} once per server and concatenate the lists in the
+agent file. This requires the host to enumerate servers, which is the
+same coupling expressed differently. The principle is that
+\code{MultiServerMCPClient} is the federation layer: N~server configs
+enter, one flat \code{list[BaseTool]} exits, and the host graph built
+in Section~\ref{sec:mcp-toolkit} is identical whether N is one or twenty.
+
+Extending from one server to N requires only extending the config dict.
+The client opens sessions in parallel, fetches tool manifests from all
+configured servers, and returns a single concatenated list. The
+\code{StateGraph} does not change.
+
+\begin{lstlisting}[language=Python,
+                   caption={Three heterogeneous servers in one \code{MultiServerMCPClient}},
+                   label={lst:mcp-multi-client}]
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+client = MultiServerMCPClient({
+    "inventory": {
+        "transport": "streamable_http",
+        "url": "http://inventory-svc:8000/mcp",
+        "headers": {"Authorization": "Bearer <inv_token>"},
+    },
+    "pricing": {
+        "transport": "streamable_http",
+        "url": "http://pricing-svc:8001/mcp",
+        "headers": {"Authorization": "Bearer <price_token>"},
+    },
+    "legacy_sku": {
+        "transport": "stdio",
+        "command": "python",
+        "args": ["/opt/legacy/sku_server.py"],
+        # headers not supported on stdio transport — omit entirely
+    },
+})
+
+# Single await returns a flat list from all three servers.
+# The StateGraph from Listing 16.4 is unchanged.
+tools = await client.get_tools()
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:mcp-multi-client} deserve explanation.
+The stdio and \code{streamable\_http} transports coexist in the same
+config dict; \code{MultiServerMCPClient} handles transport negotiation
+per-server, so a legacy subprocess-based tool can be federated alongside
+HTTP microservices without requiring the legacy tool to be ported.
+The \code{headers} key is absent from the \code{legacy\_sku} config
+and the comment explains why; adding a \code{headers} key to a stdio
+config silently has no effect rather than raising an error, and the
+explicit omission with a comment prevents a future maintainer from
+adding it and spending time debugging why their tokens are not being
+sent.
+
+\begin{warningbox}
+If two servers publish a tool with the same \code{name}, the second
+registration silently shadows the first in the flat tool list.
+\code{MultiServerMCPClient} raises no error on name collision.
+In a multi-team environment, two servers will eventually register a
+tool named \code{search} or \code{list}.
+Enforce a naming convention at the server level (e.g., prefix every
+\code{@mcp.tool()} function name with the server's domain:
+\code{inventory\_search\_products}, \code{pricing\_get\_price})
+and document this convention in the server's
+\code{FastMCP(..., instructions=...)} string.
+\end{warningbox}
+
+\begin{tipbox}
+For graceful degradation when a server may be temporarily unreachable
+at startup, use the lower-level \code{load\_mcp\_tools} path per server
+inside individual try/except blocks, accumulate the available tools, and
+log which servers failed rather than raising. The host graph receives
+a reduced tool list but continues to function.
+Use \code{async with client.session("server-name") as session} to
+acquire the session for each server, then call
+\code{await load\_mcp\_tools(session)} inside the try block.
+\end{tipbox}
+
+The multi-server config above contains placeholder token strings.
+Hardcoded credentials are a security vulnerability; they also cannot
+rotate without a code deployment. The next section replaces them with
+a credential management layer.
+
+%% ------------------------------------------------------------------
+\section{Credentials Must Not Live in Code}
+\label{sec:mcp-oauth}
+%% ------------------------------------------------------------------
+
+The design problem is that every token string in a config dict has a
+lifecycle the dict cannot express: tokens expire, are revoked, and
+must be scoped to the minimum permissions required.
+The naive approach is to read a token from an environment variable
+at startup and embed it in the config dict. This fails because the
+token is evaluated once and frozen for the lifetime of the process;
+a token valid for one hour causes all tool calls to fail silently after
+that hour with a 401 from the MCP server, with no indication in the
+host graph of what went wrong.
+The principle is that credential acquisition must be lazy and renewable:
+a token is fetched at the moment it is needed and refreshed before it
+expires, without restarting the process.
+
+A \emph{bearer token provider} is a callable object that encapsulates
+the OAuth2 client-credentials grant and caches the result until
+expiry. Using a callable object rather than a plain function allows
+the token cache to live as instance state, and allows the provider to
+be injected into any component that needs an \code{Authorization} header.
+The credentials themselves are read from the environment via
+\code{pydantic\_settings.BaseSettings}, which ensures they are never
+present in source and are masked in logs through \code{SecretStr}.
+
+\begin{lstlisting}[language=Python,
+                   caption={\code{MCPAuthSettings} and \code{BearerTokenProvider}},
+                   label={lst:mcp-auth-provider}]
+import time
+import httpx
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class MCPAuthSettings(BaseSettings):
+    # Reads MCP_CLIENT_ID, MCP_CLIENT_SECRET, MCP_TOKEN_URL,
+    # MCP_SCOPE from environment or .env file.
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        secrets_dir="/run/secrets",
+        env_prefix="MCP_",
+    )
+    client_id: str
+    client_secret: SecretStr
+    token_url: str
+    scope: str = "mcp:tools"
+
+class BearerTokenProvider:
+    def __init__(self, settings: MCPAuthSettings) -> None:
+        self._s = settings
+        self._token: str | None = None
+        self._expires_at: float = 0.0
+
+    def __call__(self) -> str:
+        """Return a valid Bearer token, refreshing before expiry."""
+        if self._token and time.monotonic() < self._expires_at - 30:
+            return self._token
+        self._refresh()
+        return self._token  # type: ignore[return-value]
+
+    def _refresh(self) -> None:
+        resp = httpx.post(self._s.token_url, data={
+            "grant_type": "client_credentials",
+            "client_id": self._s.client_id,
+            "client_secret": self._s.client_secret.get_secret_value(),
+            "scope": self._s.scope,
+        }, timeout=10)
+        resp.raise_for_status()
+        body = resp.json()
+        self._token = body["access_token"]
+        self._expires_at = time.monotonic() + body["expires_in"]
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:mcp-auth-provider} deserve
+explanation. \code{time.monotonic()} is used for expiry comparison
+rather than \code{time.time()}; monotonic time is immune to system
+clock adjustments and NTP corrections, both of which can cause a
+wall-clock-based expiry check to skip a refresh or trigger one
+prematurely on cloud instances that frequently synchronise clocks.
+The 30-second safety margin (\code{self.\_expires\_at - 30}) accounts
+for network round-trip time between the token refresh and the first
+MCP request that uses the new token; a token refreshed at exactly
+\\(T\\) may expire before reaching a server if \code{\_refresh()} takes
+29~seconds under load. \code{SecretStr} prevents the credential from
+appearing in \code{print()}, \code{logging}, or Pydantic's
+\code{model\_dump()}; the raw value is accessible only via
+\code{.get\_secret\_value()}, called exclusively at the point of the
+HTTP request.
+
+The server-side counterpart validates incoming tokens before any tool
+call is dispatched. A FastAPI dependency provides this as a reusable
+guard attached to the application that wraps the FastMCP ASGI mount.
+
+\begin{lstlisting}[language=Python,
+                   caption={Server-side Bearer token validation dependency},
+                   label={lst:mcp-verify-bearer}]
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from mcp.server.fastmcp import FastMCP
+
+bearer_scheme = HTTPBearer()
+
+async def verify_bearer(
+    creds: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> str:
+    """Validate the Bearer token; raise 401 if invalid."""
+    token = creds.credentials
+    if not await _introspect_token(token):   # your auth-server call
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return token
+
+mcp = FastMCP("inventory")
+api = FastAPI(dependencies=[Security(verify_bearer)])
+api.mount("/mcp", mcp.get_asgi_app())
+
+@api.get("/health")
+async def health() -> dict:
+    return {"status": "ok"}
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:mcp-verify-bearer} deserve
+explanation. Token validation delegates to \code{\_introspect\_token},
+which represents a call to the authorisation server's token introspection
+endpoint or local JWKS validation; inline JWT verification without key
+rotation support is omitted intentionally because key rotation is a
+deployment-specific concern that falls outside the MCP integration layer.
+Applying \code{Security(verify\_bearer)} as a global FastAPI dependency
+(\code{FastAPI(dependencies=[...])}) means every request to every
+route --- including \code{POST /mcp} and all future routes --- must
+pass token validation; the \code{/health} endpoint is deliberately
+excluded by mounting it outside the secured router if unauthenticated
+probes are required.
+
+\begin{warningbox}
+The \code{BearerTokenProvider.\_\_call\_\_()} in
+Listing~\ref{lst:mcp-auth-provider} is evaluated \emph{once per client
+construction} when the return value is embedded in the headers dict:
+\code{\{"Authorization": f"Bearer \{provider()\}"\}}.
+For long-running agents where the session outlives the token's validity,
+call \code{build\_graph()} on a schedule to reconstruct the client with
+a fresh evaluation rather than relying solely on the provider's cache.
+The safe production pattern is to construct the graph at the start of
+each agent invocation rather than caching the compiled graph across
+invocation boundaries when token lifetimes are shorter than agent
+session lifetimes.
+\end{warningbox}
+
+\begin{tipbox}
+For least-privilege scoping, instantiate one \code{BearerTokenProvider}
+per server with the minimum scope for that server's operations:
+\code{scope="inventory:read inventory:write"} for the inventory server,
+\code{scope="pricing:read"} for a read-only pricing server.
+Each provider maintains its own token cache independently, so a
+pricing-server token expiry does not affect the inventory-server cache.
+\end{tipbox}
+
+With role separation established, servers built, transport configured,
+the client wired to the host, N-server federation understood, and
+credentials managed, all six layers are ready to be assembled into
+a single runnable system.
+
+%% ------------------------------------------------------------------
+\section{The Complete System: Three Servers, One Agent}
+\label{sec:mcp-capstone}
+%% ------------------------------------------------------------------
+
+The design problem this section solves is integration under constraints:
+the preceding sections established each layer in isolation, but a
+production agent requires them to operate coherently, with failures in
+any layer producing diagnosable errors rather than silent misbehaviour.
+The naive integration approach is a single script that imports from
+every layer and wires them sequentially without preserving the role
+boundaries. This produces a system that works on the first run and
+becomes unmaintainable the moment any layer is updated. The principle
+is that integration code should be as thin as the layer boundaries
+permit: each layer has already solved its problem, and the capstone
+only composes those solutions.
+
+The system consists of three FastMCP servers, each owning one business
+domain. The inventory server exposes product search and specification
+retrieval. The pricing server exposes price lookup and discount
+calculation. The orders server exposes draft order creation and order
+status queries. All three are deployed as independent services under
+uvicorn using the FastAPI-wrapper pattern from
+Section~\ref{sec:mcp-transport}. The agent is a LangGraph
+\code{StateGraph} that federates all three through a single
+\code{MultiServerMCPClient} with per-server OAuth2 scoping from
+Section~\ref{sec:mcp-oauth}.
+
+All three server files share the same structure. The inventory server
+is shown in full; pricing and orders follow the identical pattern with
+different tool names and ports.
+
+\begin{lstlisting}[language=Python,
+                   caption={Inventory server (ch16/servers/inventory\_server.py)},
+                   label={lst:capstone-inventory}]
+import uvicorn
+from fastapi import FastAPI
+from mcp.server.fastmcp import FastMCP
+from pydantic import Field
+from typing import Annotated
+
+mcp = FastMCP("inventory",
+              instructions="Search products and retrieve specifications.")
+
+@mcp.tool()
+async def inventory_search_products(
+    query: Annotated[str, Field(description="Full-text product search")],
+    limit: Annotated[int, Field(description="Max results, 1-50")] = 10,
+) -> list[dict]:
+    """Search the product catalogue. Returns list of dicts with keys:
+    sku (str), name (str), stock (int), price_usd (float).
+    Returns empty list if no match. Call before
+    inventory_get_product_spec to confirm the SKU exists."""
+    ...   # implementation
+
+@mcp.tool()
+async def inventory_get_product_spec(
+    sku: Annotated[str, Field(description="Product SKU identifier")],
+) -> str:
+    """Return full product specification as Markdown.
+    Raises ValueError if the SKU does not exist."""
+    ...   # implementation
+
+api = FastAPI(title="Inventory MCP Server")
+api.mount("/mcp", mcp.get_asgi_app())
+
+@api.get("/health")
+async def health() -> dict:
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    uvicorn.run("inventory_server:api",
+                host="0.0.0.0", port=8000, workers=4)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:capstone-inventory} deserve
+explanation. Every tool function name is prefixed with its domain
+(\code{inventory\_}) rather than being a short generic name such
+as \code{search}; this is the server-level naming convention
+recommended in Section~\ref{sec:mcp-multi} to prevent silent tool
+shadowing when multiple servers are federated. Each docstring names
+the return schema, the empty-result contract, and the calling
+precondition relative to the other tool on this server; omitting the
+precondition causes the LLM to call \code{inventory\_get\_product\_spec}
+without first verifying the SKU exists, producing a \code{ValueError}
+during tool dispatch that the host graph cannot recover from without a
+dedicated error-handling node.
+
+The capstone agent wires all layers. Its length across two listings
+is justified because it is the integration layer; no individual concern
+within it is new.
+
+\begin{lstlisting}[language=Python,
+                   caption={Capstone agent: graph construction
+                            (ch16/agent/capstone\_agent.py, part~1)},
+                   label={lst:capstone-build}]
+import asyncio
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.graph import StateGraph, MessagesState, START
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage
+from ch16.auth.bearer_provider import BearerTokenProvider, MCPAuthSettings
+
+async def build_graph() -> StateGraph:
+    inv   = BearerTokenProvider(MCPAuthSettings(scope="inventory:read inventory:write"))
+    price = BearerTokenProvider(MCPAuthSettings(scope="pricing:read"))
+    orders = BearerTokenProvider(MCPAuthSettings(scope="orders:write orders:read"))
+
+    client = MultiServerMCPClient({
+        "inventory": {"transport": "streamable_http",
+                      "url": "http://localhost:8000/mcp",
+                      "headers": {"Authorization": f"Bearer {inv()}"}},
+        "pricing":   {"transport": "streamable_http",
+                      "url": "http://localhost:8001/mcp",
+                      "headers": {"Authorization": f"Bearer {price()}"}},
+        "orders":    {"transport": "streamable_http",
+                      "url": "http://localhost:8002/mcp",
+                      "headers": {"Authorization": f"Bearer {orders()}"}},
+    })
+    tools = await client.get_tools()
+    model = init_chat_model("openai:gpt-4.1")
+
+    def call_model(state: MessagesState) -> dict:
+        return {"messages": [
+            model.bind_tools(tools).invoke(state["messages"])
+        ]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("call_model", call_model)
+    builder.add_node("tools", ToolNode(tools))
+    builder.add_edge(START, "call_model")
+    builder.add_conditional_edges("call_model", tools_condition)
+    builder.add_edge("tools", "call_model")
+    return builder.compile()
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:capstone-build} deserve explanation.
+One \code{BearerTokenProvider} is instantiated per server with the
+minimum scope for that server's operations; scope separation ensures
+that a compromised pricing token cannot authorise order creation.
+Each provider call (\code{inv()}, \code{price()}, \code{orders()})
+is evaluated at \code{build\_graph()} time and embedded in the headers
+dict; as the warning in Section~\ref{sec:mcp-oauth} noted, calling
+\code{build\_graph()} at the start of each agent invocation ensures
+a fresh token evaluation when token lifetimes are shorter than session
+lifetimes. The graph topology is identical to Listing~\ref{lst:mcp-toolkit-wiring}
+with three servers instead of one; the host graph did not change when
+the server count tripled, validating the design principle from
+Section~\ref{sec:mcp-multi}.
+
+\begin{lstlisting}[language=Python,
+                   caption={Capstone agent: entry point and invocation
+                            (ch16/agent/capstone\_agent.py, part~2)},
+                   label={lst:capstone-run}]
+async def main() -> None:
+    graph = await build_graph()
+
+    result = await graph.ainvoke({
+        "messages": [HumanMessage(content=(
+            "Find SKU-42, get its current price, "
+            "then create a draft order for 5 units."
+        ))]
+    })
+
+    for msg in result["messages"]:
+        # msg.type: "human" | "ai" | "tool"
+        print(f"[{msg.type:6s}] {str(msg.content)[:120]}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:capstone-run} deserve explanation.
+The invocation prompt is deliberately multi-step and cross-server:
+\emph{find SKU-42} dispatches \code{inventory\_search\_products};
+\emph{get its current price} dispatches \code{pricing\_get\_price}
+using the SKU returned by the first tool call; \emph{create a draft
+order} dispatches \code{orders\_create\_draft\_order} using the SKU
+and confirmed price from the preceding calls. This sequence exercises
+the \code{tools\,$\to$\,call\_model} cycle three times and validates
+that context accumulated across tool calls is preserved in
+\code{MessagesState}. The \code{msg.type} field in the output loop
+exposes the full call sequence --- human input, AI reasoning steps,
+tool responses, and final AI answer --- which is the minimal observable
+needed to confirm multi-server cross-domain dispatch is working;
+in production this loop is replaced by LangFuse trace instrumentation,
+which Chapter~\ref{chap:observability} adds to the \code{call\_model}
+node without modifying any other part of the graph.
+
+\begin{notebox}
+The explicit \code{StateGraph} construction in
+Listing~\ref{lst:capstone-build} is intentional.
+\code{create\_react\_agent} from \code{langgraph.prebuilt} produces
+an equivalent graph in fewer lines, but with a fixed topology that
+cannot be extended with the tracing nodes, checkpointing, and guardrail
+nodes added in later chapters. Always build the graph explicitly when
+you know it will be modified downstream.
+\end{notebox}
+
+Chapter~\ref{chap:a2a} addresses the next unsolved problem this
+system exposes: the capstone agent can consume capabilities from MCP
+servers, but it cannot itself be discovered and invoked as a capability
+by another agent. The Agent-to-Agent (A2A) protocol resolves this by
+promoting the host graph to an addressable peer; doing so requires
+no changes to the MCP layer built here.
