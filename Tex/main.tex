@@ -78,7 +78,7 @@
 \makecover
 \makecopyright
 \makededication{%
-  The loop that does not observe itself\\  
+  The loop that does not observe itself\\
   cannot know when to stop.}
 
 \begin{preface}
@@ -91,95 +91,221 @@
 \mainmatter
 %% ============================================================
 
-%%  PART 1: The Core Agent Loop
-\part{The Core Agent Loop}
-\label{part:core-loop}
+%% -----------------------------------------------------------
+%%  PART I — The Agentic Runtime Core
+%% -----------------------------------------------------------
+\part{The Agentic Runtime Core}
+\label{part:core}
 
 \chapter{The Core Loop}
 \label{ch:core-loop}
 \input{Tex/chapters/chapter01}
 
-\chapter{Loop Safety and Termination}
+\chapter{Termination, Resource Limits \& Loop Failure Guards}
 \label{ch:loop-safety}
 \input{Tex/chapters/chapter02}
 
-\chapter{Checkpointing and State Persistence}
+\chapter{State Schema, Checkpointing \& Recovery}
 \label{ch:checkpointing}
 \input{Tex/chapters/chapter03}
 
-\partclose{End of Part~1 --- The loop is built and safe.\\Part~2 gives it structure, infrastructure, and context.}
-
-%%  PART 2: Validation, LLM Infrastructure and Prompt Assembly
-\part{Validation, LLM Infrastructure and Prompt Assembly}
-\label{part:infrastructure}
-
-\chapter{Structured Output and Instructor}
+\chapter{Structured Output, Validation \& Self-Healing}
 \label{ch:structured-output}
 \input{Tex/chapters/chapter04}
 
-\chapter{LiteLLM: Provider Abstraction and Fallback Routing}
+\chapter{LLM Abstraction, Reliability \& Cost Enforcement}
 \label{ch:litellm}
 \input{Tex/chapters/chapter05}
 
-\chapter{Prompt Architecture and Context Assembly}
+\chapter{Prompt Architecture \& Context Assembly}
 \label{ch:prompt-architecture}
 \input{Tex/chapters/chapter06}
 
-\partclose{End of Part~2 --- The agent reasons reliably.\\Part~3 gives it memory.}
+\partclose{End of Part~I --- The runtime core is built, safe, and reliable.\\Part~II gives it memory.}
 
-%%  PART 3: Memory Architecture
+%% -----------------------------------------------------------
+%%  PART II — Memory Architecture
+%% -----------------------------------------------------------
 \part{Memory Architecture}
 \label{part:memory}
 
-\chapter{Short-Term Memory and Context Management}
+\chapter{Short-Term Memory \& Working Context}
 \label{ch:short-term-memory}
 \input{Tex/chapters/chapter07}
 
-\chapter{Persistence Requires Governance: Long-Term Memory with mem0}
+\chapter{Long-Term Memory with mem0}
 \label{ch:long-term-memory}
 \input{Tex/chapters/chapter08}
 
-\chapter{Procedural Memory and Tool Registry}
+\chapter{Procedural Memory}
 \label{ch:procedural-memory}
 \input{Tex/chapters/chapter09}
 
-\partclose{End of Part~3 --- The agent remembers.\\Part~4 makes it observable.}
-
-%%  PART 4: Observability
-\part{Observability}
-\label{part:observability}
-
-\chapter{Langfuse Instrumentation}
-\label{ch:langfuse}
+\chapter{Qdrant Production Setup \& Vector Store Architecture}
+\label{ch:qdrant}
 \input{Tex/chapters/chapter10}
 
-\chapter{Prompt Architecture and Context Assembly}
-\label{ch:prompt-architecture-obs}
+\chapter{Hybrid Retrieval Pipeline}
+\label{ch:hybrid-retrieval}
 \input{Tex/chapters/chapter11}
 
-\chapter{Evaluation and Quality Gates}
-\label{ch:evaluation}
+\chapter{Knowledge Graph Retrieval}
+\label{ch:knowledge-graph}
 \input{Tex/chapters/chapter12}
 
-\partclose{End of Part~4 --- The agent is observable.\\Part~5 secures it.}
-
-%%  PART 5: Security and Production Hardening
-\part{Security and Production Hardening}
-\label{part:security}
-
-\chapter{Security: PII, Prompt Injection, and Secrets}
-\label{ch:security}
+\chapter{Semantic Caching}
+\label{ch:semantic-cache}
 \input{Tex/chapters/chapter13}
 
-\chapter{Human-in-the-Loop Patterns}
-\label{ch:hitl}
+\partclose{End of Part~II --- The agent remembers, retrieves, and caches.\\Part~III gives it tools and protocols.}
+
+%% -----------------------------------------------------------
+%%  PART III — Tools, Actions \& Protocol Stack
+%% -----------------------------------------------------------
+\part{Tools, Actions \& Protocol Stack}
+\label{part:tools}
+
+\chapter{Tool Design: The Production Action Interface}
+\label{ch:tool-design}
 \input{Tex/chapters/chapter14}
 
-\chapter{Multi-Agent Coordination}
-\label{ch:multi-agent}
+\chapter{ReAct: Tool Execution Loops}
+\label{ch:react}
 \input{Tex/chapters/chapter15}
 
-\partclose{End of Part~5 --- The agent is production-ready.}
+\chapter{MCP: Hosts, Clients \& Servers}
+\label{ch:mcp}
+\input{Tex/chapters/chapter16}
+
+\chapter{A2A: Agent-to-Agent Protocol}
+\label{ch:a2a}
+\input{Tex/chapters/chapter17}
+
+\chapter{ANP \& Decentralized Agent Identity}
+\label{ch:anp}
+\input{Tex/chapters/chapter18}
+
+\partclose{End of Part~III --- The agent acts, delegates, and communicates.\\Part~IV coordinates multiple agents.}
+
+%% -----------------------------------------------------------
+%%  PART IV — Multi-Agent Orchestration
+%% -----------------------------------------------------------
+\part{Multi-Agent Orchestration}
+\label{part:multi-agent}
+
+\chapter{Supervisor Pattern}
+\label{ch:supervisor}
+\input{Tex/chapters/chapter19}
+
+\chapter{Parallel Execution \& Fan-Out/Fan-In}
+\label{ch:parallel}
+\input{Tex/chapters/chapter20}
+
+\chapter{Human-in-the-Loop}
+\label{ch:hitl}
+\input{Tex/chapters/chapter21}
+
+\chapter{Durable Execution \& Long-Running Workflows}
+\label{ch:durable-execution}
+\input{Tex/chapters/chapter22}
+
+\partclose{End of Part~IV --- Multiple agents coordinate safely.\\Part~V makes the system observable, secure, and deployable.}
+
+%% -----------------------------------------------------------
+%%  PART V — Observability, Security, Evaluation \& Deployment
+%% -----------------------------------------------------------
+\part{Observability, Security, Evaluation \& Deployment}
+\label{part:observability}
+
+\chapter{Observability with Langfuse}
+\label{ch:langfuse}
+\input{Tex/chapters/chapter23}
+
+\chapter{Security, Guardrails \& Audit}
+\label{ch:security}
+\input{Tex/chapters/chapter24}
+
+\chapter{Evaluation with Langfuse, RAGAS \& DeepEval}
+\label{ch:evaluation}
+\input{Tex/chapters/chapter25}
+
+\chapter{Deployment, Serving \& Configuration}
+\label{ch:deployment}
+\input{Tex/chapters/chapter26}
+
+\chapter{Resilience \& Error Handling}
+\label{ch:resilience}
+\input{Tex/chapters/chapter27}
+
+\chapter{Testing \& CI/CD}
+\label{ch:testing}
+\input{Tex/chapters/chapter28}
+
+\partclose{End of Part~V --- The system is observable, hardened, evaluated, and deployed.\\Part~VI covers framework integration deep dives.}
+
+%% -----------------------------------------------------------
+%%  PART VI — Framework Integration Deep Dives
+%% -----------------------------------------------------------
+\part{Framework Integration Deep Dives}
+\label{part:framework-deep-dives}
+
+\chapter{LangGraph Platform \& Studio}
+\label{ch:langgraph-platform}
+\input{Tex/chapters/chapter29}
+
+\chapter{Pydantic AI \& Instructor Integration}
+\label{ch:pydantic-ai}
+\input{Tex/chapters/chapter30}
+
+\chapter{CrewAI as a LangGraph Subgraph}
+\label{ch:crewai}
+\input{Tex/chapters/chapter31}
+
+\chapter{FastMCP Server Patterns}
+\label{ch:fastmcp-patterns}
+\input{Tex/chapters/chapter32}
+
+\chapter{Framework Selection Scorecard}
+\label{ch:framework-scorecard}
+\input{Tex/chapters/chapter33}
+
+\partclose{End of Part~VI --- Every framework in the stack is mapped and benchmarked.\\Part~VII puts it all together in production usecases.}
+
+%% -----------------------------------------------------------
+%%  PART VII — Production Usecases
+%% -----------------------------------------------------------
+\part{Production Usecases}
+\label{part:usecases}
+
+\chapter{Customer Support Agent with Memory \& Escalation}
+\label{ch:usecase-support}
+\input{Tex/usecases/usecase01}
+
+\chapter{Parallel Research \& Report Generation Agent}
+\label{ch:usecase-research}
+\input{Tex/usecases/usecase02}
+
+\chapter{Code Review \& Refactoring Multi-Agent System}
+\label{ch:usecase-code-review}
+\input{Tex/usecases/usecase03}
+
+\chapter{Financial Analysis Agent}
+\label{ch:usecase-finance}
+\input{Tex/usecases/usecase04}
+
+\chapter{Content Moderation Pipeline}
+\label{ch:usecase-moderation}
+\input{Tex/usecases/usecase05}
+
+\chapter{DevOps Incident Response Agent}
+\label{ch:usecase-devops}
+\input{Tex/usecases/usecase06}
+
+\chapter{Enterprise Document Intelligence Platform}
+\label{ch:usecase-docs}
+\input{Tex/usecases/usecase07}
+
+\partclose{End of Part~VII --- Seven production systems. All code ships.}
 
 %% ============================================================
 \backmatter
