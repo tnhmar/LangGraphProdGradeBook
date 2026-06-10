@@ -290,6 +290,46 @@
   boxrule=0.6pt, width=\linewidth
 }
 
+%% ── Source-Layout tree environment ─────────────────────────────────────
+%% Usage:
+%%   \begin{sourcelayout}
+%%     \dirtree{%
+%%       .1 src/.
+%%       .2 agent/.
+%%       .3 nodes/.
+%%       .4 perceive\_node.py \DTcomment{§1.2}.
+%%     }
+%%   \end{sourcelayout}
+%%
+%% Requires: \usepackage{dirtree}  (loaded below)
+%% Colours reuse NoteBg / NoteBorder (neutral grey — reference material,
+%% not instructional content).
+%% ────────────────────────────────────────────────────────────────────────
+\usepackage{dirtree}
+
+\newtcolorbox{sourcelayout}{%
+  colback      = NoteBg,
+  colframe     = NoteBorder,
+  colbacktitle = NoteBorder,
+  coltitle     = white,
+  fonttitle    = \sffamily\bfseries\small,
+  title        = {Source Layout},
+  before skip  = 12pt,
+  after skip   = 10pt,
+  breakable,
+  lines before break = 3,
+  left   = 6pt,
+  right  = 6pt,
+  top    = 6pt,
+  bottom = 6pt,
+  boxrule = 0.6pt,
+  width   = \linewidth,
+}
+
+%% dirtree global style: monospaced font, consistent with code listings
+\renewcommand*\DTstylecomment{\rmfamily\color{CodeComment}\itshape}
+\renewcommand*\DTstyle{\ttfamily\color{BookDark}}
+
 \usepackage{amsmath}
 \usepackage{amssymb}
 
