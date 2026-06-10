@@ -371,37 +371,6 @@
 
 ---
 
-## Part VI — Framework Integration Deep Dives (~40 pages)
-
-> **Status:** This part extends the report review's core structure as an approved expansion. It is self-contained — no chapter in Parts I–V depends on it. Readers building production systems should complete Parts I–V before consulting this part.
-
-*Install → configure → integrate with LangGraph → known limits. No theory.*
-
-### Chapter 29 — LangGraph Platform & Studio
-- `langgraph.json` full reference, background runs, webhooks
-- LangGraph Studio: live state inspection, visual debug
-
-### Chapter 30 — Pydantic AI & Instructor Integration
-- `pydantic-ai` agent as a typed `ReasonNode` replacement inside a LangGraph graph
-- Instructor `patch()` all modes — decision guide per use case
-
-### Chapter 31 — CrewAI as a LangGraph Subgraph
-- Wrapping a CrewAI `Crew` as a compiled LangGraph subgraph node
-- When CrewAI role-based abstraction is worth the overhead vs. raw supervisor
-
-### Chapter 32 — FastMCP Server Patterns
-- Production FastMCP server: auth, rate-limiting, multi-resource patterns
-- Composing multiple FastMCP servers behind a single LangGraph agent
-
-### Chapter 33 — Framework Selection Scorecard
-*Implements: specs/chap31 — Decision Guide*
-
-- 10-axis rubric applied to every Python framework in the stack
-- One-page decision flowchart: requirements → framework choice per layer
-- Anti-patterns: what each framework is explicitly wrong for
-
----
-
 ## Part VII — 7 Production Usecases (~110 pages, ~15 pages each)
 
 *Each usecase: architecture → spec rules by ID → full Python code → eval suite → deploy config*
@@ -491,7 +460,6 @@ Node types, edge types, state reducers, `Send` API, `interrupt()`, `Command`, `r
 | Part III — Tools & Protocols (Ch. 14–18) | 85 |
 | Part IV — Multi-Agent (Ch. 19–22) | 65 |
 | Part V — Observability, Security, Eval & Deploy (Ch. 23–28) | 80 |
-| Part VI — Framework Deep Dives (Ch. 29–33) | 40 |
 | Part VII — 7 Usecases | 110 |
 | Appendices | 10 |
 | **Total** | **~563 pages** |
