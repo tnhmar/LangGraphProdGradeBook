@@ -107,43 +107,43 @@
 \label{ch:checkpointing}
 \input{Tex/chapters/chapter03}
 
-\partclose{End of Part~1 --- The loop is built and safe.\\Part~2 gives it memory.}
+\partclose{End of Part~1 --- The loop is built and safe.\\Part~2 gives it structure, infrastructure, and context.}
 
-%%  PART 2: Memory Architecture
+%%  PART 2: Validation, LLM Infrastructure and Prompt Assembly
+\part{Validation, LLM Infrastructure and Prompt Assembly}
+\label{part:infrastructure}
+
+\chapter{Structured Output and Instructor}
+\label{ch:structured-output}
+\input{Tex/chapters/chapter04}
+
+\chapter{LiteLLM: Provider Abstraction and Fallback Routing}
+\label{ch:litellm}
+\input{Tex/chapters/chapter05}
+
+\chapter{Prompt Architecture and Context Assembly}
+\label{ch:prompt-architecture}
+\input{Tex/chapters/chapter06}
+
+\partclose{End of Part~2 --- The agent reasons reliably.\\Part~3 gives it memory.}
+
+%%  PART 3: Memory Architecture
 \part{Memory Architecture}
 \label{part:memory}
 
 \chapter{Short-Term Memory and Context Management}
 \label{ch:short-term-memory}
-\input{Tex/chapters/chapter04}
+\input{Tex/chapters/chapter07}
 
-\chapter{Long-Term Memory and Retrieval}
+\chapter{Persistence Requires Governance: Long-Term Memory with mem0}
 \label{ch:long-term-memory}
-\input{Tex/chapters/chapter05}
+\input{Tex/chapters/chapter08}
 
 \chapter{Procedural Memory and Tool Registry}
 \label{ch:procedural-memory}
-\input{Tex/chapters/chapter06}
-
-\partclose{End of Part~2 --- The agent remembers.\\Part~3 gives it tools.}
-
-%%  PART 3: Tool and Action Layer
-\part{Tool and Action Layer}
-\label{part:tools}
-
-\chapter{Tool Design and the MCP Interface}
-\label{ch:tool-design}
-\input{Tex/chapters/chapter07}
-
-\chapter{Structured Output and Instructor}
-\label{ch:structured-output}
-\input{Tex/chapters/chapter08}
-
-\chapter{LiteLLM: Provider Abstraction and Fallback Routing}
-\label{ch:litellm}
 \input{Tex/chapters/chapter09}
 
-\partclose{End of Part~3 --- The agent acts.\\Part~4 makes it observable.}
+\partclose{End of Part~3 --- The agent remembers.\\Part~4 makes it observable.}
 
 %%  PART 4: Observability
 \part{Observability}
@@ -154,7 +154,7 @@
 \input{Tex/chapters/chapter10}
 
 \chapter{Prompt Architecture and Context Assembly}
-\label{ch:prompt-architecture}
+\label{ch:prompt-architecture-obs}
 \input{Tex/chapters/chapter11}
 
 \chapter{Evaluation and Quality Gates}
