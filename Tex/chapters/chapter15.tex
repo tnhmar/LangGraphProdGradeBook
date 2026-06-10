@@ -1,8 +1,887 @@
 %% ============================================================
 %%  Chapter 15 --- ReAct: Tool Execution Loops
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langgraph >= 0.2.0,
+%%                langchain-core >= 0.3.0,
+%%                langchain-litellm >= 0.3.0,
+%%                pydantic >= 2.7.0,
+%%                pydantic-settings >= 2.3.0,
+%%                langfuse >= 2.35.0,
+%%                pytest >= 8.0.0
 %% ============================================================
 
-\chapterquote{ReAct is a convenience layer, not an architecture. Know when to look inside it.}{anon}
+\chapterquote{The prebuilt works until it doesn't. Know what it hides before you ship it.}{anon}
 
-% TODO: Chapter 15 content
+The production failure this chapter prevents is silent and compounding. An
+agent calls a tool, the tool returns a JSON blob with a missing required
+field, and the model receives that blob as a \code{ToolMessage} with its
+structural defect intact. No exception is raised. No validation fires. The
+model reasons from broken data, produces a plausible-sounding next step,
+invokes another tool based on that step, and the second tool amplifies the
+original error into the third. The graph completes with a status of
+\texttt{success}. The answer is wrong in ways that take a human minutes to
+detect and hours to trace back to the original malformed \code{ToolMessage}.
+The cost is not a single bad response --- it is the debugging time, the
+eroded trust, and the absence of the one record that would make the failure
+traceable: a per-tool trace span.
+
+The solution this chapter builds has four layers. The first is
+\emph{conceptual}: understanding what \code{create\_react\_agent} actually
+compiles to, and why it is a convenience shortcut over the explicit graph
+architecture the book established in Chapter~1, not a replacement for it.
+The second is \emph{structural}: using \code{get\_graph()} and
+\code{get\_subgraphs()} to read the compiled topology before trusting it,
+and recognising the three conditions that require abandoning the prebuilt
+for a hand-built \code{StateGraph}. The third is \emph{mechanical}: the
+\code{ToolMessage} protocol --- its fields, their contracts, and the
+\code{add\_messages} reducer that governs how each result enters the message
+chain. The fourth is \emph{defensive}: a \code{ValidationNode} gate that
+intercepts every tool result before the model reads it, backed by a
+Langfuse span that records the input, output, and latency of every tool
+call.
+
+The sections are ordered by dependency. Section~\ref{sec:react-convenience}
+establishes the conceptual frame before any code appears, so that the
+reader understands the trade-off before committing to the shortcut.
+Section~\ref{sec:react-internals} teaches graph introspection and defines
+the switch-to-custom triggers; it requires the conceptual frame from
+Section~\ref{sec:react-convenience} to motivate the inspection.
+Section~\ref{sec:react-toolmessage} examines reducer mechanics;
+understanding them is a prerequisite for Section~\ref{sec:react-validation},
+which exploits the reducer's replace-by-id behaviour to implement the
+validation gate. Section~\ref{sec:react-langfuse} adds observability and has
+no upstream code dependency, but is placed last because instrumentation
+without structural understanding produces data no one can interpret.
+
+This chapter introduces five terms defined in Table~\ref{tab:ch15-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~15}
+\label{tab:ch15-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+ReAct loop &
+  A two-node graph topology (\code{agent} $\leftrightarrow$ \code{tools})
+  that encodes the Reason--Act--Observe cycle; compiled to a
+  \code{CompiledStateGraph} by \code{create\_react\_agent}. \\
+\code{ToolMessage} &
+  The \code{BaseMessage} subtype that carries a tool's serialised return
+  value back into \code{MessagesState}; its \code{tool\_call\_id} must
+  exactly match the originating \code{AIMessage.tool\_calls[i]["id"]}. \\
+\code{add\_messages} reducer &
+  The function assigned to the \code{messages} field in
+  \code{MessagesState}; appends messages by default, but replaces
+  in-place when an incoming message shares an \code{id} with an
+  existing one. \\
+\code{ValidationNode} &
+  A dedicated graph node (implemented in Chapter~4 \S4.3) that
+  validates the last \code{ToolMessage} against a Pydantic schema
+  before the agent node executes. \\
+\code{DrawableGraph} &
+  The return type of \code{CompiledStateGraph.get\_graph()}; a
+  serialisable topology representation with an \code{.print\_ascii()}
+  method for terminal rendering. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+ch15/
+  01a_react_minimal.py          # §15.1 — minimal create_react_agent
+  01b_explicit_equivalent.py    # §15.1 — hand-rolled two-node equivalent
+  02_inspect_react_graph.py     # §15.2 — topology introspection
+  03_tool_message_history.py    # §15.3 — ToolMessage chain & stream_mode
+  04_validation_node_react.py   # §15.4 — ValidationNode gate
+  05_langfuse_tool_traces.py    # §15.5 — @observe per tool call
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{The Prebuilt Is a Shortcut, Not a Starting Point}
+\label{sec:react-convenience}
+%% ------------------------------------------------------------
+
+The design problem is architectural capture: an engineer who reaches for
+\code{create\_react\_agent} before understanding what it compiles to will,
+sooner or later, hit one of its hard boundaries --- no domain state beyond
+\code{messages}, no routing logic beyond \emph{``did the model request a
+tool?''}, no in-flight state editing --- and will discover that migrating
+from the prebuilt to a hand-built graph at that point requires rewriting
+code that is already in production. The naive approach is to start with the
+prebuilt because it reduces the code to fit on half a screen, which it does;
+the failure is that its boundaries are invisible until violated. The
+governing principle is: understand the topology the prebuilt compiles to
+before writing the first production line, and treat every prebuilt as a
+named point in the design space rather than the origin of that space.
+
+The \emph{ReAct pattern} originates in Yao et al.\ (2022) as a prompting
+strategy: ask the model to interleave \texttt{Thought}, \texttt{Action}, and
+\texttt{Observation} steps in its output, and use each \texttt{Observation}
+to ground the next \texttt{Thought}. LangGraph encodes only the structural
+consequence of that strategy: a loop where the model runs, optionally
+requests tools, the tools run, and control returns to the model.
+The prompt that elicits interleaved reasoning is the engineer's
+responsibility; the library provides only the loop topology.
+
+What \code{create\_react\_agent} produces is a \code{CompiledStateGraph}
+containing exactly two application nodes: \code{agent}, which invokes
+the model, and \code{tools}, which is a \code{ToolNode} that dispatches
+the \code{tool\_calls} present in the most recent \code{AIMessage}.
+A single conditional edge governed by a \code{has\_tool\_calls} check routes
+either back to \code{agent} (if the last message contains tool calls) or
+to \code{\_\_end\_\_} (if it does not). This is the same \code{CompiledStateGraph}
+runtime that Chapter~1 produced by calling \code{StateGraph.compile()} ---
+no different execution engine, no different checkpointing behaviour, no
+different streaming API. The prebuilt saves approximately thirty lines of
+wiring code and hides three things in exchange: the conditional edge
+function, the \code{ToolNode} construction, and the state schema
+restriction to \code{MessagesState}.
+
+\begin{table}[h]
+\centering
+\caption{Prebuilt vs.\ explicit \code{StateGraph}: trade-offs}
+\label{tab:ch15-tradeoffs}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension}        & \textbf{\code{create\_react\_agent}} & \textbf{Explicit \code{StateGraph}} \\
+\midrule
+Lines to running agent    & $\sim$10 & $\sim$45 \\
+State schema              & \code{MessagesState} (default) & Any \code{TypedDict} \\
+Domain state fields       & Via \code{state\_schema} override (constrained) & Native, any reducer \\
+Routing logic             & \code{has\_tool\_calls} only & Arbitrary callable \\
+In-flight state editing   & Constrained (interrupt list only) & Full \code{update\_state()} control \\
+Topology auditability     & Hidden until \code{get\_graph()} called & Explicit and readable \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The listings below make the equivalence concrete by showing both forms
+side by side. Listing~\ref{lst:react-minimal} is the prebuilt form.
+Listing~\ref{lst:react-explicit} is the hand-built equivalent.
+
+\begin{lstlisting}[language=Python,
+  caption={Minimal \texttt{create\_react\_agent} with two arithmetic tools},
+  label={lst:react-minimal}]
+# ch15/01a_react_minimal.py
+from langchain_litellm import ChatLiteLLM
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage
+from langgraph.prebuilt import create_react_agent
+
+@tool
+def add(a: int, b: int) -> int:
+    """Add two integers and return the result."""
+    return a + b
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers and return the result."""
+    return a * b
+
+model  = ChatLiteLLM(model="gpt-4o-mini")
+agent  = create_react_agent(model=model, tools=[add, multiply])
+result = agent.invoke(
+    {"messages": [HumanMessage(content="What is (3 + 4) * 5?")]}
+)
+print(result["messages"][-1].content)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:react-minimal} deserve explanation.
+The tools are plain functions decorated with \code{@tool}; \code{create\_react\_agent}
+wraps them in a \code{ToolNode} internally and calls
+\code{model.bind\_tools([add, multiply])} before constructing the agent node,
+so no explicit schema registration is needed. The input is a plain \code{dict}
+matching the \code{MessagesState} schema (\code{\{"messages": [...]\}}); this
+is the correct call-site form because \code{invoke()} accepts any value that
+satisfies the state schema by key name, and \code{MessagesState} is a
+\code{TypedDict} whose only required key is \code{messages}.
+
+\begin{lstlisting}[language=Python,
+  caption={Hand-rolled two-node equivalent of the prebuilt loop},
+  label={lst:react-explicit}]
+# ch15/01b_explicit_equivalent.py
+import operator
+from typing import Annotated, Literal
+from typing_extensions import TypedDict
+from langchain_core.messages import BaseMessage, AIMessage
+from langchain_core.tools import tool
+from langchain_litellm import ChatLiteLLM
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+
+class State(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+@tool
+def add(a: int, b: int) -> int:
+    """Add two integers and return the result."""
+    return a + b
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers and return the result."""
+    return a * b
+
+TOOLS = [add, multiply]
+model  = ChatLiteLLM(model="gpt-4o-mini")
+bound  = model.bind_tools(TOOLS)
+
+def agent_node(state: State) -> dict:
+    return {"messages": [bound.invoke(state["messages"])]}
+
+def should_continue(state: State) -> Literal["tools", "__end__"]:
+    last = state["messages"][-1]
+    if isinstance(last, AIMessage) and last.tool_calls:
+        return "tools"
+    return "__end__"
+
+builder = StateGraph(State)
+builder.add_node("agent", agent_node)
+builder.add_node("tools", ToolNode(TOOLS))
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", should_continue)
+builder.add_edge("tools", "agent")
+graph = builder.compile()
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:react-explicit} deserve explanation.
+\code{model.bind\_tools(TOOLS)} is called once at module level rather than
+inside \code{agent\_node}; binding at construction time ensures the tool
+schemas are attached to the model before any graph execution begins and
+avoids re-binding on every node invocation, which would re-serialise the
+schemas on every call. \code{should\_continue} returns the string literal
+\code{"\_\_end\_\_"} rather than the imported \code{END} sentinel as its
+direct return value; \code{add\_conditional\_edges} treats string return
+values as node names, and \code{"\_\_end\_\_"} is the internal node name
+that \code{END} resolves to when no \code{path\_map} is provided. When
+\code{END} (the sentinel object, not the string) is one of the routing
+targets, a \code{path\_map} is required --- the absence of a \code{path\_map}
+here is correct because both targets are strings. \code{ToolNode(TOOLS)}
+receives the same list as \code{bind\_tools} to guarantee that the tool
+schemas the model learns and the tools the node dispatches are derived from
+the same source.
+
+\begin{notebox}
+\code{create\_react\_agent} accepts \code{interrupt\_before} and
+\code{interrupt\_after} parameters that place LangGraph \code{interrupt()}
+calls at node boundaries without a custom graph. This covers the common
+HITL case of pausing before or after tool execution. The trigger for
+moving to a custom graph is not HITL itself but \emph{in-flight state
+editing}: if a human reviewer needs to call \code{graph.update\_state()}
+to modify state between the interrupt and the resume, the explicit graph
+structure is required to place that edit at the correct node boundary.
+Chapter~21 \S21.4 covers this pattern in full.
+\end{notebox}
+
+The prebuilt topology is now understood; the question is how to verify at
+runtime that a compiled graph built from \code{create\_react\_agent} matches
+the topology described here, and how to confirm the switch-to-custom
+triggers before they become blocking production issues.
+
+
+%% ------------------------------------------------------------
+\section{Trust Requires Inspection, Not Assumption}
+\label{sec:react-internals}
+%% ------------------------------------------------------------
+
+The design problem is unverified assumption: accepting a compiled graph from
+a factory function and proceeding directly to \code{invoke()} is structurally
+equivalent to deploying code whose call graph has never been read. The
+happy path exercises only one route through the topology; the
+\code{agent~$\to$~tools} back-edge and the terminal condition are structural
+features that observed behaviour alone cannot confirm. The naive approach is
+to run the agent against a test prompt and verify the output --- which
+confirms only that the happy path works. The governing principle is: a
+compiled graph must be readable before it is trusted, and LangGraph provides
+\code{get\_graph()} and \code{get\_subgraphs()} specifically for that purpose.
+
+\code{CompiledStateGraph.get\_graph(xray=True)} returns a \code{DrawableGraph},
+a serialisable representation of the compiled topology. When \code{xray} is
+\code{False} (the default), composite nodes such as \code{ToolNode} appear
+as single opaque boxes. When \code{xray} is \code{True}, LangGraph expands
+subgraphs recursively, revealing the internal nodes and edges that composite
+nodes encapsulate. \code{DrawableGraph.print\_ascii()} renders the result as
+a terminal diagram using only standard library output.
+
+\code{get\_subgraphs(recurse=True)} returns an iterator of
+\code{(name,~subgraph)} pairs for every embedded compiled graph inside the
+top-level graph. \code{ToolNode} is itself a compiled \code{Pregel}
+execution unit; iterating with \code{recurse=True} and reading
+\code{subgraph.nodes.keys()} reveals its internal node names. This
+attribute is stable across LangGraph versions and is safe to assert on in
+\code{pytest} tests that verify expected topology.
+
+\begin{lstlisting}[language=Python,
+  caption={Inspecting compiled topology with \texttt{get\_graph} and \texttt{get\_subgraphs}},
+  label={lst:react-inspect}]
+# ch15/02_inspect_react_graph.py
+from langchain_litellm import ChatLiteLLM
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
+
+@tool
+def web_search(query: str) -> str:
+    """Search the web and return a summary of results."""
+    return f"Top result for '{query}': (stub)"
+
+model = ChatLiteLLM(model="gpt-4o-mini")
+agent = create_react_agent(model=model, tools=[web_search])
+
+# ── 1. Opaque top-level view ─────────────────────────────────
+print("=== top-level (xray=False) ===")
+agent.get_graph(xray=False).print_ascii()
+
+# ── 2. Expanded view — ToolNode internals visible ────────────
+print("\n=== expanded (xray=True) ===")
+agent.get_graph(xray=True).print_ascii()
+
+# ── 3. Enumerate all embedded compiled subgraphs ─────────────
+print("\n=== subgraph inventory ===")
+for name, subgraph in agent.get_subgraphs(recurse=True):
+    node_names = list(subgraph.nodes.keys())
+    print(f"  {name!r:30s}  nodes={node_names}")
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:react-inspect} deserve explanation.
+\code{get\_graph} is called twice --- once with \code{xray=False} and once
+with \code{xray=True} --- and the comparison is deliberate: the first call
+shows the graph as the prebuilt presents it (what is being trusted), and
+the second shows what it actually contains (what is running). Seeing both
+in a single terminal session establishes the habit of checking before
+trusting. \code{subgraph.nodes.keys()} reads from the \code{PregelProtocol}
+object returned by the iterator; the \code{nodes} attribute on that object
+is the internal node registry and its keys are the names that appear in the
+\code{get\_graph()} ASCII diagram, making it possible to assert in a
+\code{pytest} fixture that the expected topology is present before a
+deployment ships.
+
+\begin{warningbox}
+\code{get\_graph(xray=True)} does not mutate the compiled graph and is safe
+to call in production for diagnostics. \code{get\_subgraphs(recurse=True)}
+returns an iterator that yields live \code{PregelProtocol} objects; do not
+modify the objects it yields. Both methods reflect the topology at the time
+\code{compile()} was called; adding nodes or edges after compilation is not
+supported by the LangGraph API and will produce undefined behaviour.
+\end{warningbox}
+
+The three conditions that mandate switching to a custom \code{StateGraph}
+follow directly from what inspection reveals.
+
+\begin{enumerate}
+  \item \textbf{Custom routing.} The prebuilt's conditional edge calls
+    \code{has\_tool\_calls} and nothing else. Any routing logic beyond
+    that binary check --- dispatching to different tool subsets by tool
+    class, branching on a confidence score, routing to a human-approval
+    node for specific tool names --- requires an explicit callable passed
+    to \code{add\_conditional\_edges}. There is no parameter on
+    \code{create\_react\_agent} to replace this function.
+
+  \item \textbf{Domain state.} Any key beyond \code{messages} in the
+    graph state requires a custom \code{TypedDict} with explicit
+    reducers. Examples: a \code{tool\_errors} counter with
+    \code{operator.add}, a \code{token\_budget} with a cap-and-truncate
+    reducer, a \code{cycle\_count} for the termination policy from
+    Chapter~2. The \code{state\_schema} parameter on
+    \code{create\_react\_agent} accepts a custom schema, but the
+    prebuilt's internal routing logic still assumes \code{messages} is the
+    only operationally meaningful field.
+
+  \item \textbf{In-flight state editing.} \code{interrupt\_before} and
+    \code{interrupt\_after} on the prebuilt support pausing and resuming.
+    The trigger for leaving the prebuilt is needing to call
+    \code{graph.update\_state()} between an interrupt and a resume ---
+    for example, to inject a corrected \code{ToolMessage} or to modify an
+    accumulated counter before the agent node re-executes.
+    Chapter~21 \S21.4 covers this pattern.
+\end{enumerate}
+
+Inspection reveals the topology; it does not reveal the protocol that
+governs what travels through the back-edge after every tool call. That
+protocol --- the \code{ToolMessage} contract and the reducer that merges
+it into state --- is what the next section establishes.
+
+
+%% ------------------------------------------------------------
+\section{The Message Chain Is a Protocol, Not a Log}
+\label{sec:react-toolmessage}
+%% ------------------------------------------------------------
+
+The design problem is hidden coupling: the \code{ToolMessage} that carries
+a tool's result back into state must match the specific \code{tool\_call\_id}
+of the \code{AIMessage} that triggered the call, or the model receives a
+message chain that is structurally incoherent at the OpenAI message
+protocol level. The naive approach is to return a string from a tool
+function and trust LangGraph to handle the bookkeeping --- which it does
+correctly when the tool is dispatched through \code{ToolNode}, but fails
+silently when a developer constructs a \code{ToolMessage} manually in a
+test fixture, a retry handler, or a custom node without matching the
+\code{tool\_call\_id}. The governing principle is: \code{ToolMessage} is a
+protocol artefact with three mandatory fields that each carry an
+explicit contract, and that contract must be understood before any manual
+construction or state patching is attempted.
+
+\code{ToolMessage} carries three mandatory fields. \code{content} is the
+serialised tool result as a string; structured data must be
+\code{json.dumps()}-ed before being placed here because the message
+protocol boundary is text. \code{tool\_call\_id} must be an exact copy of
+the \code{id} field from the corresponding entry in
+\code{AIMessage.tool\_calls}; this is the identifier the model uses to
+associate each result with the request that produced it, and a mismatch
+causes the model to receive a history it cannot reconcile. \code{name} is
+the tool's function name as a string; it appears in Langfuse traces and in
+the model's context and must match the \code{@tool}-decorated function name
+exactly to avoid ambiguity in multi-tool runs.
+
+The \code{add\_messages} reducer, introduced as the \code{messages} field
+reducer in Chapter~7 \S7.1, governs how each incoming message merges into
+the existing list. Its default path is append: if the incoming message's
+\code{id} does not appear in the existing list, the message is added at the
+end. Its exception path is replace: if the incoming message's \code{id}
+matches an existing message's \code{id}, the new message replaces the old
+one in-place. This replace-by-id behaviour is not an edge case --- it is the
+mechanism that enables the validation gate in Section~\ref{sec:react-validation}
+to overwrite a malformed \code{ToolMessage} with a corrected one, without
+the model ever seeing the original.
+
+\begin{warningbox}
+When the model issues multiple tool calls in a single \code{AIMessage},
+\code{AIMessage.tool\_calls} contains one entry per call, each with a
+distinct \code{id}. \code{ToolNode} dispatches all calls and appends one
+\code{ToolMessage} per call, each bearing the matching \code{id}.
+If you construct \code{ToolMessage} objects manually --- in a test fixture,
+in a retry handler, or in a custom tool node --- iterate
+\code{AIMessage.tool\_calls} and bind each result to its originating
+\code{id}. A \code{ToolMessage} whose \code{tool\_call\_id} does not
+appear in the preceding \code{AIMessage.tool\_calls} will cause
+the model to return an error or silently ignore that result on the
+next reasoning step.
+\end{warningbox}
+
+The shape of the message chain after two sequential tool calls has a
+specific structure that every node in the graph receives on its next
+execution:
+
+\begin{verbatim}
+HumanMessage(content="What is (3+4)*5?")
+AIMessage(tool_calls=[{id:"c1", name:"add",      args:{a:3, b:4}}])
+ToolMessage(content="7",  tool_call_id="c1", name="add")
+AIMessage(tool_calls=[{id:"c2", name:"multiply", args:{a:7, b:5}}])
+ToolMessage(content="35", tool_call_id="c2", name="multiply")
+AIMessage(content="The answer is 35.")
+\end{verbatim}
+
+The model receives this entire list on every reasoning step. After ten
+tool calls the list contains twenty-two messages, and after twenty it
+contains forty-two. Chapter~7 \S7.2 covers \code{trim\_messages()} for
+windowing this growth; Chapter~7 \S7.3 covers the summarisation node that
+compresses history into a single \code{SystemMessage} when the list exceeds
+a token budget.
+
+\begin{lstlisting}[language=Python,
+  caption={Streaming updates to observe each \texttt{ToolMessage} as it enters state},
+  label={lst:react-toolmsg}]
+# ch15/03_tool_message_history.py
+import json
+from langchain_litellm import ChatLiteLLM
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import InMemorySaver
+
+@tool
+def add(a: int, b: int) -> int:
+    """Add two integers and return the result."""
+    return a + b
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers and return the result."""
+    return a * b
+
+model       = ChatLiteLLM(model="gpt-4o-mini")
+checkpointer = InMemorySaver()
+agent       = create_react_agent(
+    model=model, tools=[add, multiply], checkpointer=checkpointer
+)
+config: RunnableConfig = {"configurable": {"thread_id": "ch15-demo-1"}}
+
+for chunk in agent.stream(
+    {"messages": [HumanMessage(content="What is (3+4)*5?")]},
+    config=config,
+    stream_mode="updates",
+):
+    node_name, updates = next(iter(chunk.items()))
+    for msg in updates.get("messages", []):
+        tc = getattr(msg, "tool_call_id", None)
+        print(f"[{node_name}] {type(msg).__name__}"
+              + (f"  tool_call_id={tc}" if tc else ""))
+
+snapshot = agent.get_state(config)
+print("\n--- accumulated message chain ---")
+for msg in snapshot.values["messages"]:
+    preview = str(msg.content)[:55].replace("\n", " ")
+    print(f"  {type(msg).__name__:15s}  {preview}")
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:react-toolmsg} deserve explanation.
+\code{stream\_mode="updates"} is used rather than \code{stream\_mode="values"};
+with \code{"updates"} each chunk is a \code{dict} keyed by the node name
+that produced it (e.g.,
+\code{\{"tools": \{"messages": [ToolMessage(...)]\}\}})
+and contains only the delta for that step, making it straightforward to
+observe which node injected each \code{ToolMessage} and in which order.
+\code{stream\_mode="values"} emits the full accumulated state after every
+node execution --- for a two-tool interaction that is six full copies of the
+growing message list, all containing the same \code{HumanMessage} repeated.
+A \code{checkpointer} is passed to \code{create\_react\_agent} because
+\code{get\_state()} requires a checkpointer to retrieve the accumulated
+state after streaming completes; without one, the call raises a
+\code{ValueError}. The \code{snapshot.values} attribute on the returned
+\code{StateSnapshot} is a \code{dict} of the complete state at the final
+checkpoint; \code{snapshot.values["messages"]} is the full accumulated list,
+not a delta.
+
+\begin{notebox}
+To inject a synthetic \code{ToolMessage} into a running graph --- for
+testing, for manual retry, or for state patching after a human interrupt
+--- use \code{graph.update\_state(config, \{"messages": [ToolMessage(...)]\},
+as\_node="tools")}. The \code{as\_node} parameter tells the runtime which
+node is conceptually producing the update, which determines which outgoing
+edges are evaluated next. Without \code{as\_node}, the state update is
+applied without triggering any routing logic. Chapter~21 \S21.4 shows
+this pattern in the context of HITL state editing.
+\end{notebox}
+
+Knowing how the message chain accumulates makes the next failure mode
+visible: the model reads every \code{ToolMessage} in that chain without
+any schema check, and a structurally invalid payload is indistinguishable
+from a valid one at the message layer. Section~\ref{sec:react-validation}
+intercepts that payload before the model sees it.
+
+
+%% ------------------------------------------------------------
+\section{Malformed Tool Output Must Never Reach the Model}
+\label{sec:react-validation}
+%% ------------------------------------------------------------
+
+The design problem is epistemic contamination: the model cannot detect
+that a \code{ToolMessage} contains structurally invalid data, because the
+message layer carries content as a string with no schema enforcement.
+A JSON blob with a missing required field, a numeric value encoded as a
+string, or an empty object where a populated record was expected will all
+be consumed by the model and incorporated into its next reasoning step
+as though they were correct. The naive approach --- catching exceptions
+inside the tool function --- fails because most structural violations are
+not exceptions: they are valid JSON that does not match the expected schema.
+The governing principle is: every tool result must pass a Pydantic
+validation gate before the model's next reasoning step, and that gate must
+be a graph node with its own routing authority, not an inline check inside
+the tool.
+
+Chapter~4 \S4.3 defined \code{ValidationNode} as a reusable graph node
+that reads the last \code{ToolMessage} from state, calls
+\code{OutputSchema.model\_validate(json.loads(msg.content))}, and on failure
+returns a replacement \code{ToolMessage} bearing the \emph{original}
+\code{tool\_call\_id} and a \code{VALIDATION\_ERROR:~...} prefix in
+\code{content}. The \code{add\_messages} reducer's replace-by-id behaviour,
+established in Section~\ref{sec:react-toolmessage}, ensures that this
+replacement message overwrites the invalid original; the model's next step
+sees the error description, not the malformed data. This chapter imports
+\code{ValidationNode} without any modification --- its implementation
+belongs to Chapter~4 and is not reproduced here.
+
+Inserting \code{ValidationNode} requires a custom \code{StateGraph} rather
+than the prebuilt, because the prebuilt's fixed topology has no slot between
+\code{tools} and \code{agent}. The custom graph adds one state field beyond
+\code{messages}: \code{tool\_errors}, an integer that accumulates across
+the run using \code{operator.add} as its reducer. Without a ceiling on this
+count, a tool that consistently returns malformed output drives the graph
+into an infinite validation-retry loop; the ceiling converts that loop
+into a deterministic escalation to \code{END}.
+
+\begin{lstlisting}[language=Python,
+  caption={\texttt{AgentState} and routing logic for the validation gate},
+  label={lst:react-validation-state}]
+# ch15/04_validation_node_react.py
+import operator, json
+from typing import Annotated, Literal
+from typing_extensions import TypedDict
+from langchain_core.messages import BaseMessage, AIMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_litellm import ChatLiteLLM
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, ValidationError
+from ch04.validation_node import ValidationNode   # Ch.4 §4.3 — do not redefine
+
+MAX_TOOL_ERRORS: int = 3
+
+class WeatherOutput(BaseModel):
+    temperature_c: float
+    condition:     str
+
+class AgentState(TypedDict):
+    messages:    Annotated[list[BaseMessage], add_messages]
+    tool_errors: Annotated[int, operator.add]
+
+def route_after_validation(
+    state: AgentState,
+) -> Literal["agent", "tools"] | type[END]:
+    if state["tool_errors"] >= MAX_TOOL_ERRORS:
+        return END
+    last = state["messages"][-1]
+    if (isinstance(last, ToolMessage)
+            and last.content.startswith("VALIDATION_ERROR")):
+        return "tools"
+    return "agent"
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Graph wiring: \texttt{agent} → \texttt{tools} → \texttt{validate} → routing},
+  label={lst:react-validation-graph}]
+# ch15/04_validation_node_react.py  (continued)
+@tool
+def get_weather(city: str) -> str:
+    """Return weather JSON for a city.
+
+    Returns: JSON with temperature_c (float) and condition (str).
+    """
+    # Deliberately broken payload: missing required 'condition' field
+    return json.dumps({"temperature_c": 22.0})
+
+model         = ChatLiteLLM(model="gpt-4o-mini")
+bound         = model.bind_tools([get_weather])
+validate_node = ValidationNode(schema=WeatherOutput)
+
+def agent_node(state: AgentState) -> dict:
+    return {"messages": [bound.invoke(state["messages"])]}
+
+def should_call_tools(state: AgentState) -> Literal["tools", "__end__"]:
+    last = state["messages"][-1]
+    if isinstance(last, AIMessage) and last.tool_calls:
+        return "tools"
+    return "__end__"
+
+builder = StateGraph(AgentState)
+builder.add_node("agent",    agent_node)
+builder.add_node("tools",    ToolNode([get_weather]))
+builder.add_node("validate", validate_node)
+
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", should_call_tools)
+builder.add_edge("tools", "validate")
+builder.add_conditional_edges(
+    "validate",
+    route_after_validation,
+    path_map={"agent": "agent", "tools": "tools", END: END},
+)
+graph = builder.compile()
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:react-validation-state}
+and~\ref{lst:react-validation-graph} deserve explanation.
+\code{tool\_errors} uses \code{operator.add} as its reducer, which means
+any node returning \code{\{"tool\_errors": 1\}} increments the counter
+and any node that does not return the key leaves it unchanged.
+\code{ValidationNode} increments by returning \code{\{"tool\_errors": 1\}}
+only on failure, making the counter an accurate running total of
+structurally invalid results across the entire run without any explicit
+counter-management logic in the routing function. The \code{path\_map}
+argument to \code{add\_conditional\_edges} is required here because
+\code{END} (the imported sentinel object) is one of the possible return
+values of \code{route\_after\_validation}; without an explicit
+\code{path\_map}, LangGraph cannot resolve the sentinel to a valid edge
+target and raises a graph compilation error. The \code{agent\_node}
+function is a named function rather than a lambda so that its name
+appears correctly in the \code{get\_graph()} ASCII output and in Langfuse
+node-level traces.
+
+\begin{notebox}
+\code{ValidationNode} (Chapter~4 \S4.3) operates on the last
+\code{ToolMessage} in \code{state["messages"]}. When \code{ToolNode}
+dispatches multiple tool calls in one step it appends multiple
+\code{ToolMessage} objects before returning. The single-message pattern
+shown here is correct for the common case where the model issues one tool
+call per reasoning step. If your agent issues batched tool calls and each
+result must be independently validated, extend \code{ValidationNode} to
+iterate all trailing \code{ToolMessage} objects since the last
+\code{AIMessage}, as described in Chapter~4 \S4.3.
+\end{notebox}
+
+The validation gate ensures the model never reads a structurally invalid
+tool result. What remains invisible after the gate is in place is the cost
+and latency of every tool call --- information that is essential for
+diagnosing production incidents and for attribution. Section~\ref{sec:react-langfuse}
+makes that information explicit.
+
+
+%% ------------------------------------------------------------
+\section{Every Tool Call Needs Its Own Trace Span}
+\label{sec:react-langfuse}
+%% ------------------------------------------------------------
+
+The design problem is observability granularity: when a run spanning five
+tool calls takes fourteen seconds and costs \$0.06, the production question
+is which specific tool consumed nine of those seconds and which call
+sequence drove the cost. Without per-tool spans, the Langfuse trace shows
+one block of latency and one block of token usage with no attribution to
+individual tools or reasoning steps. The naive approach wraps the entire
+\code{agent.invoke()} call in a single \code{@observe} span, which produces
+exactly this problem: one blob of data, no decomposition. The governing
+principle is: observability granularity must match operational
+accountability granularity, and in a tool-calling agent that granularity
+is per-tool-call.
+
+Langfuse's \code{@observe} decorator, introduced in Chapter~23 \S23.1,
+instruments any Python callable as a trace span. The \code{as\_type}
+parameter controls how Langfuse classifies the span: \code{"generation"}
+activates token-cost attribution and is reserved for LLM calls;
+\code{"span"} is the correct type for all other units of work, including
+tool calls. Using \code{"generation"} on a tool function is not merely
+a labelling error --- Langfuse will attempt to extract token usage from
+the tool's return value, find nothing, and record zero cost for what may
+be the most expensive operation in the run.
+
+When \code{@observe}-decorated functions are called inside an already-active
+\code{@observe} context, Langfuse infers the parent-child relationship from
+a Python context variable the decorator maintains. No explicit trace ID or
+parent span ID needs to be threaded through function arguments. In a
+LangGraph agent, wrapping the LLM call inside the agent node with
+\code{@observe(as\_type="generation")} and wrapping each tool with
+\code{@observe(as\_type="span")} produces a trace hierarchy where every tool
+span is a child of the reasoning step that triggered it --- without any
+modification to the graph wiring.
+
+\begin{lstlisting}[language=Python,
+  caption={Tool functions instrumented with \texttt{@observe(as\_type="span")}},
+  label={lst:react-langfuse-tools}]
+# ch15/05_langfuse_tool_traces.py
+from langfuse.decorators import observe, langfuse_context
+from langfuse import flush_langfuse
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain_litellm import ChatLiteLLM
+from langgraph.prebuilt import create_react_agent
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    langfuse_secret_key: str
+    langfuse_public_key: str
+    langfuse_host:       str = "https://cloud.langfuse.com"
+    model_config = {"env_file": ".env"}
+
+settings = Settings()  # validates env vars at import time
+
+@tool
+@observe(name="web_search", as_type="span")
+def web_search(query: str) -> str:
+    """Search the web and return a summary."""
+    result = f"Top result for '{query}': (stub)"
+    langfuse_context.update_current_observation(
+        input={"query": query},
+        output={"result": result},
+        metadata={"tool": "web_search"},
+    )
+    return result
+
+@tool
+@observe(name="calculator", as_type="span")
+def calculator(expression: str) -> str:
+    """Evaluate a safe arithmetic expression and return the result."""
+    # ast.literal_eval is safe for arithmetic expressions
+    import ast
+    result = str(ast.literal_eval(expression))
+    langfuse_context.update_current_observation(
+        input={"expression": expression},
+        output={"result": result},
+    )
+    return result
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Agent runner instrumented as a generation span; trace URL captured inside context},
+  label={lst:react-langfuse-agent}]
+# ch15/05_langfuse_tool_traces.py  (continued)
+model = ChatLiteLLM(model="gpt-4o-mini")
+
+@observe(name="run_agent", as_type="generation")
+def run_agent(question: str) -> tuple[str, str]:
+    """Run the agent and return (answer, trace_url)."""
+    agent  = create_react_agent(model=model,
+                                tools=[web_search, calculator])
+    result = agent.invoke(
+        {"messages": [HumanMessage(content=question)]}
+    )
+    answer    = result["messages"][-1].content
+    trace_url = langfuse_context.get_current_trace_url()
+    langfuse_context.update_current_observation(
+        input={"question": question},
+        output={"answer": answer},
+    )
+    return answer, trace_url
+
+if __name__ == "__main__":
+    try:
+        answer, url = run_agent(
+            "Search for the Eiffel Tower height and compute 324 * 3.281."
+        )
+        print(f"Answer: {answer}")
+        print(f"Trace:  {url}")
+    finally:
+        flush_langfuse()
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:react-langfuse-tools}
+and~\ref{lst:react-langfuse-agent} deserve explanation.
+\code{@tool} is the outer decorator and \code{@observe} is the inner
+decorator on each tool function; the order is significant because
+\code{@tool} must wrap the Langfuse-instrumented function, not the
+\code{StructuredTool} that \code{@tool} produces. Reversing the order
+would instrument LangChain's dispatch machinery rather than the tool's
+own logic, producing a span that measures serialisation overhead instead of
+business logic latency. \code{langfuse\_context.get\_current\_trace\_url()}
+is called \emph{inside} the \code{@observe}-decorated \code{run\_agent}
+function, before it returns, because this method is only valid within an
+active observation context; calling it after the function exits raises
+\code{RuntimeError} because the context variable has been cleared. The URL
+is captured as a return value so the caller can log or surface it after
+\code{run\_agent} completes. \code{flush\_langfuse()} is called in a
+\code{finally} block rather than after \code{run\_agent}: Langfuse's SDK
+sends spans over a background thread, and if the Python process exits
+before that thread drains its queue, all spans produced in that process are
+silently lost. The \code{finally} guarantee preserves the trace even if
+\code{run\_agent} raises.
+
+\begin{tipbox}
+In long-running services --- FastAPI workers, Celery tasks, persistent
+LangGraph Platform deployments --- the SDK background thread has time to
+drain between requests and \code{flush\_langfuse()} is unnecessary. Call
+\code{flush\_langfuse()} only in short-lived scripts, in \code{pytest}
+fixtures that each produce one trace, and in CLI invocations where the
+process exits immediately after the agent completes. Chapter~23 \S23.1
+covers the full Langfuse integration pattern for production service
+deployments, including the \code{LangfuseCallbackHandler} that instruments
+every LangGraph node automatically.
+\end{tipbox}
+
+The trace produced by these two listings mirrors, in Langfuse's timeline,
+the message chain in \code{MessagesState}: one \code{generation} span per
+\code{AIMessage} reasoning step, one \code{span} per \code{ToolMessage}
+tool call, all nested under the \code{run\_agent} root span. When a
+production incident occurs, the trace identifies which tool span had
+anomalous latency or which step produced a \code{VALIDATION\_ERROR}
+message, connecting the observability record directly to the graph
+mechanism that produced it. Chapter~16 extends the tool surface outward:
+where this chapter assumes tools are Python callables in the same process,
+the next chapter considers tools that are MCP servers in separate
+processes, reachable over HTTP, and discoverable at runtime --- a topology
+that introduces transport failure, schema negotiation, and OAuth token
+scoping as new failure surfaces.
