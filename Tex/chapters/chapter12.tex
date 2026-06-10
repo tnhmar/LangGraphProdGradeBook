@@ -1,8 +1,883 @@
 %% ============================================================
 %%  Chapter 12 --- Knowledge Graph Retrieval
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langchain-neo4j >= 0.4.0,
+%%                langchain-community >= 0.3.0,
+%%                litellm >= 1.40.0, instructor >= 1.3.0,
+%%                mem0ai >= 0.1.35, pydantic-settings >= 2.3.0
 %% ============================================================
 
-\chapterquote{Not every question is a similarity search; some require traversal.}{anon}
+\chapterquote{A graph does not store facts. It stores the relationships that make facts answerable.}{anon}
 
-% TODO: Chapter 12 content
+The production failure this chapter prevents is invisible until it becomes
+expensive. A customer-support agent with a dense vector memory can retrieve
+every conversation in which a user mentioned a particular tool. What it
+cannot answer is: \emph{which tools has this user used across all workflows
+that also involved a specific model?} That question requires traversing a
+path through a graph. The dense retriever returns passages that are
+semantically similar to the query string, but semantic similarity is not
+the same as relational reachability. The relevant memories may contain no
+overlapping vocabulary with the query at all --- they are linked by structure,
+not by words. Teams discover this failure mode when an agent that passed all
+similarity-based retrieval tests begins producing answers that contradict
+known facts about the user's history, because the facts were relational and
+the retriever was not.
+
+The solution this chapter builds has four layers. The first is a
+\emph{connection layer}: a settings-driven \code{Neo4jGraph} client that
+serves as the shared interface to the graph database, together with a
+\code{GraphCypherQAChain} that translates natural-language questions into
+validated Cypher queries. The second is an \emph{extraction layer}: an
+LLM-driven pipeline that reads raw memory text, produces validated
+\code{(subject, predicate, object)} triples, and writes them to Neo4j
+using deterministic merge semantics. The third is a \emph{query layer}: a
+multi-hop Cypher execution path for relational questions, with a mandatory
+validation step that prevents LLM-hallucinated schema references from
+reaching the database. The fourth is a \emph{routing layer}: a LangGraph
+classifier node that decides per query whether to call the graph path, the
+vector path from Chapter~11, or both --- merging the results through the
+same \code{reciprocal\_rank\_fusion()} function already built. A fifth section
+closes the chapter by establishing the write-ordering contract between
+Neo4j and mem0 that keeps the two stores consistent without a distributed
+transaction.
+
+The sections must be read in order because each one hands a resolved
+problem to the next. Section~\ref{sec:kg-connection} establishes the
+connection and chain singletons that all other sections depend on.
+Section~\ref{sec:kg-extraction} populates the graph; without data, the
+query layer is untestable. Section~\ref{sec:kg-multihop} shows what the
+graph enables that vectors cannot. Section~\ref{sec:kg-routing} wraps both
+retrieval paths inside a single LangGraph dispatcher that makes the choice
+transparent and auditable. Section~\ref{sec:kg-consistency} closes the
+write path by ensuring that every memory written to Neo4j is immediately
+cross-referenced in mem0.
+
+This chapter introduces several new domain terms defined in
+Table~\ref{tab:ch12-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~12}
+\label{tab:ch12-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{Triple} & A Pydantic model representing one \code{(subject, predicate, object\_)} fact extracted from memory text; maps to one Neo4j \code{Relationship} with two \code{Node} endpoints. \\
+\code{GraphDocument} & A \code{langchain\_community} wrapper that bundles a list of \code{Node} and \code{Relationship} objects with a source \code{Document}; the unit of write for \code{add\_graph\_documents()}. \\
+\code{CypherQueryCorrector} & A \code{langchain\_neo4j} post-processor that validates LLM-generated Cypher against the live graph schema before execution; activated automatically by \code{validate\_cypher=True}. \\
+\code{RoutingDecision} & A three-valued \code{str} enum (\code{GRAPH}, \code{VECTOR}, \code{HYBRID}) that a LangGraph classifier node writes to state; read by the conditional edge to dispatch to the correct retrieval branch. \\
+\code{ConsistencyResult} & A Pydantic model recording whether the Neo4j write and the mem0 additive tag succeeded; used for Langfuse alerting and retry scheduling. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The source layout for this chapter is:
+
+\begin{verbatim}
+src/
+  graph/
+    settings.py        # §12.1
+    connection.py      # §12.1
+    models.py          # §12.2
+    extractor.py       # §12.2
+    query.py           # §12.3
+    routing.py         # §12.4
+    kg_graph.py        # §12.4
+    consistency.py     # §12.5
+prompts/
+  entity_extraction_v1.jinja2   # §12.2
+  cypher_generation_v1.py       # §12.3
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{One Connection, Two Chains, Zero Hardcodes}
+\label{sec:kg-connection}
+%% ------------------------------------------------------------
+
+The design problem is that a Neo4j connection requires a URL, a username,
+and a password, and in every codebase where these values have been written
+directly into a function call, at least one of them has eventually appeared
+in a git commit. The naive approach --- passing strings from a
+\code{settings.py} file that reads from a \code{.env} --- is not wrong, but
+it leaves the secret type invisible: a plain \code{str} field for a password
+is a loading dock left permanently open. The governing principle is that
+credentials live in typed settings objects, passwords are \code{SecretStr}
+so that their values are never included in log output or \code{repr()}, and
+the connection object is constructed once and shared by reference.
+
+\code{pydantic-settings} --- a library that maps environment variables to
+Pydantic models with automatic type coercion --- is the mechanism. A
+\code{BaseSettings} subclass declares each required variable as a typed
+field; the framework reads the corresponding environment variable at
+construction time and raises a \code{ValidationError} immediately if any
+required variable is absent. This means the process fails at startup, not
+mid-request, which is the correct failure mode for missing credentials.
+
+\begin{lstlisting}[language=Python,
+  caption={Neo4j settings model with typed secret field},
+  label={lst:neo4j-settings}]
+# src/graph/settings.py
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings
+
+class Neo4jSettings(BaseSettings):
+    neo4j_url: str           # bolt://host:7687
+    neo4j_user: str
+    neo4j_password: SecretStr
+    neo4j_database: str = "neo4j"
+
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+    }
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:neo4j-settings} deserve explanation.
+\code{SecretStr} is not cosmetic: Pydantic renders its value as
+\code{**********} in any \code{str()} or \code{repr()} call, and
+\code{get\_secret\_value()} is the only method that returns the raw string.
+This prevents the password from appearing in tracebacks, log lines, or any
+serialisation that Langfuse (Chapter~23) may attach to a span.
+The \code{neo4j\_database} field defaults to \code{"neo4j"} because the
+default database name in both Community and Enterprise editions is
+\code{"neo4j"}; teams that use named databases for tenant isolation can
+override it per environment without changing code.
+
+With the settings model defined, the connection and chain singletons can
+be built. \code{Neo4jGraph} is the low-level interface: it wraps a Neo4j
+Bolt driver and exposes \code{query()}, \code{refresh\_schema()}, and
+\code{add\_graph\_documents()}. Two constructor parameters that affect
+production behaviour need explicit values. \code{sanitize=True} strips
+list-valued properties with more than 128 elements from query results ---
+without it, a node that accumulated embedding-like float arrays in its
+payload would flood the context window of the Cypher QA chain.
+\code{enhanced\_schema=False} is the correct production default: when
+\code{True}, the schema refresh scans the entire database for example
+values, which is a full-table scan at the scale of an agent memory graph
+and will time out or degrade throughput during peak load.
+
+\begin{warningbox}
+\code{Neo4jGraph} implements \code{\_\_enter\_\_} and \code{\_\_exit\_\_},
+and the official documentation carries an explicit \textbf{Danger} notice
+against relying on \code{\_\_del\_\_} for resource cleanup. Always open a
+\code{Neo4jGraph} inside a \code{with} block or call \code{graph.close()}
+in a \code{finally} clause. A connection that is not explicitly closed will
+hold a Bolt session open until the process exits, which can exhaust the
+connection pool under concurrent load.
+\end{warningbox}
+
+\code{GraphCypherQAChain} --- a LangChain chain that translates a
+natural-language question into a Cypher query, executes it, and
+post-processes the raw results into a natural-language answer --- is the
+high-level interface. It can be constructed with a single \code{llm=}
+argument, but in production the Cypher generation and the answer
+post-processing are different tasks with different accuracy requirements.
+Cypher generation requires a model that reliably follows schema constraints
+and produces syntactically valid query strings; answer post-processing is
+closer to summarisation and tolerates a cheaper, faster model. The
+\code{from\_llm()} factory accepts separate \code{cypher\_llm=} and
+\code{qa\_llm=} arguments for this split.
+
+\begin{notebox}
+\code{allow\_dangerous\_requests=True} is a class attribute on
+\code{GraphCypherQAChain}, forwarded to \code{\_\_init\_\_} via
+\code{**kwargs} from \code{from\_llm()}. The chain raises a
+\code{ValueError} at construction time if this attribute is not set to
+\code{True}. This is a deliberate security opt-in: the chain executes
+LLM-generated Cypher against a live database, which is a write-capable
+interface. The flag exists so that the decision to accept that risk is
+explicit in every call site.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={Neo4jGraph and GraphCypherQAChain factory functions},
+  label={lst:neo4j-connection}]
+# src/graph/connection.py
+from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
+from langchain_community.chat_models import ChatLiteLLM
+from src.graph.settings import Neo4jSettings
+
+def build_neo4j_graph(settings: Neo4jSettings) -> Neo4jGraph:
+    return Neo4jGraph(
+        url=settings.neo4j_url,
+        username=settings.neo4j_user,
+        password=settings.neo4j_password.get_secret_value(),
+        database=settings.neo4j_database,
+        sanitize=True,
+        refresh_schema=True,
+        enhanced_schema=False,
+    )
+
+def build_cypher_qa_chain(
+    graph: Neo4jGraph,
+    cypher_llm_model: str = "gpt-4o",
+    qa_llm_model: str = "gpt-4o-mini",
+) -> GraphCypherQAChain:
+    cypher_llm = ChatLiteLLM(model=cypher_llm_model)
+    qa_llm     = ChatLiteLLM(model=qa_llm_model)
+    return GraphCypherQAChain.from_llm(
+        cypher_llm=cypher_llm,
+        qa_llm=qa_llm,
+        graph=graph,
+        validate_cypher=True,
+        return_intermediate_steps=True,
+        use_function_response=False,
+        allow_dangerous_requests=True,
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:neo4j-connection} deserve explanation.
+\code{return\_intermediate\_steps=True} is not optional for a production
+system: it causes \code{chain.invoke()} to return the generated Cypher
+string and the raw database results alongside the final answer, which
+Chapter~23 attaches as span metadata in Langfuse. Without it, a wrong
+answer is undebuggable because the Cypher that produced it is invisible.
+\code{use\_function\_response=False} is set explicitly because not all
+models proxied through LiteLLM support the function-calling wrapping that
+this flag activates; leaving it at its default avoids a
+provider-specific capability assumption. The \code{ChatLiteLLM} wrapper is
+used rather than a provider-specific chat model to stay consistent with the
+LiteLLM abstraction established in Chapter~5: swapping models requires a
+string change, not a dependency swap.
+
+\begin{notebox}
+\code{langchain-neo4j} also exports \code{Neo4jSaver} (synchronous) and
+\code{AsyncNeo4jSaver} (asynchronous), both implementing
+\code{BaseCheckpointSaver} --- the LangGraph checkpoint saver interface
+introduced in Chapter~3. If Neo4j is already in the infrastructure stack,
+the same instance can serve as a LangGraph checkpoint backend. The
+\code{Neo4jSaver} is opened as a context manager:
+\code{with Neo4jSaver.from\_conn\_string(uri, user, password) as saver:},
+and \code{saver.setup()} must be called once inside that context to create
+the required indexes. The library also exports
+\code{Neo4jChatMessageHistory}, a \code{BaseChatMessageHistory}
+implementation that stores conversation turns as graph nodes, which
+Chapter~7 covers as an alternative to in-memory message history.
+\end{notebox}
+
+The connection and chain are now singletons that every subsequent section
+consumes. The next problem is filling the graph with structured knowledge
+extracted from raw memory text.
+
+
+%% ------------------------------------------------------------
+\section{Structure Is Extracted, Not Stored}
+\label{sec:kg-extraction}
+%% ------------------------------------------------------------
+
+The design problem is that memories arrive as unstructured text. A memory
+entry such as ``The user completed a multi-step data pipeline using GPT-4o
+and LangGraph, triggered by a Celery beat task'' contains at least three
+facts --- user used GPT-4o, user used LangGraph, pipeline triggered by
+Celery --- but a vector store represents this as a single embedding. A
+knowledge graph can represent each fact as a separate, traversable edge.
+The naive approach is to write the text directly to Neo4j as a node
+property, which stores the string but not the structure: queries that ask
+``what tools did this user use?'' still require full-text search, not graph
+traversal. The governing principle is that structure must be extracted
+before the write, validated before it reaches the database, and stored in
+a form that makes relational queries possible.
+
+The extraction pipeline has three responsibilities: call the LLM to
+produce a list of \code{(subject, predicate, object)} triples, validate
+the list with a Pydantic model that rejects empty output, and convert the
+validated triples into \code{GraphDocument} objects that
+\code{add\_graph\_documents()} can consume. Each responsibility is
+isolated in its own function so that each can be tested and replaced
+independently.
+
+\begin{lstlisting}[language=Python,
+  caption={Triple and ExtractionResult Pydantic models},
+  label={lst:triple-models}]
+# src/graph/models.py
+from pydantic import BaseModel, model_validator
+
+class Triple(BaseModel):
+    subject:      str
+    predicate:    str
+    object_:      str           # not "object" — Python builtin
+    subject_type: str = "Entity"
+    object_type:  str = "Entity"
+
+class ExtractionResult(BaseModel):
+    triples: list[Triple]
+
+    @model_validator(mode="after")
+    def must_have_triples(self) -> "ExtractionResult":
+        if not self.triples:
+            raise ValueError(
+                "LLM extraction returned zero triples; "
+                "refusing to write empty graph document"
+            )
+        return self
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:triple-models} deserve explanation.
+The field is named \code{object\_} rather than \code{object} because
+\code{object} is a Python builtin; shadowing it inside a class body causes
+no runtime error but produces confusing behaviour when the class is
+introspected or serialised. The \code{subject\_type} and \code{object\_type}
+fields default to \code{"Entity"}: this default activates the
+\code{\_\_Entity\_\_} secondary index that
+\code{add\_graph\_documents(baseEntityLabel=True)} creates, which
+accelerates MERGE operations on frequently-written node types. Teams whose
+memory corpus has a known entity taxonomy can override these fields with
+domain-specific labels (e.g., \code{"User"}, \code{"Tool"},
+\code{"Workflow"}) by prompting the LLM to populate them.
+
+The extraction function calls the same \code{instructor}-patched LiteLLM
+client established in Chapter~11 \S11.6. The conversion function builds
+\code{GraphDocument} objects from the validated triples. One detail in the
+conversion is non-obvious: \code{add\_graph\_documents()} merges source
+documents on the \code{id} field in \code{Document.metadata} when it is
+present, and falls back to an MD5 hash of \code{page\_content} when it is
+not. Using the MD5 fallback means that two memory entries with different
+IDs but identical text would be merged into a single source node,
+destroying provenance. Passing the \code{memory\_id} explicitly as
+\code{metadata=\{"id": memory\_id\}} prevents this.
+
+\begin{lstlisting}[language=Python,
+  caption={Triple extraction and GraphDocument conversion},
+  label={lst:extractor}]
+# src/graph/extractor.py
+import instructor, litellm
+from langchain_core.documents import Document
+from langchain_community.graphs.graph_document import (
+    GraphDocument, Node, Relationship,
+)
+from src.graph.models import Triple, ExtractionResult
+
+_client = instructor.from_litellm(litellm.completion)
+
+def extract_triples(
+    text: str, model: str = "gpt-4o"
+) -> ExtractionResult:
+    return _client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": text}],
+        response_model=ExtractionResult,
+    )
+
+def triples_to_graph_documents(
+    result: ExtractionResult,
+    source_text: str,
+    memory_id: str,
+) -> list[GraphDocument]:
+    source = Document(
+        page_content=source_text,
+        metadata={"id": memory_id},
+    )
+    docs = []
+    for t in result.triples:
+        subj = Node(id=t.subject,  type=t.subject_type)
+        obj  = Node(id=t.object_,  type=t.object_type)
+        rel  = Relationship(source=subj, target=obj, type=t.predicate)
+        docs.append(GraphDocument(
+            nodes=[subj, obj], relationships=[rel], source=source,
+        ))
+    return docs
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={write\_triples\_to\_neo4j with deferred schema refresh},
+  label={lst:write-triples}]
+# src/graph/extractor.py (continued)
+from langchain_neo4j import Neo4jGraph
+
+def write_triples_to_neo4j(
+    graph: Neo4jGraph,
+    result: ExtractionResult,
+    source_text: str,
+    memory_id: str,
+) -> None:
+    graph_docs = triples_to_graph_documents(
+        result, source_text, memory_id
+    )
+    graph.add_graph_documents(
+        graph_docs,
+        include_source=True,
+        baseEntityLabel=True,
+    )
+    graph.refresh_schema()
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:extractor}
+and~\ref{lst:write-triples} deserve explanation. Each \code{Triple}
+produces a separate \code{GraphDocument} with its own source reference
+rather than packing all triples into one document. This is deliberate:
+\code{add\_graph\_documents()} runs one MERGE transaction per document,
+and batching multiple relationships into a single document with a shared
+source node is correct only when all relationships have identical
+provenance. Since each triple is an independently extractable fact, its
+provenance is the source document, not the other triples.
+\code{include\_source=True} writes the \code{Document} as a
+\code{:Document} node in the graph and links it to each entity via a
+\code{MENTIONS} relationship, enabling future queries such as ``which
+memory entries mention GPT-4o?'' --- a provenance query that is free to
+express in Cypher but impossible to express as a vector similarity search.
+\code{graph.refresh\_schema()} is called once after the batch write, not
+inside the loop: schema refresh is a full database scan that reads all
+node labels and relationship types, so calling it per triple would make
+write throughput proportional to schema scan time rather than write time.
+
+The graph now contains structured knowledge. The next problem is querying
+it for multi-hop relational questions that vectors cannot answer.
+
+
+%% ------------------------------------------------------------
+\section{Relational Questions Require Graph Traversal}
+\label{sec:kg-multihop}
+%% ------------------------------------------------------------
+
+The design problem is that LLMs generate syntactically valid Cypher that
+references node labels, relationship types, and property names that do not
+exist in the live schema. This is not a fringe case: it is the expected
+behaviour of a model that has seen Cypher in training data from many
+different graph schemas. A hallucinated label such as \code{:Workflow}
+when the actual label is \code{:Process} produces an empty result
+silently, because Cypher's \code{MATCH} returns zero rows for a
+non-existent label rather than raising an error. The agent interprets the
+empty result as ``no relevant history found'' and proceeds to answer
+incorrectly. Without schema validation, this failure is invisible and
+reproducible on every query that uses the hallucinated label.
+
+\code{validate\_cypher=True} on \code{GraphCypherQAChain} activates the
+\emph{CypherQueryCorrector} --- a post-processor that parses the generated
+Cypher, checks every label and relationship type against
+\code{Neo4jGraph.get\_structured\_schema}, and either corrects minor
+discrepancies or raises a \code{CypherQueryCorrectorException} that the
+chain catches and retries. It is instantiated automatically from the graph
+schema when the chain is constructed; no manual setup is required. The
+corrector cannot fix every hallucination --- a label that bears no
+resemblance to any schema label cannot be corrected --- but it eliminates
+the most common class of failure: capitalisation differences and
+near-matches that the LLM produces when a schema label is in its context
+but not exactly recalled.
+
+\begin{warningbox}
+The second class of Cypher safety risk is data exfiltration: an LLM that
+generates \code{MATCH (n) RETURN n} with no \code{WHERE} clause will
+return every node in the database. The \code{validate\_cypher} corrector
+does not prevent this. The defence is to inject a mandatory tenant
+\code{WHERE} clause into every generated query via a custom
+\code{cypher\_prompt} that the LLM cannot override. The tenant filter is
+not a best-effort guideline in the prompt --- it is structural scaffolding
+that the template imposes on every query regardless of what the LLM
+generates inside it.
+\end{warningbox}
+
+The \code{cypher\_prompt} is a LangChain \code{PromptTemplate} --- not a
+Jinja2 template --- because \code{GraphCypherQAChain.from\_llm()} accepts
+a \code{PromptTemplate} directly for its \code{cypher\_prompt=} parameter.
+The template variables \code{\{schema\}} and \code{\{question\}} are
+consumed by the chain; additional literal text in the template is passed
+to the LLM verbatim. The tenant filter is expressed as a structured rule
+immediately before the output scaffold, making it part of the Cypher the
+LLM is asked to complete rather than a separate instruction it can reason
+around.
+
+\begin{lstlisting}[language=Python,
+  caption={Tenant-filtered Cypher generation prompt template},
+  label={lst:cypher-prompt}]
+# prompts/cypher_generation_v1.py
+from langchain_core.prompts import PromptTemplate
+
+_TEMPLATE = """\
+You are a Cypher expert. Use only the schema below.
+Do not reference labels or properties not in the schema.
+
+Schema:
+{schema}
+
+Rules:
+- Every MATCH must include a WHERE clause that filters
+  on the user_id property of a node already in scope.
+- Return only fields needed to answer the question.
+- Do not use LIMIT unless the question asks for a count.
+
+Question: {question}
+Cypher:"""
+
+def build_tenant_cypher_prompt(user_id: str) -> PromptTemplate:
+    # Inject user_id as structural scaffolding before the
+    # PromptTemplate is constructed so it cannot be omitted
+    # at invocation time.
+    filled = _TEMPLATE.replace(
+        "on the user_id property",
+        f"on the user_id = '{user_id}' property",
+    )
+    return PromptTemplate(
+        input_variables=["schema", "question"],
+        template=filled,
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:cypher-prompt} deserve explanation.
+The \code{user\_id} is substituted into the template string before the
+\code{PromptTemplate} is constructed rather than being passed as an input
+variable. If \code{user\_id} were a template variable, the chain would
+need to supply it at invocation time, creating a call-site dependency that
+is easy to forget and produces a silent empty filter when the value is
+missing. Substituting it at construction time makes the tenant filter a
+structural property of the chain instance, not a runtime parameter.
+The resulting \code{filled} string still contains \code{\{schema\}} and
+\code{\{question\}} as live template variables, which the chain fills
+automatically on every \code{invoke()} call.
+
+With the prompt in place, the query execution function surfaces
+intermediate steps for observability.
+
+\begin{lstlisting}[language=Python,
+  caption={run\_graph\_query with intermediate step extraction},
+  label={lst:run-graph-query}]
+# src/graph/query.py
+from langchain_neo4j import GraphCypherQAChain, Neo4jGraph
+
+def run_graph_query(
+    chain: GraphCypherQAChain,
+    question: str,
+) -> dict:
+    result = chain.invoke({"query": question})
+    steps  = result.get("intermediate_steps", [])
+    return {
+        "answer":     result["result"],
+        "cypher":     steps[0].get("query", "")     if steps else "",
+        "db_results": steps[1].get("context", [])   if len(steps) > 1 else [],
+    }
+
+def direct_cypher_query(
+    graph: Neo4jGraph,
+    cypher: str,
+    params: dict,
+    session_params: dict | None = None,
+) -> list[dict]:
+    return graph.query(
+        cypher,
+        params=params,
+        session_params=session_params or {},
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:run-graph-query} deserve explanation.
+The \code{intermediate\_steps} list is accessed with defensive index
+guards rather than direct subscript, because not all error-recovery paths
+in \code{GraphCypherQAChain} populate both steps: a corrector failure may
+short-circuit execution after the Cypher is generated but before the
+database call. The step dicts are accessed via \code{.get("query")} and
+\code{.get("context")} rather than positional subscript because
+\code{langchain-neo4j} v0.4 stores steps as named dicts with these keys,
+not as bare strings or lists. \code{direct\_cypher\_query()} exists as a
+separate function for write operations and schema management calls that
+should not pass through the LLM-mediated chain; the \code{session\_params}
+argument accepts Neo4j session-level configuration such as database routing
+mode for teams running Enterprise Edition routing policies.
+
+The graph is now queryable for relational questions. The remaining problem
+is deciding, per incoming query, whether the graph path, the vector path,
+or both should be invoked.
+
+
+%% ------------------------------------------------------------
+\section{The Retrieval Decision Is a First-Class Node}
+\label{sec:kg-routing}
+%% ------------------------------------------------------------
+
+The design problem is that the choice between graph traversal and vector
+search is made implicitly in most systems --- either hardcoded in the
+agent prompt, or left to the LLM to reason about in the same turn that
+generates the answer. Both approaches produce unauditable routing
+decisions: there is no record of why a particular retrieval path was
+chosen, and a wrong choice is invisible until the answer is wrong. The
+governing principle is that routing is a first-class node in the
+LangGraph state machine, its decision is written to state as a typed
+value, and the conditional edge that reads it makes the dispatch
+explicit and testable.
+
+The routing decision has three possible values, not two.
+\emph{GRAPH} covers queries that name specific entities and ask about
+the relationships between them --- counting, ordering, path traversal, or
+any question that requires following edges rather than finding similar
+text. \emph{VECTOR} covers semantically open queries where the user
+describes a memory rather than naming an entity; similarity search over
+dense embeddings is the correct tool. \emph{HYBRID} covers queries that
+do both --- the user names an entity but also needs semantic context about
+it that the graph does not carry as a property. A two-value enum forces
+the caller to pick one and silently discards the other signal; three
+values make the hybrid case explicit.
+
+\begin{lstlisting}[language=Python,
+  caption={RoutingDecision enum, RoutingResult model, and KGState},
+  label={lst:routing-types}]
+# src/graph/routing.py
+from enum import Enum
+from pydantic import BaseModel
+from typing_extensions import TypedDict
+from src.retrieval.types import RetrievedPassage
+
+class RoutingDecision(str, Enum):
+    GRAPH  = "graph"
+    VECTOR = "vector"
+    HYBRID = "hybrid"
+
+class RoutingResult(BaseModel):
+    decision: RoutingDecision
+    reason: str
+
+class KGState(TypedDict):
+    query:             str
+    user_id:           str
+    routing_decision:  RoutingDecision | None
+    graph_results:     list[dict]
+    vector_passages:   list[RetrievedPassage]
+    final_context:     str
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:routing-types} deserve explanation.
+\code{RoutingDecision(str, Enum)} inherits from both \code{str} and
+\code{Enum}: the \code{str} mixin ensures that
+\code{routing\_decision.value} returns a plain Python string rather than
+an enum object, which is required because \code{add\_conditional\_edges()}
+path map keys must be plain strings --- passing an enum object as a
+dictionary key would silently miss all path map lookups at runtime.
+The \code{reason} field on \code{RoutingResult} is not used
+programmatically; it is logged to Langfuse (Chapter~23) as span metadata
+so that routing decisions can be audited and their quality assessed
+independently of the final answer quality.
+
+The \code{HYBRID} branch requires converting \code{graph\_results} ---
+a \code{list[dict]} returned by \code{run\_graph\_query()} --- into
+\code{list[RetrievedPassage]} so that the same
+\code{reciprocal\_rank\_fusion()} function from Chapter~11 \S11.4 can
+merge them with vector results. This conversion is the only place where
+the graph retrieval pipeline touches the vector retrieval pipeline's type
+system, and it is intentionally the thinnest possible bridge: one list
+comprehension that assigns rank by position and sets \code{source="graph"}.
+
+\begin{lstlisting}[language=Python,
+  caption={Routing classifier node, route function, and hybrid merge},
+  label={lst:routing-nodes}]
+# src/graph/kg_graph.py
+import instructor, litellm
+from langgraph.graph import StateGraph
+from src.graph.routing import RoutingDecision, RoutingResult, KGState
+from src.retrieval.fusion import reciprocal_rank_fusion
+from src.retrieval.types import RetrievedPassage
+
+_client = instructor.from_litellm(litellm.completion)
+CLASSIFIER_MODEL = "gpt-4o-mini"
+
+def routing_classifier_node(state: KGState) -> dict:
+    result = _client.chat.completions.create(
+        model=CLASSIFIER_MODEL,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Classify this query: graph traversal (GRAPH), "
+                "semantic similarity (VECTOR), or both (HYBRID).\n"
+                f"Query: {state['query']}"
+            ),
+        }],
+        response_model=RoutingResult,
+    )
+    return {"routing_decision": result.decision}
+
+def route_query(state: KGState) -> str:
+    return state["routing_decision"].value
+
+def hybrid_merge_node(state: KGState) -> dict:
+    graph_passages = [
+        RetrievedPassage(
+            id=str(i), text=str(r), score=1.0,
+            rank=i + 1, source="graph", meta=r,
+        )
+        for i, r in enumerate(state["graph_results"])
+    ]
+    fused = reciprocal_rank_fusion(
+        [graph_passages, state["vector_passages"]]
+    )
+    return {"final_context": "\n".join(p["text"] for p in fused)}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Stub retrieval nodes and KG StateGraph assembly},
+  label={lst:kg-graph}]
+# src/graph/kg_graph.py (continued)
+
+def graph_retrieval_node(state: KGState) -> dict:
+    # Inject GraphCypherQAChain via context_schema (Ch. 12 §12.3).
+    raise NotImplementedError("inject chain via context_schema")
+
+def vector_retrieval_node(state: KGState) -> dict:
+    # Inject QdrantVectorStore + Ranker via context_schema (Ch. 11).
+    raise NotImplementedError("inject store via context_schema")
+
+def build_kg_graph() -> StateGraph:
+    builder = StateGraph(state_schema=KGState)
+    builder.add_node("routing_classifier", routing_classifier_node)
+    builder.add_node("graph_retrieval",    graph_retrieval_node)
+    builder.add_node("vector_retrieval",   vector_retrieval_node)
+    builder.add_node("hybrid_merge",       hybrid_merge_node)
+    builder.set_entry_point("routing_classifier")
+    builder.add_conditional_edges(
+        "routing_classifier",
+        route_query,
+        {
+            "graph":  "graph_retrieval",
+            "vector": "vector_retrieval",
+            "hybrid": "hybrid_merge",
+        },
+    )
+    builder.add_edge("graph_retrieval",  "__end__")
+    builder.add_edge("vector_retrieval", "__end__")
+    builder.add_edge("hybrid_merge",     "__end__")
+    return builder.compile()
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:routing-nodes}
+and~\ref{lst:kg-graph} deserve explanation.
+\code{StateGraph(state\_schema=KGState)} uses the \code{state\_schema=}
+parameter, not the deprecated \code{config\_schema=} removed in
+LangGraph v0.6.0. Runtime singletons such as the
+\code{GraphCypherQAChain} and the \code{QdrantVectorStore} are injected
+via \code{context\_schema=} when immutable per-run context is needed, which
+keeps the node signatures free of infrastructure dependencies. The
+\code{route\_query()} function returns
+\code{state["routing\_decision"].value} --- the plain string value ---
+because \code{add\_conditional\_edges()} path map keys must be plain
+strings; returning the enum object directly would silently fail all path
+map lookups. In \code{hybrid\_merge\_node()}, graph results are converted
+to \code{RetrievedPassage} with \code{source="graph"} and rank assigned
+by position, then merged via the existing \code{reciprocal\_rank\_fusion()}
+with its default \code{k=60}: no new merging logic is introduced, and
+Chapter~11's variadic \code{ranked\_lists} argument is exactly the
+extension point that makes this zero-change integration possible.
+
+The routing layer makes the retrieval decision transparent and
+dispatchable. The final problem is ensuring that every memory written to
+Neo4j is immediately cross-referenced in mem0, so that the two stores do
+not drift apart.
+
+
+%% ------------------------------------------------------------
+\section{Two Stores Converge, Never Synchronise}
+\label{sec:kg-consistency}
+%% ------------------------------------------------------------
+
+The design problem is that the system now writes to two stores on the same
+event: \code{write\_triples\_to\_neo4j()} writes structured facts to Neo4j,
+and mem0 holds the original memory blob. If the two writes happen
+independently, a failure in either one produces an inconsistency that is
+silent at the call site. The naive approach is to treat them as equivalent
+and execute them in an arbitrary order, accepting that either can fail
+first. The governing principle is that the stores are not equivalent ---
+Neo4j holds the canonical structured representation, and the mem0 metadata
+tag is a derived cross-reference --- and this asymmetry determines a
+non-arbitrary write order.
+
+Neo4j must be written first. The reasoning is about failure modes, not
+performance. If the Neo4j write fails, the mem0 additive tag is never
+created, and no cross-reference points to a non-existent entity; the
+system remains consistent. If Neo4j succeeds and the mem0 tag write
+subsequently fails, the entity exists in the graph and is queryable via
+Cypher, the mem0 memory blob is retrievable via vector search, and only
+the cross-reference link is missing --- a gap that can be retried
+independently using the tenacity patterns from Chapter~27. If mem0 were
+written first and the Neo4j write then failed, the cross-reference would
+point to an entity that does not exist in the graph, producing a silent
+query failure with no self-healing path.
+
+\begin{notebox}
+The mem0 v3 API is \emph{additive-only}. There is no
+\code{MemoryClient.update(metadata=...)} method that patches the metadata
+of an existing memory in place. The correct pattern for attaching a
+\code{graph\_entities} tag to a memory is to call \code{client.add()}
+with \code{infer=False} and a structured message. This creates a new
+additive memory entry that carries the cross-reference; the original
+memory is not mutated. The \code{infer=False} flag bypasses the mem0
+extraction pipeline, which would otherwise attempt to derive additional
+memories from the message content and could produce spurious entries.
+\end{notebox}
+
+The \code{ConsistencyResult} model records both write outcomes and the
+\code{event\_id} returned by the mem0 \code{add()} call. The mem0 v3
+\code{add()} endpoint is asynchronous at the platform level: it returns
+\code{\{"status": "PENDING", "event\_id": "..."\}} immediately, and the
+tag does not appear in \code{client.search()} results until the background
+job completes. The \code{event\_id} is stored so that the Langfuse alert
+(Chapter~23) and the retry scheduler (Chapter~27) have a stable identifier
+to reference when polling for completion or re-submitting a failed tag.
+
+\begin{lstlisting}[language=Python,
+  caption={ConsistencyResult model and sync\_graph\_to\_mem0()},
+  label={lst:consistency}]
+# src/graph/consistency.py
+from pydantic import BaseModel
+from mem0 import MemoryClient
+from langchain_neo4j import Neo4jGraph
+from src.graph.models import ExtractionResult
+from src.graph.extractor import write_triples_to_neo4j
+
+class ConsistencyResult(BaseModel):
+    neo4j_written:   bool
+    mem0_add_queued: bool
+    mem0_event_id:   str | None
+    memory_id:       str
+    entity_count:    int
+
+def sync_graph_to_mem0(
+    graph: Neo4jGraph,
+    mem0_client: MemoryClient,
+    memory_id: str,
+    text: str,
+    result: ExtractionResult,
+    user_id: str,
+) -> ConsistencyResult:
+    write_triples_to_neo4j(graph, result, text, memory_id)
+    entity_names = [t.subject for t in result.triples]
+    resp = mem0_client.add(
+        messages=[{
+            "role": "system",
+            "content": f"Linked graph entities: {entity_names}",
+        }],
+        user_id=user_id,
+        metadata={
+            "graph_entities":    entity_names,
+            "linked_memory_id":  memory_id,
+        },
+        infer=False,
+    )
+    event_id = (
+        resp.get("event_id") if isinstance(resp, dict) else None
+    )
+    return ConsistencyResult(
+        neo4j_written=True,
+        mem0_add_queued=event_id is not None,
+        mem0_event_id=event_id,
+        memory_id=memory_id,
+        entity_count=len(entity_names),
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:consistency} deserve explanation.
+\code{neo4j\_written=True} is set on the success path only because
+\code{write\_triples\_to\_neo4j()} raises on failure --- the
+\code{ConsistencyResult} is never constructed when the Neo4j write fails.
+Chapter~27 wraps \code{sync\_graph\_to\_mem0()} with a tenacity retry
+decorator that catches those exceptions and handles the failure path
+without this function needing to encode retry logic. The
+\code{entity\_names} list uses only the \code{subject} field of each
+triple, not \code{object\_}: object-position values are often generic
+strings (\code{"true"}, \code{"None"}, \code{"2026-01-01"}) that pollute
+the cross-reference tag with values that carry no graph traversal utility.
+The \code{isinstance(resp, dict)} guard handles the case where the mem0
+client version returns a response object rather than a raw dict; the
+\code{event\_id} extraction degrades to \code{None} rather than raising an
+\code{AttributeError} that would incorrectly mark the Neo4j write as
+failed.
+
+Chapter~13 builds the semantic caching layer that sits in front of the
+entire retrieval system --- both the vector pipeline from Chapter~11 and
+the graph pipeline from this chapter --- and prevents redundant LLM and
+database calls for queries that have been answered recently.
