@@ -1,8 +1,1329 @@
 %% ============================================================
 %%  Chapter 14 --- Tool Design: The Production Action Interface
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langchain-core >= 0.3.0,
+%%                langgraph >= 0.2.0,
+%%                pydantic >= 2.7.0,
+%%                langfuse >= 2.35.0,
+%%                tenacity >= 8.3.0,
+%%                pytest >= 8.0.0
 %% ============================================================
 
-\chapterquote{A tool without a schema is a function with undocumented side effects.}{anon}
+\chapterquote{A tool without a contract is a loaded gun with no safety.}{anon}
 
-% TODO: Chapter 14 content
+The production failure this chapter prevents is quiet and systematic. An
+agent given access to a file-deletion tool will eventually delete the wrong
+file --- not because the LLM is malicious, but because prompt instructions
+such as ``only delete files in the \code{/tmp} directory'' are advisory text
+that the LLM interprets, not enforceable boundaries that Python checks.
+The same agent in a multi-tenant deployment, where two simultaneous runs
+share a module-level tool dictionary, will occasionally invoke a tool
+registered by a higher-privilege run simply because both runs can reach
+the same Python namespace. Neither failure raises an exception or appears
+in a log; each manifests as a wrong action executed with full confidence.
+The cost is not the individual action but the trust: once an agent has
+performed one unintended mutation, every subsequent action it takes must
+be audited manually.
+
+The solution this chapter builds has four layers. The first is a
+\emph{contract layer}: every tool carries a Pydantic input schema and a
+matching Pydantic output schema, both validated at invocation time, so the
+boundary between the LLM's text world and the agent's typed state world is
+machine-checked rather than prose-described. The second is an
+\emph{inventory layer}: a \code{ToolRegistry} scoped per agent run, not
+shared across runs, so the tools reachable from any run are exactly and
+only the tools that run was constructed with. The third is an
+\emph{access-control layer}: a \code{PolicyConfig} that enforces which
+tools each agent type may invoke in Python code, making enforcement
+independent of what the LLM was told. The fourth is an
+\emph{observability layer}: a \code{ToolInvocationRecord} emitted to
+Langfuse on every invocation --- success, failure, and denial --- so the
+full action history of every run is reconstructible without log parsing.
+
+The sections must be read in order because each one closes a gap the
+previous one left open. Section~\ref{sec:tool-contracts} establishes the
+contract layer; without typed schemas, there is no meaningful boundary to
+enforce. Section~\ref{sec:tool-registry} adds the inventory layer and
+defines the scoping that makes multi-run isolation possible.
+Section~\ref{sec:tool-policy} adds the access-control layer; it depends on
+the registry established in Section~\ref{sec:tool-registry} because policy
+enforcement happens inside registry lookups. Section~\ref{sec:tool-sandbox}
+hardens code-execution tools against resource exhaustion, a failure mode
+unique to that tool class. Section~\ref{sec:tool-errors} shows how failures
+in any of the prior layers become structured graph-routing signals rather
+than unhandled exceptions. Section~\ref{sec:tool-retry} adds per-tool retry
+before the fallback branch fires, handling the transient-error case that
+structured routing alone cannot. Section~\ref{sec:tool-audit} closes the
+observability layer across all prior sections. Section~\ref{sec:tool-node}
+assembles the runtime: a parallel tool node that calls the registry, emits
+audit records, and hands a structured result list back to the graph.
+Section~\ref{sec:tool-tests} verifies all four invariants in isolation.
+
+This chapter introduces seven terms defined in
+Table~\ref{tab:ch14-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~14}
+\label{tab:ch14-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{StrictToolInputBase} &
+  \code{BaseModel} subclass whose \code{\_\_init\_subclass\_\_} walker
+  rejects \code{Any}-typed and bare-\code{dict} fields at class definition
+  time; the required base for all tool input schemas. \\
+\code{ToolRegistry} &
+  Per-run scoped container that maps tool names to \code{StructuredTool}
+  instances; the only legal source of tool references for a given agent run. \\
+\code{PolicyConfig} &
+  Pydantic model declaring which tool names each \code{agent\_type} may
+  invoke; enforced inside \code{ToolRegistry.get\_tool()}, never in
+  system prompts. \\
+\code{ToolAccessDeniedError} &
+  \code{ToolException} subclass raised by \code{ToolRegistry.get\_tool()}
+  when the requested tool is absent from the run's \code{PolicyConfig};
+  carries \code{tool\_name}, \code{agent\_type}, \code{run\_id}, and
+  \code{allowed\_tools}. \\
+\code{SandboxResult} &
+  Pydantic model returned by \code{sandboxed\_run()}; carries
+  \code{timed\_out: bool} and \code{oom\_killed: bool} flags that the
+  graph routing logic reads without string-parsing stderr. \\
+\code{ToolInvocationRecord} &
+  Pydantic model (defined in Ch.~1 \S1.4) capturing every call's
+  \code{tool\_name}, \code{args}, \code{result}, \code{error},
+  \code{latency\_ms}, and \code{agent\_id}; emitted to Langfuse. \\
+\code{ToolLayerState} &
+  \code{TypedDict} graph state schema for the tool layer:
+  \code{messages}, \code{tool\_errors}, \code{last\_tool\_invocations}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{verbatim}
+src/
+  tools/
+    base.py          # §14.1 — StrictToolInputBase, build_structured_tool()
+    registry.py      # §14.2 — ToolRegistry, per-run scoped inventory
+    policy.py        # §14.3 — PolicyConfig, PolicyRegistry,
+                     #          ToolAccessDeniedError
+    sandbox.py       # §14.4 — sandboxed_run(), SandboxResult
+    errors.py        # §14.5 — ToolException hierarchy, routing helpers
+    retry.py         # §14.6 — RetryConfig, with_retry()
+    audit.py         # §14.7 — ToolInvocationRecord, invoke_and_record()
+    node.py          # §14.8 — audited_tool_node(), build_tool_node()
+    state.py         # §14.8 — ToolLayerState TypedDict
+tests/
+  tools/
+    test_policy.py   # §14.9
+    test_sandbox.py  # §14.9
+    test_audit.py    # §14.9
+    test_retry.py    # §14.9
+\end{verbatim}
+
+
+\section{Tool Contracts Must Be Machine-Readable}
+\label{sec:tool-contracts}
+
+The design problem is that a tool's input and output are fully defined by
+its Python signature and docstring --- both invisible to the type system at
+runtime and both unverifiable by anything downstream. The naive approach is
+to trust that the LLM will provide well-formed arguments and that the tool
+will return a sensible value; this trust breaks the moment the LLM
+hallucinates a field name, omits a required argument, or the tool returns a
+raw string where the graph state reducer expects a typed object. The
+principle is that every tool carries a Pydantic schema for its input
+\emph{and} its output, validated at invocation time, so that type errors
+are structural failures with a clear location rather than silent data
+corruption that surfaces five nodes later.
+
+LangChain's \code{StructuredTool} already requires an \code{args\_schema}
+Pydantic model for input, so the input side has a defined hook. The output
+side has no built-in enforcement: \code{StructuredTool.invoke()} returns
+whatever the underlying \code{func} returns, without validation. The
+\code{build\_structured\_tool()} factory closes this gap by wrapping every
+\code{func} in a \emph{validated closure} that calls
+\code{return\_schema.model\_validate(raw\_result)} before returning. If
+validation fails, a \code{ToolValidationError} --- a \code{ToolException}
+subclass defined in Section~\ref{sec:tool-errors} --- is raised rather than
+a bare \code{ValidationError}, keeping every failure within the
+\code{ToolException} hierarchy that the graph routing logic understands.
+
+The input schema constraint goes further than Pydantic's default
+configuration allows. Two weaknesses survive in a plain \code{BaseModel}
+subclass: \code{extra="allow"} (the default) accepts fields the LLM
+hallucinates and passes them silently into \code{func}; and \code{Any}-typed
+fields bypass validation entirely, turning a schema into a commented-out
+no-op. Both weaknesses are closed on the base class so that every tool
+schema inherits them automatically. \code{StrictToolInputBase} sets
+\code{model\_config = \{"extra": "forbid"\}} and adds an
+\code{\_\_init\_subclass\_\_} class-construction hook that walks the
+subclass's \code{model\_fields} and raises \code{TypeError} if any field
+is annotated \code{Any} or bare \code{dict} without type parameters.
+
+\begin{lstlisting}[language=Python,
+  caption={StrictToolInputBase and the return-schema validated factory},
+  label={lst:tool-base}]
+# src/tools/base.py
+from typing import Any, Callable, Awaitable, get_args, get_origin
+from pydantic import BaseModel
+from langchain_core.tools import StructuredTool
+
+class StrictToolInputBase(BaseModel):
+    model_config = {"arbitrary_types_allowed": False,
+                    "extra": "forbid"}
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        for name, info in cls.model_fields.items():
+            ann = info.annotation
+            if ann is Any:
+                raise TypeError(
+                    f"{cls.__name__}.{name}: Any is not allowed "
+                    "in tool input schemas."
+                )
+            if ann is dict or (get_origin(ann) is dict
+                               and Any in get_args(ann)):
+                raise TypeError(
+                    f"{cls.__name__}.{name}: unparameterised dict "
+                    "or dict[str, Any] is not allowed."
+                )
+
+class StrictToolOutputBase(BaseModel):
+    model_config = {"arbitrary_types_allowed": False,
+                    "extra": "ignore"}
+
+def build_structured_tool(
+    name: str,
+    description: str,
+    func: Callable,
+    args_schema: type[StrictToolInputBase],
+    return_schema: type[StrictToolOutputBase],
+    afunc: Callable[..., Awaitable] | None = None,
+) -> StructuredTool:
+    def validated_func(*args: Any, **kwargs: Any) -> StrictToolOutputBase:
+        raw = func(*args, **kwargs)
+        return return_schema.model_validate(
+            raw if isinstance(raw, dict) else raw.model_dump()
+        )
+    return StructuredTool.from_function(
+        func=validated_func,
+        name=name,
+        description=description,
+        args_schema=args_schema,
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:tool-base} deserve explanation. The
+\code{\_\_init\_subclass\_\_} hook runs at \emph{class definition time}, not
+at instantiation or invocation. This means a developer who writes
+\code{class MyInput(StrictToolInputBase): query: Any} receives a
+\code{TypeError} the moment Python imports the module containing that
+class --- before any agent run starts, before any LLM call is made. Early
+failure is the principle: an invalid schema discovered at import time costs
+a stack trace in a developer's terminal; discovered at runtime it costs a
+failed agent action in a production deployment. The \code{validated\_func}
+closure calls \code{model\_validate} on the raw return value and lets any
+\code{ValidationError} propagate; the \code{ToolValidationError} wrapping
+happens in \code{invoke\_and\_record()} (Section~\ref{sec:tool-audit}),
+which is the single point where all tool invocations flow. The
+\code{StrictToolOutputBase} uses \code{extra="ignore"} rather than
+\code{extra="forbid"} because tool implementations frequently return richer
+dicts than the schema declares --- ignoring extra fields is safe here since
+the consumer is the graph state, not the LLM.
+
+\begin{lstlisting}[language=Python,
+  caption={Concrete tool: SearchInput, SearchOutput, build\_search\_tool},
+  label={lst:tool-search}]
+# src/tools/base.py (continued)
+from pydantic import Field
+
+class SearchInput(StrictToolInputBase):
+    query:       str
+    max_results: int = Field(default=5, ge=1, le=20)
+
+class SearchOutput(StrictToolOutputBase):
+    results:     list[str]
+    source_urls: list[str]
+
+def _search_impl(query: str, max_results: int) -> dict:
+    # real implementation calls a search API
+    return {"results": [], "source_urls": []}
+
+def build_search_tool() -> StructuredTool:
+    return build_structured_tool(
+        name="search_web",
+        description=(
+            "Search the web for current information. "
+            "Input: query (str), max_results (int, 1-20). "
+            "Output: results (list[str]), source_urls (list[str]). "
+            "Raises ToolExternalError if the search API is unreachable."
+        ),
+        func=lambda query, max_results: _search_impl(query, max_results),
+        args_schema=SearchInput,
+        return_schema=SearchOutput,
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:tool-search} deserve explanation. The
+\code{description} string names the input format, the output format, and at
+least one failure condition explicitly. This is not documentation discipline
+--- it is the LLM's only source of truth about what arguments to provide
+and what to expect in return. A description that says only ``searches the
+web'' tells the LLM nothing about \code{max\_results} bounds and nothing
+about what to do if the search fails; the LLM will guess both, and its
+guesses will be wrong on the call that matters most. The \code{lambda}
+wrapper in \code{func=} is used rather than passing \code{\_search\_impl}
+directly because \code{StructuredTool.from\_function} infers the
+\code{args\_schema} from the \code{func} signature when no schema is
+provided. Passing the lambda forces schema inference to use
+\code{args\_schema=SearchInput} unambiguously.
+
+The contract layer is now in place. The problem it cannot solve is
+isolation: every tool built by this factory lives in Python memory and is,
+in principle, reachable from any code in the same process. The next section
+establishes the inventory layer that restricts which tools a given agent
+run can reach.
+
+
+\section{Tool Inventory Must Be Scoped, Not Global}
+\label{sec:tool-registry}
+
+The design problem is that shared mutable state is the root cause of
+multi-run isolation failures, and a module-level tool dictionary is shared
+mutable state. The naive approach is a global \code{TOOLS: dict[str,
+StructuredTool] = \{\}} populated at application startup, which is
+convenient in single-agent development but becomes a security boundary
+violation the moment two agent runs with different privilege levels execute
+concurrently: a higher-privilege run registers a \code{delete\_record} tool
+at startup, a lower-privilege run starts before the higher-privilege run
+ends, and nothing in Python prevents the lower-privilege run from calling
+\code{TOOLS["delete\_record"]} directly. The principle is that a
+\code{ToolRegistry} is instantiated once per run, populated during run
+construction, sealed before execution begins, and discarded when the run
+ends --- it is never shared.
+
+The \code{ToolRegistry} constructor takes a \code{run\_id: str} and a
+\code{PolicyConfig} (Section~\ref{sec:tool-policy}). The \code{run\_id} is
+stored and checked on every \code{get\_tool()} call: if the \code{run\_id}
+passed to \code{get\_tool()} does not match the registry's own
+\code{run\_id}, a \code{RegistryMismatchError} is raised immediately. This
+guard closes the cross-run access pattern that arises when a factory
+function creates a registry, stores it somewhere, and a second call site
+retrieves it with a different run context. The guard is structural --- it
+does not require the caller to be careful, it requires the system to be
+consistent.
+
+\begin{lstlisting}[language=Python,
+  caption={ToolRegistry: per-run scoped inventory with three-layer guard},
+  label={lst:tool-registry}]
+# src/tools/registry.py
+from langchain_core.tools import StructuredTool
+from src.tools.policy import PolicyConfig, ToolAccessDeniedError
+
+class ToolNameConflictError(Exception): ...
+class RegistryMismatchError(Exception): ...
+
+class ToolRegistry:
+    def __init__(self, run_id: str, policy: PolicyConfig) -> None:
+        self._run_id  = run_id
+        self._policy  = policy
+        self._tools:  dict[str, StructuredTool] = {}
+        self._sealed  = False
+
+    def register(self, tool: StructuredTool) -> None:
+        if self._sealed:
+            raise RuntimeError("registry is sealed; register before run start")
+        existing = self._tools.get(tool.name)
+        if existing is not None and existing is not tool:
+            raise ToolNameConflictError(
+                f"Tool '{tool.name}' already registered with a different object."
+            )
+        self._tools[tool.name] = tool
+
+    def seal(self) -> None:
+        self._sealed = True
+
+    def get_tool(self, name: str, run_id: str) -> StructuredTool:
+        if run_id != self._run_id:
+            raise RegistryMismatchError(
+                f"run_id mismatch: expected {self._run_id!r}, got {run_id!r}"
+            )
+        if name not in self._policy.allowed_tool_names:
+            raise ToolAccessDeniedError(
+                tool_name=name, agent_type=self._policy.agent_type,
+                run_id=run_id,
+                allowed_tools=self._policy.allowed_tool_names,
+            )
+        try:
+            return self._tools[name]
+        except KeyError:
+            raise KeyError(f"Tool '{name}' not registered in this run.")
+
+    def list_tools(self) -> list[str]:
+        return list(self._tools)
+
+    def as_tool_list(self) -> list[StructuredTool]:
+        return list(self._tools.values())
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:tool-registry} deserve explanation.
+The \code{seal()} method exists because \code{register()} must be callable
+only during run construction, before any graph execution begins. Without a
+seal, a node running inside the graph could register a new tool mid-run,
+silently expanding the tool surface after policy was applied. The
+\code{\_sealed} flag makes this a runtime \code{RuntimeError} rather than a
+footgun that requires callers to agree not to register tools after
+construction. The \code{get\_tool()} method executes its three guards in a
+deliberate order: run-ID mismatch first, policy check second, key lookup
+third. Swapping the policy check and key lookup would mean that an
+unregistered tool in a policy-violating run raises \code{KeyError} rather
+than \code{ToolAccessDeniedError}, leaking information about what tools are
+registered. Policy denial must be reported before revealing whether the
+tool exists. The \code{as\_tool\_list()} method returns
+\code{list(self.\_tools.values())} --- a snapshot copy, not a view of the
+internal dict --- so the caller cannot mutate registry state through the
+returned list.
+
+\begin{warningbox}
+\code{register()} is not thread-safe. The \code{ToolRegistry} is designed
+to be populated sequentially during run construction, before any async or
+multi-threaded graph execution begins. If your run-construction logic
+populates the registry from multiple threads, add a \code{threading.Lock}
+around \code{register()} calls. Once \code{seal()} is called,
+\code{get\_tool()} is safe to call concurrently because it performs only
+reads on \code{\_tools} and \code{\_policy}.
+\end{warningbox}
+
+The inventory layer now ensures that each run sees only the tools
+registered for it. The remaining problem is that registering a tool in a
+run does not mean every agent \emph{type} within that run should be able to
+call it. The next section adds the access-control layer that distinguishes
+between ``available in this run'' and ``permitted for this agent type.''
+
+
+\section{Access Control Must Live in Code, Not in Prompts}
+\label{sec:tool-policy}
+
+The design problem is that the two most common forms of LLM tool
+restriction --- system prompt instructions and tool list filtering --- both
+have the same flaw: they are advisory, not enforceable. A system prompt
+that says ``you may only use \code{search\_web}'' is a natural-language
+instruction that the LLM interprets probabilistically; a jailbreak, a
+long context that dilutes the instruction, or a sufficiently unusual query
+can cause the LLM to emit a \code{tool\_call} for a tool it was told not
+to use, and LangGraph's \code{ToolNode} will execute it without question.
+Filtering the tool list passed to the LLM helps but is not sufficient
+either: the LLM may still emit a \code{tool\_call} by name if it learned
+the tool's name from context. The principle is that access control is a
+runtime check inside \code{ToolRegistry.get\_tool()}, in Python, before
+\code{StructuredTool.invoke()} is called --- a check the LLM cannot
+bypass regardless of what it generates.
+
+The \code{PolicyConfig} model is minimal by design. It carries exactly two
+fields: \code{agent\_type: str} and \code{allowed\_tool\_names:
+frozenset[str]}. The type is \code{frozenset} rather than \code{list}
+because policy is immutable after construction --- a \code{list} is a
+signal that items can be appended at runtime, which would undermine the
+least-privilege guarantee. Pydantic coerces \code{list[str]} input (from a
+JSON config file) to \code{frozenset[str]} automatically via a
+\code{field\_validator}. There is deliberately no \code{default\_allow}
+flag: any tool not present in \code{allowed\_tool\_names} is denied.
+Implicit allow is the most common source of privilege escalation in
+agentic systems, and it must not be a configuration option.
+
+\begin{lstlisting}[language=Python,
+  caption={PolicyConfig, PolicyRegistry, and ToolAccessDeniedError},
+  label={lst:tool-policy}]
+# src/tools/policy.py
+from pathlib import Path
+from pydantic import BaseModel, field_validator, model_validator
+
+class ToolAccessDeniedError(Exception):
+    def __init__(self, tool_name: str, agent_type: str,
+                 run_id: str, allowed_tools: frozenset[str]) -> None:
+        self.tool_name     = tool_name
+        self.agent_type    = agent_type
+        self.run_id        = run_id
+        self.allowed_tools = allowed_tools
+        super().__init__(
+            f"Agent '{agent_type}' may not call '{tool_name}'. "
+            f"Allowed: {sorted(allowed_tools)}"
+        )
+
+class PolicyConfig(BaseModel):
+    agent_type:         str
+    allowed_tool_names: frozenset[str]
+
+    @field_validator("allowed_tool_names", mode="before")
+    @classmethod
+    def coerce_to_frozenset(cls, v: object) -> frozenset[str]:
+        return frozenset(v)  # type: ignore[arg-type]
+
+class PolicyRegistry(BaseModel):
+    policies: dict[str, PolicyConfig]
+
+    @model_validator(mode="after")
+    def assert_key_consistency(self) -> "PolicyRegistry":
+        for key, cfg in self.policies.items():
+            if cfg.agent_type != key:
+                raise ValueError(
+                    f"Policy key '{key}' does not match "
+                    f"agent_type '{cfg.agent_type}'."
+                )
+        return self
+
+    def get(self, agent_type: str) -> PolicyConfig:
+        return self.policies[agent_type]
+
+def load_policy_registry(path: Path) -> PolicyRegistry:
+    return PolicyRegistry.model_validate_json(path.read_text())
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:tool-policy} deserve explanation.
+\code{ToolAccessDeniedError} stores all four fields as instance attributes
+rather than packing them only into the string message. The
+\code{invoke\_and\_record()} function in Section~\ref{sec:tool-audit}
+reads these fields directly to populate the \code{ToolInvocationRecord}'s
+\code{error} field as a JSON object --- structured data, not a parsed
+string. The \code{PolicyRegistry}'s \code{model\_validator} checks
+key-value consistency because a JSON config file edited by hand can
+trivially produce \code{policies["researcher"]: \{agent\_type: "admin",
+...\}}, a misconfiguration that would grant the researcher agent admin-level
+access under a mismatched key. The validator makes this a load-time
+\code{ValidationError} rather than a silent runtime grant.
+\code{load\_policy\_registry()} uses \code{model\_validate\_json} rather
+than loading JSON and calling \code{model\_validate(dict)}: the JSON path
+is slightly faster and, more importantly, the error messages from
+\code{model\_validate\_json} include byte offsets into the JSON text, which
+makes malformed policy files easier to locate and fix.
+
+\begin{notebox}
+The \code{PolicyRegistry} is loaded once at application startup and is
+read-only thereafter. It must \emph{not} be reloaded between requests or
+between agent runs without a full application restart and policy audit. A
+hot-reload pattern that swaps the registry mid-deployment can grant a new
+tool to an in-flight run that started under the old policy, producing a
+policy violation that is invisible in the audit log because the violation
+occurred in the gap between policy versions.
+\end{notebox}
+
+Policy is now enforced at the code level for every tool access. The next
+category of tool failure is not about which tool runs but about what that
+tool consumes while running --- the class of tools that execute arbitrary
+code and can consume unbounded memory or run indefinitely requires an
+additional containment layer.
+
+
+\section{Code Execution Tools Require Two-Layer Containment}
+\label{sec:tool-sandbox}
+
+The design problem is that a tool executing agent-directed code inside the
+host process shares the host's memory, open file descriptors, and signal
+handlers --- a runaway \code{while True: pass} loop consumes a CPU core
+indefinitely; a \code{' ' * (1024**3)} allocation evicts the host
+process's working set from RAM; a \code{sys.exit(1)} call inside the tool
+terminates the entire agent server. The naive approach is to set a
+wall-clock timeout on the tool call, which catches the infinite loop but
+does nothing for the memory bomb, because a process can allocate several
+gigabytes in the time between two timeout checks. The principle is that
+code-execution tools run in a child process with two independent resource
+limits: a wall-clock timeout and a virtual memory cap, applied before the
+child process's Python interpreter even begins executing the user's code.
+
+The two-layer defence uses \code{subprocess.run()} for process isolation
+and \code{resource.setrlimit()} for memory containment. \code{subprocess}
+creates a child process with its own address space, making any crash,
+memory exhaustion, or runaway loop a child-process event that the parent
+catches and handles. \code{resource.setrlimit(resource.RLIMIT\_AS, (cap,
+cap))} sets the virtual address space limit on the child before any user
+code runs, via the \code{preexec\_fn} argument. \code{RLIMIT\_AS} is chosen
+over \code{RLIMIT\_DATA} (heap only) because the Python memory allocator
+uses \code{mmap} for large allocations, which bypasses the heap limit but
+is caught by the virtual address space limit. The combined effect is that
+a child that tries to allocate more than \code{max\_memory\_bytes} receives
+\code{SIGKILL} from the kernel immediately --- not after a timeout.
+
+\begin{lstlisting}[language=Python,
+  caption={sandboxed\_run() with two-layer resource containment},
+  label={lst:tool-sandbox}]
+# src/tools/sandbox.py
+import resource, subprocess, sys
+from pydantic import BaseModel
+
+if sys.platform != "linux":
+    raise RuntimeError(
+        "src.tools.sandbox requires Linux; "
+        "use container memory limits on other platforms."
+    )
+
+class SandboxResult(BaseModel):
+    stdout:     str
+    stderr:     str
+    returncode: int
+    timed_out:  bool
+    oom_killed: bool   # heuristic: returncode == -9
+
+def _apply_limits(max_bytes: int) -> None:
+    resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
+
+def sandboxed_run(
+    cmd:              list[str],
+    timeout:          float = 30.0,
+    max_memory_bytes: int   = 256 * 1024 * 1024,
+    env:              dict[str, str] | None = None,
+) -> SandboxResult:
+    try:
+        proc = subprocess.run(
+            cmd, timeout=timeout, capture_output=True,
+            text=True, env=env,
+            preexec_fn=lambda: _apply_limits(max_memory_bytes),
+        )
+        return SandboxResult(
+            stdout=proc.stdout, stderr=proc.stderr,
+            returncode=proc.returncode, timed_out=False,
+            oom_killed=(proc.returncode == -9),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return SandboxResult(
+            stdout=(exc.stdout or "").decode("utf-8", errors="replace")
+                   if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
+            stderr="", returncode=-1,
+            timed_out=True, oom_killed=False,
+        )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:tool-sandbox} deserve explanation. The
+platform guard at module import time --- not inside \code{sandboxed\_run}
+--- means that importing this module on macOS or Windows raises immediately,
+making the platform requirement visible at startup rather than at the first
+tool invocation. \code{preexec\_fn=lambda: \_apply\_limits(max\_memory\_bytes)}
+passes a closure rather than a partial because \code{preexec\_fn} receives no
+arguments from \code{subprocess.run}: the child process calls it with no
+parameters, so the memory cap must be baked into the closure. The
+\code{oom\_killed} heuristic --- \code{returncode == -9} --- is documented as
+a heuristic because signal \code{-9} indicates \code{SIGKILL}, which is what
+the kernel sends on \code{RLIMIT\_AS} violation, but is also sent by an
+explicit \code{kill -9} from an unrelated process. In practice, an
+unexpected \code{SIGKILL} is almost always an OOM event in a sandboxed
+child, and the Langfuse event emitted by the audit layer (Section~\ref{sec:tool-audit})
+carries enough context for a human to distinguish the cases.
+
+\begin{warningbox}
+\code{RLIMIT\_AS} limits virtual address space, not resident set size (RSS).
+On Linux kernels with over-commit enabled (the default on most distributions),
+a process can perform virtual allocations that succeed silently until the
+pages are actually touched. A \code{' ' * 256MB} allocation will trigger the
+limit because Python's \code{str} constructor touches pages immediately;
+a \code{numpy.empty(256, dtype=float64)} with shape \code{(1024, 1024)}
+creates a virtual allocation that may not touch pages immediately and may
+slip past the limit. For stricter and more reliable memory enforcement in
+containerised deployments, set the container's \code{memory} cgroup limit
+and rely on the kernel OOM killer rather than \code{RLIMIT\_AS} alone.
+\end{warningbox}
+
+The sandbox closes the resource-exhaustion failure mode for code-execution
+tools. What it does not close is the question of what happens when any tool
+--- sandboxed or not --- raises an exception: does the agent stall, retry
+blindly, or receive a structured signal that lets it reason about the
+failure type? That question is what the next section resolves.
+
+
+\section{Every Tool Failure Needs a Typed Graph Signal}
+\label{sec:tool-errors}
+
+The design problem is that \code{ToolNode}'s default error handling converts
+every exception into a \code{ToolMessage} whose content is a fixed English
+string defined in \code{TOOL\_CALL\_ERROR\_TEMPLATE}. The LLM receives this
+string and cannot distinguish a timeout from a policy violation from a
+validation failure --- all three produce the same opaque text --- so it
+does what any language model does with ambiguous context: it retries. An
+agent that retries a policy-violation error will retry indefinitely, because
+the error is structural, not transient. The naive approach of catching all
+exceptions uniformly is wrong because not all exceptions represent the same
+failure class, and failure class determines the correct response. The
+principle is that every failure type in the tool layer maps to a named
+exception class that carries structured fields, and those fields are
+serialised into the \code{ToolMessage} content as JSON so the LLM can
+reason about the failure type rather than parse English prose.
+
+LangChain's \code{ToolNode} accepts a callable for its
+\code{handle\_tool\_errors} parameter: any callable with a matching
+exception type in its signature will be called with the raised exception
+and must return a string to use as the \code{ToolMessage} content. This is
+the confirmed API signature: \code{handle\_tool\_errors: Union[bool, str,
+Callable[..., str], tuple[type[Exception], ...]]}. The production pattern
+passes \code{handle\_tool\_errors=tool\_exception\_to\_json\_str}, a function
+that accepts any \code{ToolException} subclass and returns a JSON string.
+The LLM receives \code{\{"error\_type": "ToolTimeoutError", "tool\_name":
+"run\_code", "message": "timed out after 30.0s"\}} and can reason: this is
+a timeout, not a policy violation, so retrying with different code
+(not more requests) is appropriate.
+
+The exception hierarchy is flat and shallow: all production tool failures
+inherit directly from \code{ToolException} rather than forming a deep tree.
+Deep hierarchies create ambiguous \code{except} clauses and make the error
+handling callable difficult to type correctly.
+
+\begin{lstlisting}[language=Python,
+  caption={ToolException hierarchy and the JSON serialisation helper},
+  label={lst:tool-errors}]
+# src/tools/errors.py
+import json
+from langchain_core.tools import ToolException
+
+class ToolTimeoutError(ToolException):
+    def __init__(self, tool_name: str, timeout_seconds: float) -> None:
+        self.tool_name       = tool_name
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"{tool_name} timed out after {timeout_seconds}s")
+
+class ToolValidationError(ToolException):
+    def __init__(self, tool_name: str, detail: str) -> None:
+        self.tool_name = tool_name
+        self.detail    = detail
+        super().__init__(f"{tool_name} return validation failed: {detail}")
+
+class ToolExternalError(ToolException):
+    def __init__(self, tool_name: str,
+                 status_code: int | None = None) -> None:
+        self.tool_name   = tool_name
+        self.status_code = status_code
+        super().__init__(
+            f"{tool_name} upstream API error "
+            f"(status={status_code})"
+        )
+
+def tool_exception_to_json_str(exc: ToolException) -> str:
+    payload: dict = {
+        "error_type": type(exc).__name__,
+        "message":    str(exc),
+        "tool_name":  getattr(exc, "tool_name", "unknown"),
+    }
+    if hasattr(exc, "timeout_seconds"):
+        payload["timeout_seconds"] = exc.timeout_seconds
+    if hasattr(exc, "status_code"):
+        payload["status_code"] = exc.status_code
+    return json.dumps(payload)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:tool-errors} deserve explanation.
+Every exception subclass stores its structured data as instance attributes
+in addition to encoding it in the string message. This is because
+\code{invoke\_and\_record()} in Section~\ref{sec:tool-audit} reads these
+attributes directly to populate \code{ToolInvocationRecord.error} ---
+parsing the string message would be fragile and would couple the audit
+layer to the error message format. The \code{tool\_exception\_to\_json\_str}
+function uses \code{getattr} with defaults for the optional fields
+(\code{timeout\_seconds}, \code{status\_code}) rather than \code{hasattr}
+guards on the exception class, because new \code{ToolException} subclasses
+added in future chapters will be handled gracefully: their additional fields
+will simply not appear in the JSON until explicitly added to the function.
+
+\begin{notebox}
+\code{ToolAccessDeniedError} (Section~\ref{sec:tool-policy}) is not in
+this hierarchy even though it is a tool-layer failure. It inherits from
+\code{Exception}, not from \code{ToolException}, because it is raised
+\emph{inside} \code{ToolRegistry.get\_tool()} before any tool invocation
+begins --- wrapping it in \code{ToolException} would imply it is an error
+from a running tool, which is architecturally misleading. The audit layer
+handles it as a special case: \code{invoke\_and\_record()} catches
+\code{ToolAccessDeniedError} separately from \code{ToolException}.
+\end{notebox}
+
+Now that failures have typed representations, the graph needs a typed state
+key to carry them and a conditional edge to route on them. The
+\code{ToolLayerState} schema and the routing function are defined alongside
+the node in Section~\ref{sec:tool-node}; the remaining gap before that is
+the transient-error case --- failures that should prompt a retry before the
+fallback branch fires at all.
+
+
+\section{Retries Depend on Failure Type}
+\label{sec:tool-retry}
+
+The design problem is that routing every \code{ToolExternalError}
+immediately to the fallback branch discards potentially recoverable
+operations. A \code{503 Service Unavailable} from a search API is usually
+transient --- the same call 500\,ms later often succeeds. Routing it to the
+fallback branch and responding to the user with ``the search tool is
+unavailable'' when a single retry would have succeeded is a worse outcome
+than the retry costs. The naive approach is to add retry logic inside each
+tool's \code{func}, which duplicates retry configuration across every tool
+and makes changing the retry policy require editing every tool
+implementation. The principle is that retry behaviour is a concern of the
+tool boundary, not the tool implementation, and is attached to the tool at
+construction time as a configurable wrapper rather than embedded in the
+underlying logic.
+
+Tenacity provides the retry decorator used here. The important design
+decision is that only \code{ToolExternalError} --- transient upstream
+failures --- is in the default \code{retry\_on} set. \code{ToolAccessDeniedError}
+and \code{ToolValidationError} are structural failures: retrying a policy
+violation will always produce the same policy violation; retrying a
+validation failure will always produce the same validation failure. Including
+them in \code{retry\_on} would turn a fast, informative failure into a slow,
+equally informative failure after \code{max\_attempts} iterations. The
+\code{RetryConfig} model carries \code{retry\_on} as a tuple of exception
+types so that callers can extend it if their tool interacts with an API
+that raises a custom exception class.
+
+\begin{lstlisting}[language=Python,
+  caption={RetryConfig and with\_retry Tenacity wrapper},
+  label={lst:tool-retry}]
+# src/tools/retry.py
+from typing import Callable
+from pydantic import BaseModel
+from tenacity import (retry, stop_after_attempt,
+                      wait_exponential, retry_if_exception_type,
+                      before_sleep_log)
+from langfuse import Langfuse
+import logging
+
+from src.tools.errors import ToolExternalError
+
+log = logging.getLogger(__name__)
+
+class RetryConfig(BaseModel):
+    model_config = {"arbitrary_types_allowed": True}
+    max_attempts: int                         = 3
+    wait_min:     float                       = 1.0
+    wait_max:     float                       = 10.0
+    retry_on:     tuple[type[Exception], ...] = (ToolExternalError,)
+
+def with_retry(
+    func:      Callable,
+    config:    RetryConfig,
+    tool_name: str,
+    langfuse:  Langfuse,
+) -> Callable:
+    def _before_sleep(retry_state):  # type: ignore[no-untyped-def]
+        langfuse.event(
+            name="tool_retry",
+            metadata={
+                "tool_name":      tool_name,
+                "attempt_number": retry_state.attempt_number,
+                "exception_type": type(retry_state.outcome.exception()).__name__,
+            },
+        )
+    return retry(
+        stop=stop_after_attempt(config.max_attempts),
+        wait=wait_exponential(min=config.wait_min, max=config.wait_max),
+        retry=retry_if_exception_type(config.retry_on),
+        reraise=True,
+        before_sleep=_before_sleep,
+    )(func)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:tool-retry} deserve explanation.
+\code{reraise=True} is not optional here: without it, Tenacity raises its
+own \code{RetryError} wrapper after exhausting all attempts. A
+\code{RetryError} is not a \code{ToolException}, so \code{ToolNode}'s
+\code{handle\_tool\_errors} callable --- which accepts \code{ToolException}
+--- would not catch it, and the exception would propagate uncaught,
+crashing the graph node. The \code{before\_sleep} callback is intentionally
+a Langfuse event rather than a log line. A log line recording ``retry
+attempt 2'' is invisible unless someone reads the log; a Langfuse event
+appears on the agent's trace timeline, making retry storms visible in the
+operations dashboard without any additional log aggregation pipeline. The
+\code{tool\_name} parameter is required rather than inferred from
+\code{func.\_\_name\_\_} because the wrapped function is the
+\code{validated\_func} closure from \code{build\_structured\_tool}, whose
+\code{\_\_name\_\_} is \code{validated\_func} regardless of which tool it
+wraps.
+
+With the retry wrapper in place, the path from tool invocation to failure
+is complete: transient errors retry up to \code{max\_attempts} times, then
+propagate as the original \code{ToolExternalError}; structural errors
+propagate immediately without retry. The remaining gap is recording this
+entire path --- the timing, the result, the error type, the retry count ---
+in a form that is queryable without log parsing.
+
+
+\section{Every Tool Call Must Produce an Audit Record}
+\label{sec:tool-audit}
+
+The design problem is that a text log line recording a tool call is
+aggregable only by building a log parsing pipeline, and a log parsing
+pipeline has its own availability, latency, and retention requirements.
+An operations engineer who wants to know the p99 latency of the
+\code{search\_web} tool over the last hour needs a structured time-series
+query, not a regex over JSON logs. The naive approach logs tool calls with
+\code{logger.info()} and derives metrics from log aggregation; the
+production approach emits a structured \code{ToolInvocationRecord} to
+Langfuse on every tool call --- success, failure, and access denial ---
+and queries it directly. The principle is that the audit record is a
+first-class data artefact, not a side-effect of a log statement, and
+\code{invoke\_and\_record()} is the single function through which all tool
+invocations flow.
+
+Chapter~1 \S1.4 defined \code{ToolInvocationRecord} as part of the book's
+contract for agent observability. The fields declared there ---
+\code{tool\_name}, \code{args}, \code{result}, \code{error},
+\code{latency\_ms}, \code{agent\_id}, \code{run\_id}, \code{invoked\_at}
+--- are reproduced here exactly; any modification to this model requires a
+matching change in \S1.4. The \code{invoke\_and\_record()} function builds
+the record for both the success and failure paths, emits it to Langfuse via
+\code{emit\_invocation()}, and then --- critically --- re-raises any
+exception it caught. Emission and re-raise are separated by a
+\code{finally} clause so that even if the Langfuse client raises during
+emission, the original tool exception propagates to the caller rather than
+being silently swallowed by an observability failure.
+
+\begin{lstlisting}[language=Python,
+  caption={ToolInvocationRecord and invoke\_and\_record with always-emit guarantee},
+  label={lst:tool-audit}]
+# src/tools/audit.py
+import time
+from datetime import datetime, timezone
+from pydantic import BaseModel
+from langfuse import Langfuse
+from langchain_core.tools import StructuredTool
+from src.tools.errors import ToolException, ToolValidationError
+from src.tools.policy import ToolAccessDeniedError
+
+class ToolInvocationRecord(BaseModel):
+    # Fields match Ch.1 §1.4 exactly — update §1.4 before modifying here
+    tool_name:  str
+    args:       dict
+    result:     str | None
+    error:      str | None
+    latency_ms: float
+    agent_id:   str
+    run_id:     str
+    invoked_at: datetime
+
+def emit_invocation(record: ToolInvocationRecord,
+                    langfuse: Langfuse) -> None:
+    langfuse.event(name="tool_invocation",
+                   metadata=record.model_dump(mode="json"))
+
+def invoke_and_record(
+    tool: StructuredTool, args: dict,
+    agent_id: str, run_id: str, langfuse: Langfuse,
+) -> ToolInvocationRecord:
+    start    = time.perf_counter()
+    result   = None
+    error    = None
+    exc_hold = None
+    try:
+        output = tool.invoke(args)
+        result = output if isinstance(output, str) else output.model_dump_json()
+    except (ToolException, ToolAccessDeniedError, Exception) as exc:
+        error    = _exc_to_json(exc)
+        exc_hold = exc
+    finally:
+        record = ToolInvocationRecord(
+            tool_name=tool.name, args=args, result=result, error=error,
+            latency_ms=(time.perf_counter() - start) * 1000,
+            agent_id=agent_id, run_id=run_id,
+            invoked_at=datetime.now(tz=timezone.utc),
+        )
+        try:
+            emit_invocation(record, langfuse)
+        except Exception:
+            pass   # never let observability failures mask tool failures
+    if exc_hold is not None:
+        raise exc_hold
+    return record
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={\_exc\_to\_json helper used by invoke\_and\_record},
+  label={lst:tool-audit-helper}]
+# src/tools/audit.py (continued)
+import json
+
+def _exc_to_json(exc: Exception) -> str:
+    payload: dict = {
+        "error_type": type(exc).__name__,
+        "message":    str(exc),
+    }
+    for field in ("tool_name", "agent_type", "run_id",
+                  "allowed_tools", "status_code", "timeout_seconds"):
+        val = getattr(exc, field, None)
+        if val is not None:
+            payload[field] = (list(val) if isinstance(val, frozenset)
+                              else val)
+    return json.dumps(payload)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:tool-audit} deserve explanation. The
+\code{finally} block guarantees that a \code{ToolInvocationRecord} is built
+and emitted whether or not the tool invocation succeeds. The \code{try/except
+Exception: pass} inside \code{finally} is deliberate: if Langfuse is
+temporarily unavailable, the tool failure must still propagate to the graph
+routing logic. Silencing observability exceptions is normally wrong; here
+it is correct because the tool result --- not the audit record --- is
+the data that the agent needs to function. The \code{exc\_hold} pattern
+(store the exception, then raise after \code{finally}) is used rather
+than \code{raise} inside \code{finally} because raising inside a
+\code{finally} block suppresses the original exception on Python 3.11 and
+earlier; the stored-then-raised pattern propagates the original exception
+cleanly. The \code{frozenset} serialisation in \code{\_exc\_to\_json} ---
+\code{list(val) if isinstance(val, frozenset)} --- handles the
+\code{allowed\_tools} field from \code{ToolAccessDeniedError}, which is a
+\code{frozenset[str]} and is not JSON-serialisable directly.
+
+Every tool call now produces an audit record and re-raises any failure.
+The final assembly problem is running multiple tool calls from the same
+\code{AIMessage} in parallel, routing on the results, and returning a
+well-formed list of \code{ToolMessage} objects --- the work of the next
+section.
+
+
+\section{Parallel Execution Requires an Explicit Fan-Out Contract}
+\label{sec:tool-node}
+
+The design problem is that a sequential tool executor --- calling each
+\code{tool\_call} one after another --- adds latency proportional to the
+number of tools the LLM requested, even when the tool calls are independent.
+An agent that requests a web search, a database lookup, and a weather check
+simultaneously should complete in the time it takes the slowest tool to
+respond, not in the sum of all three latencies. The naive approach is to
+implement a simple \code{for} loop over \code{tool\_calls}, which works
+correctly but sacrifices parallelism that the task structure allows. The
+principle is that independent tool calls in the same \code{AIMessage} are
+fanned out concurrently and fanned in to a uniform \code{list[ToolMessage]}
+with exactly one \code{ToolMessage} per \code{tool\_call}, regardless of
+whether that call succeeded or failed.
+
+LangGraph's \code{create\_react\_agent} supports two parallelism strategies.
+In \code{version="v1"}, all \code{tool\_calls} in a single \code{AIMessage}
+are run in parallel within one \code{ToolNode} execution. In
+\code{version="v2"}, each \code{tool\_call} is dispatched to a separate
+\code{ToolNode} instance via the \code{Send} API, making each call a
+separately checkpointed graph step. The version-1 pattern is used here
+because it fits a custom \code{StateGraph} where the state schema carries
+\code{ToolLayerState} with explicit \code{tool\_errors} and
+\code{last\_tool\_invocations} fields --- fields that \code{create\_react\_agent}
+does not expose. The custom \code{audited\_tool\_node} implements the same
+parallel semantics as the native \code{ToolNode} version-1 behaviour using
+\code{asyncio.gather(return\_exceptions=True)}, which ensures all tool
+calls complete and all audit records are emitted even if some calls fail.
+
+\begin{lstlisting}[language=Python,
+  caption={ToolLayerState TypedDict and audited\_tool\_node fan-out},
+  label={lst:tool-node}]
+# src/tools/state.py
+from typing import Annotated
+from typing_extensions import TypedDict
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+from src.tools.audit import ToolInvocationRecord
+
+class ToolLayerState(TypedDict):
+    messages:              Annotated[list[AnyMessage], add_messages]
+    tool_errors:           list[ToolInvocationRecord]
+    last_tool_invocations: list[ToolInvocationRecord]
+
+# src/tools/node.py
+import asyncio, json
+from functools import partial
+from langchain_core.messages import ToolMessage, AIMessage
+from langchain_core.runnables import RunnableConfig
+from langfuse import Langfuse
+from src.tools.registry import ToolRegistry
+from src.tools.audit import invoke_and_record, ToolInvocationRecord
+from src.tools.errors import tool_exception_to_json_str, ToolException
+from src.tools.policy import ToolAccessDeniedError
+from src.tools.state import ToolLayerState
+
+async def audited_tool_node(
+    state:    ToolLayerState,
+    config:   RunnableConfig,
+    registry: ToolRegistry,
+    langfuse: Langfuse,
+) -> dict:
+    cfg      = config.get("configurable", {})
+    run_id   = cfg["run_id"]
+    agent_id = cfg["agent_id"]
+    last_msg = state["messages"][-1]
+    assert isinstance(last_msg, AIMessage) and last_msg.tool_calls
+
+    async def _call_one(tc: dict) -> tuple[ToolMessage, ToolInvocationRecord]:
+        try:
+            tool   = registry.get_tool(tc["name"], run_id)
+            record = await asyncio.to_thread(
+                invoke_and_record, tool, tc["args"],
+                agent_id, run_id, langfuse,
+            )
+            return (ToolMessage(content=record.result or "",
+                                tool_call_id=tc["id"]), record)
+        except (ToolException, ToolAccessDeniedError, Exception) as exc:
+            err_str = (tool_exception_to_json_str(exc)
+                       if isinstance(exc, ToolException)
+                       else json.dumps({"error_type": type(exc).__name__,
+                                        "message": str(exc)}))
+            dummy_rec = ToolInvocationRecord(
+                tool_name=tc["name"], args=tc["args"],
+                result=None, error=err_str, latency_ms=0.0,
+                agent_id=agent_id, run_id=run_id,
+                invoked_at=__import__("datetime").datetime.now(
+                    tz=__import__("datetime").timezone.utc),
+            )
+            return (ToolMessage(content=err_str,
+                                tool_call_id=tc["id"]), dummy_rec)
+
+    pairs   = await asyncio.gather(
+        *[_call_one(tc) for tc in last_msg.tool_calls]
+    )
+    msgs    = [p[0] for p in pairs]
+    records = [p[1] for p in pairs]
+    errors  = [r for r in records if r.error is not None]
+    return {"messages": msgs,
+            "last_tool_invocations": records,
+            "tool_errors": errors}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={build\_tool\_node factory and graph wiring},
+  label={lst:tool-node-factory}]
+# src/tools/node.py (continued)
+from langgraph.graph import StateGraph, END
+
+def build_tool_node(registry: ToolRegistry,
+                    langfuse:  Langfuse):
+    return partial(audited_tool_node,
+                   registry=registry, langfuse=langfuse)
+
+def route_after_tools(state: ToolLayerState) -> str:
+    return "handle_tool_error" if state["tool_errors"] else "agent"
+
+def build_tool_graph(registry: ToolRegistry,
+                     langfuse:  Langfuse,
+                     agent_node) -> "CompiledGraph":
+    graph = StateGraph(ToolLayerState)
+    graph.add_node("tools",             build_tool_node(registry, langfuse))
+    graph.add_node("agent",             agent_node)
+    graph.add_node("handle_tool_error", _error_handler)
+    graph.add_conditional_edges(
+        "tools",
+        route_after_tools,
+        {"agent": "agent", "handle_tool_error": "handle_tool_error"},
+    )
+    graph.add_edge("agent", "tools")
+    graph.add_edge("handle_tool_error", END)
+    graph.set_entry_point("agent")
+    return graph.compile()
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:tool-node} deserve explanation.
+\code{asyncio.gather} is called without \code{return\_exceptions=True}
+because \code{\_call\_one} is designed to never raise --- it catches all
+exceptions internally and returns a \code{(ToolMessage, ToolInvocationRecord)}
+pair in both the success and failure cases. This is more deliberate than
+passing \code{return\_exceptions=True} and checking the type of each result:
+the function signature guarantees a consistent return type, making the
+fan-in code simpler and type-safe. \code{asyncio.to\_thread} is used to
+call \code{invoke\_and\_record} --- which calls the synchronous
+\code{tool.invoke()} --- without blocking the event loop; LangGraph's async
+graph execution runs on an asyncio event loop, and a blocking
+\code{tool.invoke()} inside an async node function would stall all other
+concurrently executing nodes. The \code{dummy\_rec} with \code{latency\_ms=0.0}
+for exceptions raised before \code{invoke\_and\_record} is a deliberate
+approximation: \code{ToolAccessDeniedError} fires before any tool execution
+begins, so there is no meaningful latency to record; the zero signals to the
+analytics layer that this record was not produced by an actual invocation.
+
+\begin{notebox}
+The graph built in Listing~\ref{lst:tool-node-factory} sets
+\code{handle\_tool\_error} as a terminal node (edge to \code{END}). This
+means that any tool error ends the current agent turn. Whether the agent
+restarts on the next turn depends on the application layer above the
+graph --- the graph itself treats the error as a resolved state, not an
+in-progress one. Applications that need retry-after-error behaviour should
+loop back to \code{"agent"} from \code{"handle\_tool\_error"} and carry
+a retry count in \code{ToolLayerState} to prevent infinite loops.
+\end{notebox}
+
+The runtime is complete. The remaining work is confirming in tests that
+the four invariants --- schema enforcement, inventory isolation, policy
+enforcement, and audit completeness --- hold in isolation before they are
+composed.
+
+
+\section{Tests Must Enforce Every Invariant in Isolation}
+\label{sec:tool-tests}
+
+The design problem is that integration tests that compose all four layers
+at once cannot localise failures: when a test fails, it is unclear whether
+the schema layer, the registry, the policy, or the audit emission is at
+fault. The naive approach tests the assembled system end-to-end and relies
+on log output to diagnose failures. The principle is that each invariant
+has at least one test that touches only the component responsible for that
+invariant, with real objects not mocked out of existence, and assertions on
+the specific fields and exception types the invariant requires.
+
+The policy invariant has three test cases. The straightforward case asserts
+that a tool whose name is absent from \code{PolicyConfig.allowed\_tool\_names}
+raises \code{ToolAccessDeniedError} with the correct \code{tool\_name} and
+\code{agent\_type} fields --- not just the correct exception type. The
+run-ID mismatch case asserts that \code{ToolRegistry.get\_tool()} raises
+\code{RegistryMismatchError} when called with a \code{run\_id} that does
+not match the registry's own \code{run\_id}. The positive case asserts that
+an allowed tool returns the exact \code{StructuredTool} instance that was
+registered --- same object, not a copy.
+
+\begin{lstlisting}[language=Python,
+  caption={Policy enforcement tests: field assertions, not just exception types},
+  label={lst:test-policy}]
+# tests/tools/test_policy.py
+import pytest
+from src.tools.policy import PolicyConfig, ToolAccessDeniedError
+from src.tools.registry import ToolRegistry, RegistryMismatchError
+from tests.tools.conftest import make_dummy_tool
+
+RUN_ID = "run-test-001"
+
+@pytest.fixture
+def registry() -> ToolRegistry:
+    policy = PolicyConfig(agent_type="reader",
+                          allowed_tool_names=["search_web"])
+    reg = ToolRegistry(run_id=RUN_ID, policy=policy)
+    reg.register(make_dummy_tool("search_web"))
+    reg.register(make_dummy_tool("delete_file"))
+    reg.seal()
+    return reg
+
+def test_denied_tool_raises_with_correct_fields(registry):
+    with pytest.raises(ToolAccessDeniedError) as exc_info:
+        registry.get_tool("delete_file", RUN_ID)
+    err = exc_info.value
+    assert err.tool_name  == "delete_file"
+    assert err.agent_type == "reader"
+    assert err.run_id     == RUN_ID
+    assert "search_web" in err.allowed_tools
+
+def test_run_id_mismatch_raises(registry):
+    with pytest.raises(RegistryMismatchError):
+        registry.get_tool("search_web", "wrong-run-id")
+
+def test_allowed_tool_returns_registered_instance(registry):
+    tool = registry.get_tool("search_web", RUN_ID)
+    assert tool.name == "search_web"
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:test-policy} deserve explanation.
+The test for \code{ToolAccessDeniedError} asserts on four fields ---
+\code{tool\_name}, \code{agent\_type}, \code{run\_id}, and
+\code{allowed\_tools} --- because those are the four fields the audit layer
+reads to construct a structured error JSON. A test that asserts only
+\code{pytest.raises(ToolAccessDeniedError)} does not prevent a refactor
+that removes these fields from the exception, silently breaking the audit
+layer. The \code{make\_dummy\_tool()} conftest helper creates a minimal
+\code{StructuredTool} with a no-op \code{func} and a
+\code{StrictToolInputBase} subclass; it is kept in \code{conftest.py}
+rather than defined in each test file because the registry and audit tests
+share it.
+
+\begin{lstlisting}[language=Python,
+  caption={Audit completeness tests: emission fires before re-raise},
+  label={lst:test-audit}]
+# tests/tools/test_audit.py
+import pytest
+from unittest.mock import MagicMock, patch
+from langfuse import Langfuse
+from src.tools.audit import invoke_and_record
+from src.tools.errors import ToolTimeoutError
+from tests.tools.conftest import make_dummy_tool, make_failing_tool
+
+def test_success_emits_record_with_result():
+    mock_lf = MagicMock(spec=Langfuse)
+    tool    = make_dummy_tool("search_web")
+    record  = invoke_and_record(tool, {"query": "test", "max_results": 3},
+                                "agent-1", "run-1", mock_lf)
+    assert record.result is not None
+    assert record.error  is None
+    mock_lf.event.assert_called_once()
+    assert mock_lf.event.call_args.kwargs["name"] == "tool_invocation"
+
+def test_failure_emits_record_with_error_before_reraise():
+    mock_lf  = MagicMock(spec=Langfuse)
+    tool     = make_failing_tool("run_code",
+                                 ToolTimeoutError("run_code", 30.0))
+    with pytest.raises(ToolTimeoutError):
+        invoke_and_record(tool, {}, "agent-1", "run-1", mock_lf)
+    # emission fires before re-raise
+    mock_lf.event.assert_called_once()
+    call_meta = mock_lf.event.call_args.kwargs["metadata"]
+    assert call_meta["error"] is not None
+    assert call_meta["result"] is None
+    assert "ToolTimeoutError" in call_meta["error"]
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:test-audit} deserve explanation.
+The test for \code{test\_failure\_emits\_record\_with\_error\_before\_reraise}
+uses \code{pytest.raises(ToolTimeoutError)} as a context manager and then
+asserts on \code{mock\_lf.event} \emph{after} the \code{with} block exits.
+This assertion structure confirms that Langfuse emission occurred despite
+the exception being raised --- if the \code{finally} block in
+\code{invoke\_and\_record} were accidentally replaced with an \code{else}
+block, the exception would be raised before emission, \code{mock\_lf.event}
+would not be called, and this test would catch the regression.
+\code{MagicMock(spec=Langfuse)} is used rather than an unspecced
+\code{MagicMock()} so that accessing an attribute that does not exist on the
+real \code{Langfuse} class raises \code{AttributeError} immediately, preventing
+tests from passing because a typo in the attribute name silently creates a
+new mock attribute instead of failing.
+
+\begin{lstlisting}[language=Python,
+  caption={Retry tests: type-selective retry and Langfuse event count},
+  label={lst:test-retry}]
+# tests/tools/test_retry.py
+import pytest
+from unittest.mock import MagicMock, call
+from langfuse import Langfuse
+from src.tools.retry import RetryConfig, with_retry
+from src.tools.errors import ToolExternalError
+from src.tools.policy import ToolAccessDeniedError
+
+def test_retries_on_external_error():
+    mock_lf = MagicMock(spec=Langfuse)
+    call_count = {"n": 0}
+    def flaky():
+        call_count["n"] += 1
+        if call_count["n"] < 3:
+            raise ToolExternalError("search_web", status_code=503)
+        return "ok"
+    wrapped = with_retry(flaky, RetryConfig(max_attempts=3),
+                         "search_web", mock_lf)
+    result = wrapped()
+    assert result == "ok"
+    assert call_count["n"] == 3
+    assert mock_lf.event.call_count == 2   # two before_sleep events
+
+def test_no_retry_on_access_denied():
+    mock_lf = MagicMock(spec=Langfuse)
+    call_count = {"n": 0}
+    def always_denied():
+        call_count["n"] += 1
+        raise ToolAccessDeniedError("delete_file","reader","run-1",
+                                    frozenset({"search_web"}))
+    wrapped = with_retry(always_denied, RetryConfig(max_attempts=3),
+                         "delete_file", mock_lf)
+    with pytest.raises(ToolAccessDeniedError):
+        wrapped()
+    assert call_count["n"] == 1
+    assert mock_lf.event.call_count == 0
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:test-retry} deserve explanation.
+The \code{call\_count} dict is used rather than a nonlocal integer because
+Python closures cannot rebind a nonlocal variable inside a nested function
+unless the \code{nonlocal} declaration is present; the dict avoids the
+declaration and makes the pattern readable to readers unfamiliar with
+Python scoping rules. The assertion \code{mock\_lf.event.call\_count == 2}
+directly encodes the contract that \code{before\_sleep} fires once per
+failed attempt \emph{before} sleeping, not once per retry loop iteration:
+three total calls minus one successful final call equals two
+\code{before\_sleep} events. A reader who changes the retry count or the
+success condition will see this assertion fail and understand immediately
+that the event count contract must be updated.
+
+Chapter~15 opens with the problem that none of the four invariants tested
+here operate on an agent's \emph{memory} of previous actions --- the tools
+built and governed in this chapter operate statelessly per invocation. The
+next chapter introduces memory as a production subsystem with its own
+isolation, retention, and audit requirements.
