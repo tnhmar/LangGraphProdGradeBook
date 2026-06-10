@@ -1,8 +1,892 @@
 %% ============================================================
 %%  Chapter 11 --- Hybrid Retrieval Pipeline
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: rank-bm25 >= 0.2.2, flashrank >= 0.2.10,
+%%                langchain-qdrant >= 0.2.0, litellm >= 1.40.0,
+%%                instructor >= 1.3.0
 %% ============================================================
 
 \chapterquote{Recall without precision wastes context; precision without recall wastes potential.}{anon}
 
-% TODO: Chapter 11 content
+The production failure this chapter prevents is a silent one. An agent that
+retrieves wrong or irrelevant memories does not raise an exception --- it
+reasons from bad evidence and produces plausible-sounding but incorrect
+output. A team running a customer-support assistant discovered this when
+recall for technical queries dropped below 50\% after the corpus grew past
+100\,000 memories. The dense vector index had not changed; the failure was
+vocabulary mismatch. Model names, version strings, and product identifiers
+appeared verbatim in user queries but were out-of-distribution for the
+embedding encoder, which silently ranked semantically unrelated passages
+higher. BM25 would have found those passages immediately. Neither retriever
+alone was sufficient; the failure was architectural.
+
+The solution this chapter builds is a two-stage hybrid pipeline. The first
+stage is a \emph{recall layer}: BM25 lexical retrieval and dense vector
+retrieval each produce a ranked candidate pool, and Reciprocal Rank Fusion
+combines them without requiring score normalisation. The second stage is a
+\emph{precision layer}: a \code{flashrank} cross-encoder reranker reorders
+the fused pool using full query-passage interaction. The base pipeline
+(Sections~\ref{sec:pipeline-architecture}--\ref{sec:reranker}) is a complete,
+runnable system before any enhancements are introduced. HyDE
+(Section~\ref{sec:hyde}) and CRAG (Section~\ref{sec:crag}) are opt-in
+extensions applied only after the base pipeline passes the quality tests in
+Section~\ref{sec:metrics}.
+
+One architectural constraint from Chapter~10 governs the entire chapter:
+the Qdrant collection established in \S10.1 uses a single unnamed dense
+vector field (\code{VectorParams} directly, not a named\code{\{"dense": VectorParams(...)\}} dict). This means \code{RetrievalMode.HYBRID} from
+\texttt{langchain-qdrant} is architecturally excluded here: that mode requires
+a collection configured with both \code{vectors\_config} and
+\code{sparse\_vectors\_config}, which is a different schema. Using it would
+require deleting and recreating the Chapter~10 collection --- a breaking change.
+BM25 is therefore implemented independently with \texttt{rank-bm25}, not
+through Qdrant's sparse vector index.
+
+This chapter introduces several pipeline-specific terms defined in
+Table~\ref{tab:ch11-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~11}
+\label{tab:ch11-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{RetrievedPassage} & Shared TypedDict carrying a passage's \code{id}, \code{text}, \code{score}, \code{rank}, \code{source}, and \code{meta} through all pipeline stages. \\
+BM25 first stage & Lexical retrieval using \code{BM25Okapi} over a tokenised corpus; excels at exact term match for product names, error codes, and version strings. \\
+Dense stage & Approximate nearest-neighbour search via \code{QdrantVectorStore}; excels at semantic paraphrase retrieval. \\
+RRF & Reciprocal Rank Fusion: rank-position-based score fusion that requires no score normalisation across heterogeneous retrievers. \\
+Cross-encoder & A reranker model that scores (query, passage) pairs jointly; more precise than bi-encoder retrieval but too slow to run over a full corpus. \\
+HyDE & Hypothetical Document Embedding: replaces a short or ambiguous query with a generated hypothetical answer whose embedding lies closer to relevant passages in vector space. \\
+CRAG & Corrective Retrieval Augmented Generation: a LangGraph conditional loop that triggers re-retrieval when a grader node judges the first-pass candidates as insufficient. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The source layout for this chapter is:
+
+\begin{verbatim}
+src/
+  retrieval/
+    types.py           # §11.1
+    bm25_stage.py      # §11.2
+    dense_stage.py     # §11.3
+    fusion.py          # §11.4
+    reranker.py        # §11.5
+    hyde.py            # §11.6
+    crag_nodes.py      # §11.7
+    crag_graph.py      # §11.7
+    metrics.py         # §11.8
+prompts/
+  hyde_v1.jinja2           # §11.6
+  retrieval_grader_v1.jinja2 # §11.7
+tests/
+  retrieval/
+    test_retrieval_quality.py  # §11.8
+  fixtures/
+    retrieval_eval.json        # §11.8
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{Two-Stage Architecture: Recall Then Precision}
+\label{sec:pipeline-architecture}
+%% ------------------------------------------------------------
+
+The design problem is that recall and precision are in direct tension when
+only one retrieval mechanism is used. A retriever optimised for recall returns
+many candidates, most of which are irrelevant; one optimised for precision
+returns few candidates, risking the omission of genuinely relevant passages
+that were phrased differently from the query. The governing principle is that
+recall and precision are separate concerns that require separate stages, and
+that each stage must receive only the output type the next stage is designed
+to consume.
+
+The data flow has five steps. First, BM25 retrieval over the tokenised memory
+corpus produces a ranked list of up to 50 candidates
+(\code{source="bm25"}). Second, dense vector retrieval via
+\code{QdrantVectorStore} produces a second ranked list of up to 50 candidates
+(\code{source="dense"}). Third, \code{reciprocal\_rank\_fusion()} merges the
+two lists by rank position into a single pool of up to 100 candidates
+(\code{source="fused"}). Fourth, \code{rerank\_passages()} applies a
+cross-encoder to the fused pool and returns the top-5 reordered candidates
+(\code{source="reranked"}). Fifth, the generation node receives exactly those
+five passages as its evidence context.
+
+The shared data carrier across all stages is \code{RetrievedPassage}. Every
+stage reads from and writes to this type so that stage boundaries are clean
+interfaces rather than implicit conventions.
+
+\begin{lstlisting}[language=Python,
+  caption={Shared passage type used across all pipeline stages},
+  label={lst:retrieved-passage}]
+# src/retrieval/types.py
+from typing import Any, Literal
+from typing_extensions import TypedDict
+
+class RetrievedPassage(TypedDict):
+    id: str
+    text: str
+    score: float
+    rank: int
+    source: Literal["bm25", "dense", "fused", "reranked"]
+    meta: dict[str, Any]
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:retrieved-passage} deserve explanation.
+The \code{source} field carries a literal tag through the entire pipeline,
+making it possible to trace which retriever originally contributed each
+passage to the final context --- a detail that Chapter~23 uses to build
+per-retriever recall metrics in Langfuse. The \code{rank} field is
+reassigned at each stage, reflecting the passage's position within the
+current stage's ordered output rather than its original position in the
+corpus, which would have no pipeline-level meaning.
+
+\begin{warningbox}
+\code{RetrievalMode.HYBRID} from \texttt{langchain-qdrant} is not used in
+this chapter. That mode requires the Qdrant collection to have both dense
+and sparse vector fields (\code{sparse\_vectors\_config} at collection
+creation). Chapter~10's \code{create\_agent\_memory\_collection()} creates
+a single unnamed dense vector field; adding a sparse field would require
+dropping and recreating the collection. BM25 is implemented with
+\texttt{rank-bm25} as an independent lexical stage.
+\end{warningbox}
+
+
+%% ------------------------------------------------------------
+\section{BM25 First Stage: rank\_bm25 with Tokenisation Pipeline}
+\label{sec:bm25-stage}
+%% ------------------------------------------------------------
+
+The design problem is tokenisation asymmetry. BM25 scores are computed as
+inner products between term-frequency vectors built from the corpus and from
+the query. If the two are tokenised differently --- for example, punctuation is
+stripped from corpus tokens but not from query tokens --- the overlapping term
+sets diverge and scores collapse. The governing principle is that the same
+\code{tokenize()} function is applied to every corpus passage at index time
+and to every query at search time, with no exceptions.
+
+The tokenisation pipeline for agent memory workloads has three steps and
+deliberately omits two common extras. Lowercase normalisation and punctuation
+stripping are required. Whitespace splitting is the terminal step. Stemming
+is omitted because agent memories contain model names (\code{gpt-4o},
+\code{claude-3-5-sonnet}), version strings (\code{v1.2.3}), and product
+identifiers that stemming corrupts. Stopword removal is omitted because short
+queries (two to four words) frequently consist almost entirely of stopwords
+and become empty strings after removal.
+
+\code{BM25Okapi} is selected over \code{BM25L} and \code{BM25+}. The
+difference matters for corpora with high document-length variance: \code{BM25L}
+applies a lower-bound normalisation that benefits very long documents.
+Agent memory entries are typically one to three sentences; length variance is
+low. \code{BM25Okapi} is simpler to reason about and the appropriate default.
+
+\begin{notebox}
+\code{BM25Okapi} requires a \code{list[list[str]]} at construction time
+--- a pre-tokenised corpus --- and \code{get\_scores()} requires a
+\code{list[str]} --- a pre-tokenised query. \code{tokenize()} must be called
+on both sides. The \code{get\_top\_n()} convenience method returns raw text
+strings and discards document identity; it must not be used here because the
+\code{id} field of each \code{RetrievedPassage} must survive into the fusion
+stage.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={Tokenisation pipeline and BM25 index construction},
+  label={lst:bm25-index}]
+# src/retrieval/bm25_stage.py
+import re
+import numpy as np
+from rank_bm25 import BM25Okapi
+from src.retrieval.types import RetrievedPassage
+
+def tokenize(text: str) -> list[str]:
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", " ", text)
+    return text.split()
+
+def build_bm25_index(
+    passages: list[RetrievedPassage],
+) -> tuple[BM25Okapi, list[RetrievedPassage]]:
+    tokenized = [tokenize(p["text"]) for p in passages]
+    return BM25Okapi(tokenized), passages
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={BM25 retrieval with rank assignment},
+  label={lst:bm25-retrieve}]
+# src/retrieval/bm25_stage.py (continued)
+def bm25_retrieve(
+    index: BM25Okapi,
+    corpus: list[RetrievedPassage],
+    query: str,
+    top_k: int = 50,
+) -> list[RetrievedPassage]:
+    tokenized_query = tokenize(query)
+    scores: np.ndarray = index.get_scores(tokenized_query)
+    top_indices = np.argsort(scores)[::-1][:top_k]
+    results = []
+    for rank, idx in enumerate(top_indices, start=1):
+        passage = dict(corpus[idx])
+        passage["score"] = float(scores[idx])
+        passage["rank"] = rank
+        passage["source"] = "bm25"
+        results.append(passage)
+    return results
+\end{lstlisting}
+
+Three decisions in Listings~\ref{lst:bm25-index} and~\ref{lst:bm25-retrieve}
+deserve explanation. \code{np.argsort(scores)[::-1]} sorts in descending order
+without copying the full score array --- safer and faster than
+\code{sorted(enumerate(scores), key=lambda x: -x[1])} for large corpora.
+The \code{dict(corpus[idx])} copy is required: mutating the original corpus
+passage in-place would corrupt the index on the next retrieval call.
+\code{top\_k=50} is the default because the RRF fusion stage benefits from a
+large candidate pool, but the cross-encoder reranker is CPU-bound at
+inference --- 100 fused candidates (50 from each stage) is the practical
+ceiling before reranker latency exceeds the SLA.
+
+
+%% ------------------------------------------------------------
+\section{Dense Vector Stage: QdrantVectorStore with Payload Filters}
+\label{sec:dense-stage}
+%% ------------------------------------------------------------
+
+The design problem is connecting to the pre-configured Chapter~10 collection
+without violating the shared client contract and without applying the tenant
+filter as an afterthought in Python. The governing principle is that
+\code{QdrantVectorStore} is constructed from the shared \code{QdrantClient}
+instance, the retrieval mode is declared as \code{RetrievalMode.DENSE} at
+construction time, and the \code{user\_id} payload filter is passed as the
+\code{filter=} keyword argument to every search call.
+
+The construction pattern matters. \code{QdrantVectorStore.from\-\_existing\_collection()} accepts only a URL string, which bypasses the shared
+client lifecycle established in Chapter~10 \S10.1. The correct form is
+\code{QdrantVectorStore(client=client, collection\_name=..., embedding=embeddings, retrieval\_mode=RetrievalMode.DENSE)}, passing the
+already-constructed \code{QdrantClient} directly.
+
+\code{similarity\_search\_with\_score()} returns
+\code{list[tuple[Document, float]]}. Each \code{Document} carries the
+passage text in \code{page\_content} and all \code{MemoryPayload} fields
+in \code{metadata}. The conversion to \code{RetrievedPassage} extracts
+\code{metadata["id"]} for the identity field and assigns
+\code{source="dense"}.
+
+\begin{lstlisting}[language=Python,
+  caption={QdrantVectorStore construction and dense retrieval},
+  label={lst:dense-retrieve}]
+# src/retrieval/dense_stage.py
+from langchain_qdrant import QdrantVectorStore, RetrievalMode
+from src.retrieval.types import RetrievedPassage
+from src.vector_store.tenant_ops import build_user_filter
+
+def dense_retrieve(
+    vector_store: QdrantVectorStore,
+    query: str,
+    user_id: str,
+    top_k: int = 50,
+    min_importance: float = 0.0,
+) -> list[RetrievedPassage]:
+    filt = build_user_filter(
+        user_id=user_id,
+        min_importance=min_importance,
+    )
+    hits = vector_store.similarity_search_with_score(
+        query,
+        k=top_k,
+        filter=filt,
+    )
+    results: list[RetrievedPassage] = []
+    for rank, (doc, score) in enumerate(
+        sorted(hits, key=lambda x: x[1], reverse=True), start=1
+    ):
+        results.append(
+            RetrievedPassage(
+                id=str(doc.metadata.get("id", doc.metadata.get("_id", ""))),
+                text=doc.page_content,
+                score=float(score),
+                rank=rank,
+                source="dense",
+                meta={k: v for k, v in doc.metadata.items()
+                      if k not in ("id", "_id")},
+            )
+        )
+    return results
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:dense-retrieve} deserve explanation.
+The \code{sorted(..., reverse=True)} step is applied even though
+\code{similarity\_search\_with\_score} typically returns results in score
+order, because the langchain-qdrant documentation does not guarantee that
+ordering contract across all versions --- an explicit sort costs nothing and
+protects against future ordering changes. The \code{id} extraction
+falls back to \code{\_id} because Qdrant point IDs are stored differently
+depending on whether the payload was written by \code{mem0} (which uses
+\code{id}) or a direct \code{upsert} call (which stores the Qdrant UUID in
+\code{\_id}).
+
+
+%% ------------------------------------------------------------
+\section{RRF Fusion: \texttt{reciprocal\_rank\_fusion()}}
+\label{sec:rrf-fusion}
+%% ------------------------------------------------------------
+
+The design problem is combining two ranked lists whose scores live in
+incomparable spaces. BM25 scores are term-frequency-based floats with no
+fixed upper bound; cosine similarity scores from the dense stage are bounded
+in $[-1, 1]$. Normalising them to a common range requires knowing the
+distribution of scores in both stages, which changes with the corpus and
+the query. Rank positions are always comparable. The governing principle is
+that fusion operates on rank positions, not on scores, and that a document
+is not discarded for appearing in only one list.
+
+The RRF formula for a document $d$ is:
+
+\[ \text{score}(d) = \sum_{i} \frac{1}{k + \text{rank}_i(d)} \]
+
+where the sum runs over each ranked list $i$ that contains $d$, $k = 60$
+by default, and $\text{rank}_i(d)$ is the 1-indexed position of $d$ in
+list $i$. A document appearing in only one list with rank~1 receives
+$1 / (60 + 1) \approx 0.016$. A document appearing in both lists at rank~1
+receives $2 \times 0.016 = 0.033$. The $k = 60$ default is from the
+original Cormack et al. (2009) paper. Lowering $k$ amplifies top-rank
+differences; 60 is the appropriate neutral choice for agent memory retrieval
+where no single retriever is systematically dominant.
+
+The function is generalised to \code{list[list[RetrievedPassage]]} rather
+than two fixed arguments so that HyDE (\S\ref{sec:hyde}) can contribute a
+third ranked list without requiring a function signature change.
+
+\begin{lstlisting}[language=Python,
+  caption={Reciprocal Rank Fusion over N ranked lists},
+  label={lst:rrf-fusion}]
+# src/retrieval/fusion.py
+from collections import defaultdict
+from src.retrieval.types import RetrievedPassage
+
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[RetrievedPassage]],
+    k: int = 60,
+    top_k: int = 100,
+) -> list[RetrievedPassage]:
+    scores: dict[str, float] = defaultdict(float)
+    registry: dict[str, RetrievedPassage] = {}
+    for ranked in ranked_lists:
+        for passage in ranked:
+            pid = passage["id"]
+            scores[pid] += 1.0 / (k + passage["rank"])
+            if pid not in registry:
+                registry[pid] = passage
+    sorted_ids = sorted(scores, key=lambda pid: scores[pid], reverse=True)
+    fused: list[RetrievedPassage] = []
+    for rank, pid in enumerate(sorted_ids[:top_k], start=1):
+        merged = dict(registry[pid])
+        merged["score"] = scores[pid]
+        merged["rank"] = rank
+        merged["source"] = "fused"
+        fused.append(merged)
+    return fused
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:rrf-fusion} deserve explanation.
+\code{defaultdict(float)} accumulates scores across all lists without
+requiring an existence check; a passage that appears in only one list simply
+receives one contribution. The \code{registry} dict stores the first
+encountered version of each passage --- its \code{text} and \code{meta} are
+identical across lists since they come from the same underlying corpus; the
+duplicate detection is on \code{id}. The \code{top\_k=100} ceiling exists
+because the cross-encoder reranker in the next section is $O(\text{candidates}
+\times \text{query length})$ at inference time; passing more than 100
+candidates to a CPU cross-encoder reliably exceeds a 200\,ms latency budget.
+
+
+%% ------------------------------------------------------------
+\section{flashrank Cross-Encoder Reranker}
+\label{sec:reranker}
+%% ------------------------------------------------------------
+
+The design problem is that bi-encoder retrieval scores the query and each
+passage independently. The query embedding and the passage embedding are
+computed separately and combined only at the very end with a dot product.
+This is fast enough to run over millions of passages, but it misses
+fine-grained interaction between query terms and passage terms. A
+cross-encoder receives the full (query, passage) pair and produces a joint
+score, capturing term-level interactions at the cost of being too slow
+to run over a full corpus. The governing principle is that the cross-encoder
+is a precision stage over a bounded pool, never a retrieval stage over an
+unbounded corpus.
+
+\code{flashrank} provides a cross-encoder reranker that runs on CPU without
+a GPU dependency. The official README identifies two models for production
+use. \code{ms-marco-TinyBERT-L-2-v2} (\textasciitilde{}4\,MB) is the library
+default: fast, low-memory. \code{ms-marco-MiniLM-L-12-v2}
+(\textasciitilde{}34\,MB) is labelled ``Best Cross-encoder'' in the
+official documentation and is the recommended production default for agent
+memory workloads where latency budget allows 100--200\,ms for reranking 100
+candidates.
+
+\begin{warningbox}
+\code{Ranker} loads the cross-encoder model into memory at
+\code{\_\_init\_\_} time. Instantiating it inside a per-request function
+reloads the model on every call, adding seconds of latency and exhausting
+memory. Instantiate \code{Ranker} once at process startup --- at module
+level or via dependency injection --- and pass the singleton to all
+calling code.
+\end{warningbox}
+
+flashrank passages are plain Python dicts with keys \code{id}, \code{text},
+and optionally \code{meta}. flashrank exports no \code{Passage} class.
+The listing below defines a local \code{FlashPassage} \code{TypedDict}
+as an author-defined adapter type to enforce structure before the
+\code{RerankRequest} call; it is not part of the flashrank API.
+
+\begin{notebox}
+flashrank \code{Ranker.rerank()} output scores are raw cross-encoder logit
+outputs --- for example, \code{0.0168}, \code{0.0116}, \code{0.00081}.
+They are \emph{not} softmax probabilities bounded in $(0, 1)$. Sort
+descending and take the top $K$; do not interpret the absolute values as
+confidence scores.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={FlashPassage adapter, Ranker factory, and rerank\_passages()},
+  label={lst:reranker}]
+# src/retrieval/reranker.py
+from typing import Any
+from typing_extensions import TypedDict
+from flashrank import Ranker, RerankRequest
+from src.retrieval.types import RetrievedPassage
+
+# Author-defined adapter; NOT a flashrank exported type.
+class FlashPassage(TypedDict):
+    id: int | str
+    text: str
+    meta: dict[str, Any]
+
+def build_ranker(
+    model_name: str = "ms-marco-MiniLM-L-12-v2",
+    max_length: int = 256,
+    cache_dir: str = "/opt/flashrank",
+) -> Ranker:
+    return Ranker(model_name=model_name, max_length=max_length,
+                 cache_dir=cache_dir)
+
+def rerank_passages(
+    ranker: Ranker,
+    query: str,
+    candidates: list[RetrievedPassage],
+    top_k: int = 5,
+) -> list[RetrievedPassage]:
+    flash_passages: list[FlashPassage] = [
+        FlashPassage(id=p["id"], text=p["text"], meta=p["meta"])
+        for p in candidates
+    ]
+    request = RerankRequest(query=query, passages=flash_passages)
+    reranked = ranker.rerank(request)
+    id_to_original = {p["id"]: p for p in candidates}
+    results: list[RetrievedPassage] = []
+    for rank, item in enumerate(
+        sorted(reranked, key=lambda x: x["score"], reverse=True)[:top_k],
+        start=1,
+    ):
+        base = dict(id_to_original[item["id"]])
+        base["score"] = float(item["score"])
+        base["rank"] = rank
+        base["source"] = "reranked"
+        results.append(base)
+    return results
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:reranker} deserve explanation.
+\code{id\_to\_original} maps flash passage IDs back to the original
+\code{RetrievedPassage} dicts so that all metadata fields survive the
+reranking round-trip --- flashrank returns only \code{id}, \code{text},
+and \code{score}. The \code{sorted(..., reverse=True)[:top\_k]} slice is
+applied to the reranker output rather than relying on the library's
+output ordering, because the official flashrank README does not guarantee
+that \code{rerank()} returns results in score-descending order. The
+\code{max\_length=256} default is appropriate for agent memory entries of
+one to three sentences; increasing it to 512 for short passages doubles
+attention computation without improving scores.
+
+The base pipeline is now complete. Sections~\ref{sec:hyde}
+and~\ref{sec:crag} are opt-in extensions.
+
+
+%% ------------------------------------------------------------
+\section{HyDE: Hypothetical Answer Embedding}
+\label{sec:hyde}
+%% ------------------------------------------------------------
+
+The design problem is that a short or ambiguous query embeds into a vector
+space region that is not close to the relevant passages, even though those
+passages clearly answer the query. The dense encoder learned a representation
+from passages, and a one-sentence question looks structurally very different
+from a one-paragraph answer in that space. HyDE closes this gap by generating
+a hypothetical answer --- a passage that \emph{looks like} the answer the
+corpus would provide --- and embedding that answer in place of the original
+query. The governing principle is that the hypothetical answer is only used
+as the dense query vector; BM25 always receives the original query because
+exact term matching benefits from the user's own vocabulary, not a generated
+paraphrase.
+
+\begin{warningbox}
+HyDE adds one full LLM round-trip before dense retrieval. Expected added
+latency is 200--500\,ms depending on model and load. It must be activated
+explicitly via \code{use\_hyde=True} and should be restricted to queries
+with \code{len(query.split()) < 10}. It is disabled by default. The HyDE
+call uses a separate, cheaper model (\code{gpt-4o-mini} or
+\code{claude-haiku-3}) --- never the primary agent reasoning model.
+\end{warningbox}
+
+The hypothetical answer is validated with a \code{HypotheticalAnswer}
+Pydantic model before its embedding is computed. A degenerate one-word
+output would embed near the centre of the space and return worse results
+than the original query. On \code{ValidationError}, the function falls back
+silently to the original query, degrading to standard dense retrieval rather
+than raising.
+
+\begin{lstlisting}[language=Python,
+  caption={HyDE hypothetical answer prompt (hyde\_v1.jinja2)},
+  label={lst:hyde-prompt}]
+{# prompts/hyde_v1.jinja2 #}
+{# Versioned per Chapter 9 §9.1 rules. #}
+You are generating a passage for a memory retrieval system.
+Write a single paragraph (3–5 sentences) that directly answers the
+following query as if it were an entry in the agent's memory corpus.
+Do not hedge or qualify. Write the answer, not a description of the answer.
+
+Query: {{ query }}
+
+Answer:
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={HypotheticalAnswer model and generation function},
+  label={lst:hyde-generate}]
+# src/retrieval/hyde.py
+import litellm
+import instructor
+from pydantic import BaseModel, model_validator
+
+client = instructor.from_litellm(litellm.completion)
+
+class HypotheticalAnswer(BaseModel):
+    text: str
+
+    @model_validator(mode="after")
+    def must_be_substantive(self) -> "HypotheticalAnswer":
+        if len(self.text.split()) < 20:
+            raise ValueError(
+                "hypothetical answer too short for useful embedding"
+            )
+        return self
+
+def generate_hypothetical_answer(
+    query: str,
+    model: str = "gpt-4o-mini",
+) -> str:
+    try:
+        result = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user",
+                       "content": f"Query: {query}\n\nAnswer:"}],
+            response_model=HypotheticalAnswer,
+        )
+        return result.text
+    except Exception:
+        return query  # fallback to original query
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:hyde-generate} deserve explanation.
+The broad \code{except Exception} fallback is intentional here: HyDE is an
+optional enhancement, and any failure --- network error, validation failure,
+or model refusal --- should degrade gracefully to standard dense retrieval
+rather than propagating an exception that would abort the entire retrieval
+pipeline. The \code{instructor.from\_litellm(litellm.completion)} pattern
+patches the LiteLLM completion function to extract and validate the
+\code{HypotheticalAnswer} structured output; it does not require a separate
+OpenAI or Anthropic client and is therefore consistent with the LiteLLM
+abstraction established in Chapter~5.
+
+
+%% ------------------------------------------------------------
+\section{CRAG: Retrieval Grader and Re-Retrieval Branch}
+\label{sec:crag}
+%% ------------------------------------------------------------
+
+The design problem is that neither the base pipeline nor HyDE can detect
+when their output is insufficient. A query whose relevant memories were
+never stored, or whose context requires a wider importance threshold, will
+silently produce a low-quality context window. The governing principle is
+that relevance judgment must be a first-class node in the graph, and that
+a negative judgment triggers a second retrieval attempt with widened
+parameters before the system falls back to a conservative answer.
+
+The grader is a regular LangGraph node that uses the Pydantic-validated
+structured output pattern from Chapter~4 \S4.3. It calls one LiteLLM binary
+classification prompt, extracts a \code{GradeResult} via \code{instructor},
+and writes \code{retrieval\_grade} into state. The conditional edge reads
+that field: \code{"RELEVANT"} routes to generation; \code{"NOT\_RELEVANT"}
+routes to re-retrieval. A cycle counter\code{crag\_attempts} caps the loop
+at two iterations before the graph forces generation regardless of grade,
+preventing infinite re-retrieval loops.
+
+The re-retrieval node calls the same pipeline functions as the first pass
+but widens \code{top\_k} from 50 to 80 and relaxes \code{min\_importance}
+to 0.0, recovering memories that would have been filtered out by a stricter
+threshold.
+
+\begin{lstlisting}[language=Python,
+  caption={GradeResult model and retrieval grader node},
+  label={lst:crag-grader}]
+# src/retrieval/crag_nodes.py
+from typing import Literal
+from typing_extensions import TypedDict
+from pydantic import BaseModel
+import litellm
+import instructor
+from src.retrieval.types import RetrievedPassage
+
+client = instructor.from_litellm(litellm.completion)
+
+class GradeResult(BaseModel):
+    grade: Literal["RELEVANT", "NOT_RELEVANT"]
+    reason: str  # logged to Langfuse as span metadata (Ch. 23)
+
+class CRAGState(TypedDict):
+    query: str
+    user_id: str
+    final_passages: list[RetrievedPassage]
+    retrieval_grade: Literal["RELEVANT", "NOT_RELEVANT"] | None
+    crag_attempts: int
+
+GRADER_MODEL = "gpt-4o-mini"
+
+def retrieval_grader_node(state: CRAGState) -> dict:
+    passages_text = "\n".join(
+        f"{i+1}. {p['text'][:200]}"
+        for i, p in enumerate(state["final_passages"])
+    )
+    result = client.chat.completions.create(
+        model=GRADER_MODEL,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Query: {state['query']}\n\nPassages:\n{passages_text}\n\n"
+                "Are these passages relevant to the query? "
+                "Respond RELEVANT or NOT_RELEVANT with a one-sentence reason."
+            ),
+        }],
+        response_model=GradeResult,
+    )
+    return {"retrieval_grade": result.grade}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={CRAG StateGraph with cycle-bounded conditional edge},
+  label={lst:crag-graph}]
+# src/retrieval/crag_graph.py
+from langgraph.graph import StateGraph
+from src.retrieval.crag_nodes import CRAGState, retrieval_grader_node
+from src.retrieval.crag_nodes import GradeResult
+
+MAX_CRAG_ATTEMPTS = 2
+
+def re_retrieval_node(state: CRAGState) -> dict:
+    # wider top_k, relaxed importance — same pipeline functions
+    from src.retrieval.bm25_stage import bm25_retrieve
+    from src.retrieval.dense_stage import dense_retrieve
+    from src.retrieval.fusion import reciprocal_rank_fusion
+    from src.retrieval.reranker import rerank_passages
+    # caller injects index, vector_store, ranker via context_schema
+    raise NotImplementedError("inject via context_schema — see Ch. 11 §11.7")
+
+def should_re_retrieve(
+    state: CRAGState,
+) -> Literal["re_retrieve", "generate"]:
+    if state["crag_attempts"] >= MAX_CRAG_ATTEMPTS:
+        return "generate"
+    if state["retrieval_grade"] == "NOT_RELEVANT":
+        return "re_retrieve"
+    return "generate"
+
+def build_crag_graph() -> StateGraph:
+    builder = StateGraph(state_schema=CRAGState)
+    builder.add_node("retrieval_grader", retrieval_grader_node)
+    builder.add_node("re_retrieval", re_retrieval_node)
+    builder.set_entry_point("retrieval_grader")
+    builder.add_conditional_edges(
+        "retrieval_grader",
+        should_re_retrieve,
+        {"re_retrieve": "re_retrieval", "generate": "__end__"},
+    )
+    builder.add_edge("re_retrieval", "retrieval_grader")
+    return builder.compile()
+\end{lstlisting}
+
+Three decisions in Listings~\ref{lst:crag-grader} and~\ref{lst:crag-graph}
+deserve explanation. \code{should\_re\_retrieve} checks
+\code{crag\_attempts >= MAX\_CRAG\_ATTEMPTS} \emph{before} checking the
+grade, ensuring the cycle limit is enforced even if the grader consistently
+returns \code{NOT\_RELEVANT}. The \code{reason} field on \code{GradeResult}
+is included not for programmatic use but for observability: Chapter~23
+attaches it as span metadata in Langfuse, making grader decisions inspectable
+after the fact without re-running the query. \code{StateGraph(state\_schema=CRAGState)} is the correct constructor; the \code{config\_schema}
+parameter is deprecated as of LangGraph v0.6.0 --- use \code{context\_schema=}
+if immutable per-run context (such as the injected \code{Ranker} singleton)
+needs to be passed into nodes.
+
+
+%% ------------------------------------------------------------
+\section{Quality Metrics as pytest Assertions}
+\label{sec:metrics}
+%% ------------------------------------------------------------
+
+The final design problem is proving that the pipeline actually works. Teams
+frequently declare retrieval ``good enough'' after passing a handful of manual
+spot checks, which proves nothing about systematic behaviour across a
+diverse query set. The governing principle is that retrieval quality is
+expressed as machine-checkable thresholds over a committed fixture dataset,
+not as aspirational guidelines, and that the tests call the full pipeline
+end-to-end rather than mocking individual stages.
+
+Three metrics are measured. \textbf{Precision@5} is the fraction of the
+five returned passages that are relevant: $\text{P@5} = |\text{relevant}
+\cap \text{top5}| / 5$. \textbf{Recall@5} is the fraction of all relevant
+passages that appear in the top five: $\text{R@5} = |\text{relevant} \cap
+\text{top5}| / |\text{relevant}|$. \textbf{MRR} is the mean reciprocal
+rank of the first relevant passage across all queries; a query with no
+relevant passage in the top five contributes 0. Each metric is averaged over
+all fixture queries before the threshold comparison --- a single difficult
+query does not break the suite, but systematic degradation does.
+
+The fixture dataset requirements are non-negotiable constraints:
+
+\begin{itemize}
+  \item Minimum 20 \code{EvalQuery} records committed to
+    \code{tests/fixtures/retrieval\_eval.json} --- never generated at test
+    runtime.
+  \item Each query has 2--5 explicitly labelled \code{relevant\_ids}.
+  \item Corpus size \(\_\geq\)\, 200 passages. A 20-passage corpus makes
+    Recall@5 trivially achievable; 200 makes it a real constraint.
+  \item Dense retrieval uses \code{QdrantClient(":memory:")} with
+    Chapter~10's \code{create\_agent\_memory\_collection()} and
+    \code{setup\_payload\_indexes()} called in the fixture setup --- CI
+    uses the same collection schema as production.
+\end{itemize}
+
+\begin{lstlisting}[language=Python,
+  caption={EvalQuery model and metric functions},
+  label={lst:metrics}]
+# src/retrieval/metrics.py
+from pydantic import BaseModel
+
+class EvalQuery(BaseModel):
+    query_id: str
+    query: str
+    relevant_ids: list[str]  # len in [2, 5]
+
+def precision_at_k(
+    retrieved_ids: list[str], relevant_ids: list[str], k: int = 5
+) -> float:
+    top_k = retrieved_ids[:k]
+    hits = len(set(top_k) & set(relevant_ids))
+    return hits / k
+
+def recall_at_k(
+    retrieved_ids: list[str], relevant_ids: list[str], k: int = 5
+) -> float:
+    if not relevant_ids:
+        return 0.0
+    top_k = retrieved_ids[:k]
+    hits = len(set(top_k) & set(relevant_ids))
+    return hits / len(relevant_ids)
+
+def mean_reciprocal_rank(
+    retrieved_ids: list[str], relevant_ids: list[str]
+) -> float:
+    rel_set = set(relevant_ids)
+    for i, pid in enumerate(retrieved_ids, start=1):
+        if pid in rel_set:
+            return 1.0 / i
+    return 0.0
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={pytest threshold assertions over the full pipeline},
+  label={lst:quality-tests}]
+# tests/retrieval/test_retrieval_quality.py
+import json, statistics, pytest
+from qdrant_client import QdrantClient
+from src.retrieval.metrics import (
+    EvalQuery, precision_at_k, recall_at_k, mean_reciprocal_rank
+)
+from src.vector_store.collection_setup import create_agent_memory_collection
+from src.vector_store.index_setup import setup_payload_indexes
+
+P5_THRESHOLD  = 0.7
+R5_THRESHOLD  = 0.8
+MRR_THRESHOLD = 0.6
+
+@pytest.fixture(scope="module")
+def eval_queries() -> list[EvalQuery]:
+    raw = json.loads(
+        open("tests/fixtures/retrieval_eval.json").read()
+    )
+    return [EvalQuery(**r) for r in raw]
+
+@pytest.fixture(scope="module")
+def qdrant_memory():
+    client = QdrantClient(":memory:")
+    create_agent_memory_collection(client, dims=1536)
+    setup_payload_indexes(client, "agent_memory")
+    return client
+
+def run_pipeline(query: str, qdrant_client) -> list[str]:
+    """Returns top-5 passage IDs from full pipeline."""
+    # bm25_retrieve + dense_retrieve + reciprocal_rank_fusion
+    # + rerank_passages — abbreviated here; full impl in src/
+    raise NotImplementedError
+
+def test_precision_at_5(eval_queries, qdrant_memory):
+    scores = [
+        precision_at_k(run_pipeline(q.query, qdrant_memory),
+                       q.relevant_ids)
+        for q in eval_queries
+    ]
+    assert statistics.mean(scores) >= P5_THRESHOLD
+
+def test_recall_at_5(eval_queries, qdrant_memory):
+    scores = [
+        recall_at_k(run_pipeline(q.query, qdrant_memory),
+                    q.relevant_ids)
+        for q in eval_queries
+    ]
+    assert statistics.mean(scores) >= R5_THRESHOLD
+
+def test_mrr(eval_queries, qdrant_memory):
+    scores = [
+        mean_reciprocal_rank(run_pipeline(q.query, qdrant_memory),
+                             q.relevant_ids)
+        for q in eval_queries
+    ]
+    assert statistics.mean(scores) >= MRR_THRESHOLD
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:quality-tests} deserve explanation.
+\code{scope="module"} on both fixtures ensures that the in-memory Qdrant
+instance and the eval dataset are constructed once per test module run,
+not once per test function --- construction is not cheap and the fixtures
+are read-only within the test module. The \code{statistics.mean(scores)}
+aggregation is intentional: the threshold applies to the \emph{mean} across
+all 20+ queries, not to each query individually. A single hard query with
+zero recall is informative but not a build-breaker; if the mean drops below
+threshold, the pipeline has regressed systematically.
+
+Chapter~12 extends this pipeline by adding a Neo4j knowledge graph retrieval
+stage that contributes a third ranked list to \code{reciprocal\_rank\_fusion}.
+The \code{RetrievedPassage} type, the RRF function signature, and the
+quality test fixture are all designed to accommodate that extension without
+modification.
