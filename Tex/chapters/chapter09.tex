@@ -3,8 +3,6 @@
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
 %% ============================================================
 
-\chapter{Chapter 9 --- Behavior Must Be Versioned: Procedural Memory}
-
 \chapterquote{If an agent remembers facts but forgets how to work, it will fail correctly and uselessly.}{anon}
 
 The production failure this chapter prevents is behavioural drift hidden behind apparently stable infrastructure. An agent can retain correct user facts, route to the right tools, and still regress because the workflow instructions that tell it how to perform a task changed invisibly, were overwritten without review, or cannot be rolled back after a bad deployment. That failure is expensive because it looks like model unreliability when the real cause is unversioned procedure: the system forgot not what the world is, but how it is supposed to act.
