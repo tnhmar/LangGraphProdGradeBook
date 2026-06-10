@@ -110,29 +110,118 @@ Table~\ref{tab:mcp-terms} defined the three roles. Their runtime
 boundaries are best understood as a data-flow sequence, reproduced
 below as an annotated ASCII diagram.
 
-\begin{lstlisting}[language=bash,
-                   caption={MCP role boundaries and data flow},
-                   label={lst:mcp-boundary}]
-┌──────────────────────────────────────────────┐
-│  HOST: LangGraph StateGraph                  │
-│  Owns the LLM reasoning loop.                │
-│  Receives list[BaseTool] — nothing else.     │
-│  Never imports mcp.* wire-protocol modules.  │
-└───────────────────┬──────────────────────────┘
-                    │  list[BaseTool]
-┌───────────────────▼──────────────────────────┐
-│  CLIENT: MultiServerMCPClient                │
-│  Speaks MCP wire protocol.                   │
-│  Opens one ClientSession per server.         │
-│  Runs initialize() capability handshake.     │
-│  Fetches tools/list → populates BaseTool.    │
-└──────┬──────────────────────┬────────────────┘
-       │  streamable_http      │  stdio
-┌──────▼──────────┐   ┌───────▼──────────────┐
-│ FastMCP Server A│   │ FastMCP Server B      │
-│ POST /mcp :8000 │   │ subprocess (dev only) │
-└─────────────────┘   └──────────────────────┘
-\end{lstlisting}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  %% Base node styles
+  layer/.style={
+    rectangle,
+    draw=BookBlue,
+    fill=BookBlue!8,
+    rounded corners=4pt,
+    text width=72mm,
+    minimum height=18mm,
+    align=center,
+    font=\sffamily\small
+  },
+  server/.style={
+    rectangle,
+    draw=BookDark,
+    fill=BookDark!6,
+    rounded corners=3pt,
+    text width=34mm,
+    minimum height=14mm,
+    align=center,
+    font=\sffamily\small
+  },
+  %% Arrow style
+  flow/.style={
+    ->,
+    >=Stealth,
+    thick,
+    color=BookBlue
+  },
+  sideflow/.style={
+    ->,
+    >=Stealth,
+    thick,
+    color=BookDark,
+    dashed
+  },
+  label/.style={
+    font=\sffamily\footnotesize\itshape,
+    color=BookMid
+  }
+]
+
+%% ── Layer nodes (top to bottom) ──────────────────────────────
+
+\node[layer] (host) {
+  \textbf{\color{BookBlue}HOST}\\[3pt]
+  \texttt{LangGraph StateGraph}\\[2pt]
+  {\footnotesize Owns the LLM reasoning loop.}\\
+  {\footnotesize Receives \texttt{list[BaseTool]} only.}\\
+  {\footnotesize Never imports \texttt{mcp.*} wire modules.}
+};
+
+\node[layer, below=14mm of host] (client) {
+  \textbf{\color{BookBlue}CLIENT}\\[3pt]
+  \texttt{MultiServerMCPClient}\\[2pt]
+  {\footnotesize Speaks MCP wire protocol.}\\
+  {\footnotesize Opens one \texttt{ClientSession} per server.}\\
+  {\footnotesize Runs \texttt{initialize()} + \texttt{tools/list}.}
+};
+
+%% ── Servers (side by side below client) ──────────────────────
+
+\node[server, below left=14mm and 18mm of client] (serverA) {
+  \textbf{FastMCP Server A}\\[2pt]
+  {\footnotesize \texttt{POST /mcp :8000}}\\
+  {\footnotesize streamable\_http}\\
+  {\footnotesize \textit{production}}
+};
+
+\node[server, below right=14mm and 18mm of client] (serverB) {
+  \textbf{FastMCP Server B}\\[2pt]
+  {\footnotesize \texttt{stdin/stdout}}\\
+  {\footnotesize stdio transport}\\
+  {\footnotesize \textit{local dev / CI only}}
+};
+
+%% ── Arrows ────────────────────────────────────────────────────
+
+%% Host ↔ Client: bidirectional, labelled
+\draw[flow] (host.south) -- node[label, right=2pt]
+  {\texttt{list[BaseTool]}} (client.north);
+
+%% Client → Server A: solid (production path)
+\draw[flow] (client.south) -- node[label, left=2pt]
+  {\texttt{streamable\_http}} (serverA.north);
+
+%% Client → Server B: dashed (dev-only path)
+\draw[sideflow] (client.south) -- node[label, right=2pt]
+  {\texttt{stdio}} (serverB.north);
+
+%% ── Role boundary annotations ─────────────────────────────────
+
+\node[label, right=4pt of host.east, anchor=west,
+      text width=28mm] {
+  \textit{Role boundary:}\\no wire-protocol\\imports below this line
+};
+
+\node[label, right=4pt of client.east, anchor=west,
+      text width=28mm] {
+  \textit{Role boundary:}\\no business logic\\below this line
+};
+
+\end{tikzpicture}
+\caption{MCP role boundaries and data flow.
+  Solid arrows carry production traffic; the dashed arrow indicates
+  the stdio transport, which is restricted to local development and CI\@.
+  The host layer never crosses the lower role boundary.}
+\label{fig:mcp-boundary}
+\end{figure}
+
 
 Two properties of this diagram must be understood before any code is
 written. First, the host never imports anything from the MCP wire-protocol
