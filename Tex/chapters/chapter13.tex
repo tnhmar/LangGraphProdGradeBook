@@ -1,8 +1,813 @@
 %% ============================================================
 %%  Chapter 13 --- Semantic Caching
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langchain-community >= 0.3.0,
+%%                langchain-core >= 0.3.0,
+%%                redis >= 5.0.0,
+%%                prometheus-client >= 0.20.0,
+%%                langfuse >= 2.35.0,
+%%                pydantic-settings >= 2.3.0
 %% ============================================================
 
 \chapterquote{The cheapest LLM call is the one you never make.}{anon}
 
-% TODO: Chapter 13 content
+The production failure this chapter prevents is silent and cumulative. An
+agent that calls an LLM for every incoming query pays the full inference
+cost on each one, including queries it has answered correctly dozens of
+times before. A customer-support assistant serving 50\,000 daily queries
+with a 40\% repeat-question rate is spending \$0.02 per duplicate call
+--- \$400 per day, \$146\,000 per year --- on computation whose result is
+already known. The failure is not a crash; it is a margin leak that
+compounds invisibly until someone examines the billing dashboard. The
+second failure mode is subtler: when semantic caching is added without a
+calibrated similarity threshold, the cache begins returning responses to
+queries that are merely related, not identical, to the cached prompt. An
+agent that answers a question about GPT-4o pricing with a cached response
+from a question about GPT-3.5 pricing has not saved cost --- it has
+amplified a stale answer at scale. Both failures share the same root
+cause: caching was treated as an optimisation to add later rather than a
+correctness constraint to design from the start.
+
+The solution this chapter builds has four layers. The first is a
+\emph{threshold layer}: a \code{RedisSemanticCache} configured with a
+calibrated \code{score\_threshold} that controls how similar two queries
+must be before the cached response is considered valid. The second is a
+\emph{tier layer}: an exact Redis string cache checked before the
+semantic cache, so that byte-identical queries always receive a
+guaranteed-fresh response without incurring embedding overhead. The third
+is an \emph{invalidation layer}: a tool-result hash scheme that prevents
+tool-dependent LLM responses from being cached under prompt keys that
+cannot reflect changes in the tool's output. The fourth is an
+\emph{observability layer}: per-tier Prometheus counters and Langfuse
+events that make hit rate a queryable signal rather than a guessed
+property.
+
+The sections must be read in order because each one closes a gap the
+previous one left open. Section~\ref{sec:cache-threshold} establishes the
+semantic cache and the threshold contract; without it, there is no cache
+to query. Section~\ref{sec:cache-tiers} adds the exact cache tier and
+defines the lookup order that makes the system correct; the two-tier
+lookup function it produces becomes the call site that all later sections
+instrument. Section~\ref{sec:cache-invalidation} handles the case the
+first two sections cannot: tool-dependent responses whose staleness is
+invisible to any similarity metric. Section~\ref{sec:cache-metrics}
+closes the chapter by making the behaviour of all three prior sections
+observable and tunable without log parsing.
+
+This chapter introduces five terms defined in Table~\ref{tab:ch13-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~13}
+\label{tab:ch13-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{score\_threshold} &
+  Cosine \emph{similarity} parameter on \code{RedisSemanticCache};
+  higher values are stricter. The library default is \code{0.2}; the
+  production minimum recommended here is \code{0.9}. Below \code{0.85}
+  false hits become measurable; above \code{0.98} the cache degrades
+  toward exact matching. \\
+\code{CacheLookupResult} &
+  \code{TypedDict} with \code{hit: bool}, \code{tier: str}
+  (\code{"exact"} \textbar{} \code{"semantic"} \textbar{} \code{"miss"}),
+  and \code{value: str \textbar{} None}; the unified return type
+  across both cache tiers and all callers. \\
+\code{CacheInvalidationEvent} &
+  Pydantic model emitted when a tool result hash changes; carries
+  \code{affected\_cache\_keys} and triggers immediate Redis key
+  deletion via \code{client.delete()}. \\
+\code{CacheMetricsEmitter} &
+  Class that wraps \code{prometheus\_client.Counter} increments and
+  \code{langfuse.event()} calls behind a single \code{emit()} method;
+  decouples metric emission from cache lookup logic. \\
+Two-tier cache &
+  Exact Redis string cache (TTL 1\,h) checked before
+  \code{RedisSemanticCache}; the \code{tier} field on every
+  \code{CacheLookupResult} determines which Prometheus label is
+  incremented. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The source layout for this chapter is:
+
+\begin{verbatim}
+src/
+  cache/
+    settings.py       # §13.4 -- CacheSettings (BaseSettings)
+    semantic_cache.py # §13.1 -- build_semantic_cache()
+    exact_cache.py    # §13.2 -- exact_cache_get/set,
+                      #          two_tier_lookup, CacheLookupResult
+    tool_cache.py     # §13.3 -- tool_result_cache_key,
+                      #          check_and_invalidate,
+                      #          CacheInvalidationEvent
+    metrics.py        # §13.4 -- CacheMetricsEmitter,
+                      #          CACHE_HITS, CACHE_MISSES
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{Score Threshold Is a Safety Parameter}
+\label{sec:cache-threshold}
+%% ------------------------------------------------------------
+
+The design problem is that \code{RedisSemanticCache} ships with a
+\code{score\_threshold} default of \code{0.2} --- a value low enough to
+admit cache hits for queries that are merely topically related rather
+than semantically equivalent. At \code{0.2}, a cosine similarity of just
+20\% is enough to return a cached response: two prompts that share a
+handful of domain-specific tokens but ask entirely different questions
+will regularly collide in the cache. The naive approach --- deploying the
+cache with default settings and trusting that the library chose a safe
+default --- is wrong because the library chose a default optimised for
+recall, not for correctness. The governing principle is that
+\code{score\_threshold} must be understood as a correctness control and
+set explicitly to a value whose safety can be reasoned about, not
+inherited from a default whose implications have not been examined.
+
+To reason about the threshold, it helps to state what cosine similarity
+measures. Two prompt embeddings at cosine similarity 0.9 are within
+approximately 26\textdegree{} of each other in the embedding space. At
+that angle, paraphrases of the same question cluster tightly: ``What is
+the refund policy?'' and ``How do I get a refund?'' are typically at
+similarity 0.92--0.96 for a sentence-level encoder. At similarity 0.85,
+related but distinct questions begin to cluster: ``What is the return
+window?'' and ``What is the refund policy?'' may land at 0.87. Below
+0.85, false hits --- where a cached response for one question is served
+for a genuinely different question --- become measurable in A/B tests on
+production traffic. This phenomenon is \emph{semantic hallucination
+amplification}: the cache serves a plausible but wrong answer at cache
+speed, with no indication that a cache hit occurred and no retry
+mechanism to catch it. The production minimum recommended here is
+\code{score\_threshold=0.9}. Above \code{0.98}, the threshold approaches
+exact matching and the semantic hit rate collapses to near zero --- the
+cache consumes Redis memory and embedding compute with no return.
+
+\begin{notebox}
+\code{RedisSemanticCache} is available from two packages.
+\code{langchain\_community.cache.RedisSemanticCache} is the stable,
+confirmed path (\texttt{langchain-community >= 0.3}). The newer
+\texttt{langchain-redis} package (\texttt{>= 0.1}) re-exports a
+\code{RedisSemanticCache} with an updated \code{distance\_threshold}
+parameter (cosine \emph{distance} rather than similarity --- lower is
+stricter). If your project uses \texttt{langchain-redis}, replace
+\code{score\_threshold=0.9} with \code{distance\_threshold=0.1}
+throughout --- the two values are equivalent (\(1 - 0.9 = 0.1\)).
+All listings in this chapter use the \texttt{langchain-community} path
+because its constructor signature is confirmed by the live API reference.
+\code{LangCacheSemanticCache}, also in \texttt{langchain-redis}, is a
+managed cloud alternative excluded here because it introduces an external
+API dependency incompatible with the self-hosted deployment pattern this
+book targets.
+\end{notebox}
+
+A second constraint governs the embedding model passed to
+\code{RedisSemanticCache}: it must be identical to the model used by the
+Qdrant vector store introduced in Chapter~10. The cache and the retrieval
+pipeline operate in the same embedding space only if they use the same
+encoder. If they differ, a query that the cache considers a near-miss may
+be a strong retrieval hit in Qdrant's space, and vice versa. The
+\code{score\_threshold} guarantee holds only within a single, consistent
+embedding space. The enforcement mechanism is a shared \code{embeddings}
+singleton injected from \code{CacheSettings}
+(Section~\ref{sec:cache-metrics}) into both the cache factory and the
+Qdrant client factory --- the same object reference, not two instances
+of the same class.
+
+\begin{warningbox}
+LiteLLM-proxied completion calls do \emph{not} go through LangChain's
+\code{set\_llm\_cache()} global. \code{set\_llm\_cache()} is a
+side-effect on \code{langchain\_core.globals} that intercepts only
+\code{ChatModel.invoke()} calls made through the LangChain abstraction.
+For LiteLLM, caching is configured separately via
+\code{litellm.cache = Cache(type="redis", host=..., port=...,} \\
+\code{password=...)} before any \code{litellm.completion()} call. Both
+must be configured. A system that sets only \code{set\_llm\_cache()} and
+uses LiteLLM as its completion backend will have zero cache hits and no
+error to explain why.
+\end{warningbox}
+
+With the threshold contract established, the factory function for the
+semantic cache encodes the safety constraint directly. A misconfigured
+\code{score\_threshold} supplied via environment variable causes an
+immediate \code{AssertionError} during the application boot sequence ---
+before any request is served --- rather than silently degrading
+correctness for hours.
+
+\begin{lstlisting}[language=Python,
+  caption={Semantic cache factory with threshold assertion},
+  label={lst:semantic-cache}]
+# src/cache/semantic_cache.py
+import litellm
+from langchain_community.cache import RedisSemanticCache
+from langchain_core.embeddings import Embeddings
+from langchain_core.globals import set_llm_cache
+from litellm.caching import Cache
+
+def build_semantic_cache(
+    redis_url: str,
+    embeddings: Embeddings,
+    score_threshold: float = 0.9,
+) -> RedisSemanticCache:
+    assert score_threshold >= 0.85, (
+        f"score_threshold={score_threshold} risks semantic false hits; "
+        "minimum safe value is 0.85."
+    )
+    cache = RedisSemanticCache(
+        redis_url=redis_url,
+        embedding=embeddings,
+        score_threshold=score_threshold,
+    )
+    set_llm_cache(cache)
+    litellm.cache = Cache(
+        type="redis",
+        host=redis_url.split("://")[1].split(":")[0],
+        port=int(redis_url.split(":")[-1].split("/")[0]),
+    )
+    return cache
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:semantic-cache} deserve explanation.
+The \code{assert} fires at process startup, not at cache-query time,
+because a wrong \code{score\_threshold} delivered via a misconfigured
+\code{SEMANTIC\_SCORE\_THRESHOLD} environment variable would otherwise
+produce plausible-looking responses for hours before anyone noticed the
+elevated false-hit rate in Langfuse. The \code{set\_llm\_cache(cache)}
+call registers the \code{RedisSemanticCache} instance globally for all
+LangChain \code{ChatModel} calls; the separate \code{litellm.cache =
+Cache(...)} registration targets LiteLLM-proxied calls --- the two
+registrations cover different call paths on the same Redis backend and
+are not redundant. The \code{redis\_url} parsing is intentionally naive:
+in production, \code{CacheSettings} (Section~\ref{sec:cache-metrics})
+provides \code{host} and \code{port} as separate fields so this
+string-splitting is replaced by direct field access.
+
+The semantic cache is now in place and correctly bounded. The problem it
+cannot solve is lookup order: a semantic cache checked first will return
+a near-match response even when the byte-identical prompt has a cached
+response that is guaranteed correct, wasting embedding compute and
+potentially serving an inferior answer. That ordering problem is what the
+next section resolves.
+
+
+%% ------------------------------------------------------------
+\section{Lookup Order Is a Correctness Decision}
+\label{sec:cache-tiers}
+%% ------------------------------------------------------------
+
+The design problem is that a semantic cache checked first will return a
+near-match response even when the byte-identical prompt has a cached
+response that is guaranteed correct. The near-match may be very close ---
+similarity 0.97 --- but it is not the same prompt. An agent that answered
+``What is the refund policy for order \#1042?'' should not have its
+response served for ``What is the refund policy for order \#1043?'' even
+if the two questions embed at similarity 0.97, because order numbers are
+identity keys, not semantic content. The naive two-cache system that
+checks the semantic cache first has no mechanism to detect this. The
+governing principle is that the exact cache is checked first because an
+exact key match is the only match that carries a \emph{correctness}
+guarantee, and correctness takes precedence over throughput.
+
+The exact cache uses a thin wrapper over \code{redis.Redis}: the key is
+\code{"exact\_cache:" + hashlib.sha256(prompt.encode()).hexdigest()},
+and the value is the JSON-serialised response stored with \code{SETEX}.
+The SHA-256 key is deterministic across process restarts, collision-resistant
+at any realistic corpus size, and --- critically --- does not include the
+raw prompt text. Storing the raw prompt as a Redis key creates a memory
+leak proportional to prompt length on every unique query, bounded only
+by the TTL or by Redis eviction policy. The TTL for the exact cache tier
+is 3\,600 seconds (1\,hour): short enough to ensure freshness for
+high-frequency repeated queries, long enough to absorb traffic spikes
+without every request hitting the LLM.
+
+Serialisation uses \code{json.dumps} exclusively. Pickle is excluded
+because it creates a deserialisation code-execution vulnerability if the
+Redis instance is reachable from outside the private network. An attacker
+with write access to Redis can craft a pickle payload that executes
+arbitrary code when any process calls \code{redis.Redis.get()}. JSON has
+no equivalent attack surface: a malformed JSON value raises
+\code{json.JSONDecodeError}, not a shell.
+
+\begin{lstlisting}[language=Python,
+  caption={CacheLookupResult and exact cache read/write operations},
+  label={lst:exact-cache}]
+# src/cache/exact_cache.py
+import hashlib, json
+import redis as _redis
+from typing_extensions import TypedDict
+
+class CacheLookupResult(TypedDict):
+    hit:   bool
+    tier:  str          # "exact" | "semantic" | "miss"
+    value: str | None
+
+def _exact_key(prompt: str, prefix: str) -> str:
+    digest = hashlib.sha256(prompt.encode()).hexdigest()
+    return f"{prefix}:{digest}"
+
+def exact_cache_get(
+    client: _redis.Redis,
+    prompt: str,
+    prefix: str = "exact_cache",
+) -> CacheLookupResult:
+    raw = client.get(_exact_key(prompt, prefix))
+    if raw is not None:
+        return CacheLookupResult(
+            hit=True, tier="exact", value=raw.decode()
+        )
+    return CacheLookupResult(hit=False, tier="miss", value=None)
+
+def exact_cache_set(
+    client: _redis.Redis,
+    prompt: str,
+    response: str,
+    ttl: int = 3600,
+    prefix: str = "exact_cache",
+) -> None:
+    client.setex(
+        _exact_key(prompt, prefix), ttl, json.dumps(response)
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:exact-cache} deserve explanation.
+\code{\_exact\_key()} is extracted as a private helper rather than
+inlined in both \code{exact\_cache\_get} and \code{exact\_cache\_set}
+because the key construction logic must be identical on read and write
+--- any divergence between the two (a different prefix, a different
+encoding) produces a permanent cache miss with no error to diagnose. A
+shared function makes the identity guarantee structural. \code{raw.decode()}
+converts the bytes returned by \code{redis.Redis.get()} to a Python
+string because \code{redis-py} returns \code{bytes} by default. Using
+\code{decode\_responses=True} on the client constructor is an
+alternative, but it applies globally to all keys and can break binary
+key consumers sharing the same client instance.
+
+With the exact cache operations defined, the two-tier lookup function
+enforces the ordering contract --- exact first, semantic second --- and
+returns a \code{CacheLookupResult} whose \code{tier} field records which
+layer was responsible for the hit or miss. This \code{tier} field is the
+single piece of state that the observability layer in
+Section~\ref{sec:cache-metrics} needs to route to the correct Prometheus
+label.
+
+\begin{lstlisting}[language=Python,
+  caption={Two-tier lookup: exact then semantic, unified return type},
+  label={lst:two-tier-lookup}]
+# src/cache/exact_cache.py (continued)
+from langchain_community.cache import RedisSemanticCache
+
+def two_tier_lookup(
+    client: _redis.Redis,
+    semantic_cache: RedisSemanticCache,
+    prompt: str,
+    llm_string: str,
+) -> CacheLookupResult:
+    exact = exact_cache_get(client, prompt)
+    if exact["hit"]:
+        return exact
+
+    generations = semantic_cache.lookup(prompt, llm_string)
+    if generations:
+        # Chat models return ChatGeneration; use .message.content
+        first = generations[0][0] if generations[0] else None
+        value = (
+            first.message.content
+            if hasattr(first, "message")
+            else first.text
+            if first is not None else None
+        )
+        return CacheLookupResult(
+            hit=True, tier="semantic", value=value
+        )
+
+    return CacheLookupResult(hit=False, tier="miss", value=None)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:two-tier-lookup} deserve explanation.
+The \code{llm\_string} parameter is required by LangChain's cache API:
+it namespaces cache entries by model identifier so that a GPT-4o response
+is never served for a GPT-4o-mini query with an identical prompt.
+\code{semantic\_cache.lookup()} returns \code{list[list[Generation]] |
+None}; the outer list corresponds to prompt variants, the inner to
+generation candidates. The \code{hasattr(first, "message")} branch
+handles the distinction between \code{ChatGeneration} (chat models, which
+carry \code{.message.content}) and \code{Generation} (completion models,
+which carry \code{.text}): both are valid return types depending on which
+LangChain model class populated the cache entry, and accessing the wrong
+attribute raises a silent \code{AttributeError} at runtime. The
+\code{None} guard on \code{generations} is necessary because
+\code{lookup()} returns \code{None} on a miss, not an empty list.
+
+\begin{warningbox}
+In async LangGraph nodes that call \code{exact\_cache\_get} or
+\code{exact\_cache\_set} directly, use \code{redis.asyncio.Redis} and
+\code{await client.get(key)}. The synchronous \code{redis.Redis} client
+blocks the event loop when called inside \code{async def} node functions,
+causing thread-pool starvation under concurrent graph execution.
+\code{RedisSemanticCache} does not currently expose async lookup methods
+in \texttt{langchain-community} --- wrap the \code{semantic\_cache.lookup()}
+call with \code{asyncio.to\_thread()} in async contexts.
+\end{warningbox}
+
+The two-tier lookup resolves ordering and correctness for queries whose
+relevant context is entirely within the prompt text. It cannot resolve
+the case where the prompt is identical but the correct answer has changed
+--- because the tool the agent called returned a different result. That
+failure mode is what the next section addresses.
+
+
+%% ------------------------------------------------------------
+\section{Tool Outputs Must Not Be Cached by Prompt}
+\label{sec:cache-invalidation}
+%% ------------------------------------------------------------
+
+The design problem is that tool-dependent LLM responses are stale from
+the moment the underlying tool result changes, and no similarity metric
+applied to the prompt can detect this. The naive approach caches the
+agent's synthesised answer under the prompt key, as the first two cache
+tiers do. For a query such as ``What is the current price of AAPL?'',
+the prompt text is stable across time but the correct answer is not. An
+exact cache hit at 14:00 for a query answered at 09:00 returns a price
+that is five hours stale. A semantic cache hit is worse: it may return a
+response originally generated for a different ticker that embeds close to
+AAPL in financial-domain embedding space. The governing principle is that
+the cache key for any response derived from a tool call must incorporate
+the tool's identity and arguments, not the prompt text, and must be
+invalidated \emph{immediately} when the tool's output changes.
+
+The key construction rule is deterministic: the tool name and all
+arguments are serialised to a single string, hashed with SHA-256, and
+prefixed with \code{"tool\_cache:"}. The critical detail in argument
+serialisation is that \code{json.dumps(tool\_args, sort\_keys=True)} must
+be used --- not \code{sorted(tool\_args.items())} at the top level. The
+built-in \code{sort\_keys=True} argument recurses into nested
+dictionaries automatically. A top-level \code{sorted()} call sorts only
+the outermost keys; a tool argument like
+\code{\{"filters": \{"date": "2026-01-01", "category": "tech"\}\}}
+produces a different hash depending on the insertion order of the inner
+dict, which varies across Python versions and call sites. Cache key
+instability on nested arguments means entries are never found on lookup,
+turning the cache layer into a write-only data sink.
+
+\begin{lstlisting}[language=Python,
+  caption={Tool cache key construction and CacheInvalidationEvent model},
+  label={lst:tool-cache-models}]
+# src/cache/tool_cache.py
+import hashlib, json
+from datetime import datetime, timezone
+from pydantic import BaseModel
+
+class CacheInvalidationEvent(BaseModel):
+    tool_name:            str
+    tool_args:            dict
+    old_result_hash:      str
+    new_result_hash:      str
+    invalidated_at:       datetime
+    affected_cache_keys:  list[str]
+
+def tool_result_cache_key(
+    tool_name: str,
+    tool_args: dict,
+    prefix: str = "tool_cache",
+) -> str:
+    payload = tool_name + ":" + json.dumps(
+        tool_args, sort_keys=True
+    )
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return f"{prefix}:{digest}"
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:tool-cache-models} deserve explanation.
+\code{CacheInvalidationEvent} carries both \code{old\_result\_hash} and
+\code{new\_result\_hash} rather than just the new hash. A Langfuse event
+that records only the new hash cannot answer ``how often does this tool's
+result change?'' --- it needs both sides of the transition to measure
+tool result volatility over time. Chapter~23 builds a dashboard panel
+from these events. The \code{affected\_cache\_keys} field is a list
+rather than a single string because a single tool call may have generated
+multiple prompt-level cache entries (for example, a summary and a direct
+answer both derived from the same \code{get\_stock\_price()} result); the
+\code{check\_and\_invalidate} function populates this list by including
+all keys whose hash has changed in a single transaction.
+
+Invalidation uses immediate deletion via \code{client.delete()}, not TTL
+expiry. TTL expiry sets a ceiling on how stale a cached response can be,
+but between the last write and the TTL firing, every query served from
+the cache receives the stale answer. For a tool whose output changes on
+the order of seconds --- a price feed, a sensor reading, a queue depth
+counter --- a one-hour TTL means up to one hour of wrong answers.
+Immediate deletion on hash change closes the stale-serve window to the
+latency of a single Redis \code{DEL} call, typically under one
+millisecond on a co-located Redis instance.
+
+\begin{lstlisting}[language=Python,
+  caption={check\_and\_invalidate: hash comparison and immediate deletion},
+  label={lst:check-invalidate}]
+# src/cache/tool_cache.py (continued)
+# hashlib, json, datetime, timezone imported above
+import redis
+
+_HASH_PREFIX = "tool_hash"
+
+def check_and_invalidate(
+    client: redis.Redis,
+    tool_name: str,
+    tool_args: dict,
+    new_result: str,
+) -> CacheInvalidationEvent | None:
+    cache_key = tool_result_cache_key(tool_name, tool_args)
+    hash_key  = tool_result_cache_key(
+        tool_name, tool_args, prefix=_HASH_PREFIX
+    )
+    new_hash     = hashlib.sha256(new_result.encode()).hexdigest()
+    old_hash_raw = client.get(hash_key)
+
+    if old_hash_raw is None:
+        client.set(hash_key, new_hash)
+        return None                      # first call: no prior state
+
+    old_hash = old_hash_raw.decode()
+    if old_hash == new_hash:
+        return None                      # result unchanged: cache valid
+
+    client.delete(cache_key)
+    client.set(hash_key, new_hash)
+    return CacheInvalidationEvent(
+        tool_name=tool_name,
+        tool_args=tool_args,
+        old_result_hash=old_hash,
+        new_result_hash=new_hash,
+        invalidated_at=datetime.now(tz=timezone.utc),
+        affected_cache_keys=[cache_key],
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:check-invalidate} deserve explanation.
+The hash of the tool result is stored under a separate \code{tool\_hash:}
+key rather than embedded in the cached response value. This means the
+hash check is a single \code{GET} on a short string key --- typically
+under 64 bytes --- rather than a \code{GET} followed by deserialisation
+of the full cached response. At high call rates the difference between a
+64-byte \code{GET} and a multi-kilobyte JSON deserialisation per tool
+invocation is measurable in Redis pipeline throughput. When
+\code{old\_hash\_raw} is \code{None}, the function stores the new hash
+and returns \code{None} because there is no prior cached state to
+invalidate --- the first call for a given tool argument set is always a
+cache population, not an invalidation. \code{datetime.now(tz=timezone.utc)}
+is used rather than \code{datetime.utcnow()} because \code{utcnow()}
+returns a naive datetime that carries no timezone information; a naive
+UTC datetime is indistinguishable from a naive local datetime in
+serialised form and produces silent bugs when timestamps are compared
+across service boundaries.
+
+The invalidation layer ensures that tool-dependent responses are never
+served past the point where the tool's output changes. The remaining
+problem is that none of this behaviour is visible: without structured
+counters, there is no way to know whether the cache is providing value,
+whether the threshold needs adjustment, or whether a specific tool is
+invalidating its cache entries every five minutes. That visibility is
+what the final section adds.
+
+
+%% ------------------------------------------------------------
+\section{Hit Rate Is a Metric, Not a Log Line}
+\label{sec:cache-metrics}
+%% ------------------------------------------------------------
+
+The design problem is that a text log line saying
+\code{"cache hit, tier=semantic"} is not aggregable without a log
+parsing pipeline, a query language, and a retention policy. The engineer
+who needs to know whether \code{score\_threshold} should be tightened
+from \code{0.9} to \code{0.95} needs a \emph{rate} over a time window,
+not a list of events. The naive approach --- logging cache outcomes as
+structured JSON and deriving rates from log aggregation --- introduces a
+dependency on the log pipeline's availability and query latency into what
+should be a sub-second operational decision. The governing principle is
+that cache behaviour is expressed as Prometheus counters, which are
+queryable in constant time regardless of event volume, and as Langfuse
+events that appear on the agent's trace timeline, giving both operational
+and debugging views from a single emission point.
+
+Two counters are used, not one. \code{cache\_hits\_total} and
+\code{cache\_misses\_total} each carry a \code{cache\_tier} label with
+values \code{"exact"}, \code{"semantic"}, and \code{"miss"}. Hit rate is
+then expressed as a clean PromQL expression with no label-value ratio
+tricks:
+
+\[
+  \frac{\texttt{rate(cache\_hits\_total[5m])}}
+       {\texttt{rate(cache\_hits\_total[5m])} + \texttt{rate(cache\_misses\_total[5m])}}
+\]
+
+Adding a \code{by (cache\_tier)} clause breaks this down by tier. A
+single counter with a \code{result=hit/miss} label requires a ratio
+across two label values, which is valid PromQL but produces verbose alert
+rule expressions that are harder to review and harder to test against a
+local Prometheus instance during development.
+
+\begin{notebox}
+\code{prometheus\_client} does not initialise metrics with labels at
+declaration time. A Prometheus scrape that arrives before the first cache
+event will find no series at all for that label value, which causes alert
+rules using \code{absent()} to fire spuriously on startup. The fix is to
+call \code{.labels()} for every known label value once at module load
+time, creating zero-valued series immediately so the alerting baseline is
+established before any traffic arrives.
+\end{notebox}
+
+The \code{CacheMetricsEmitter} class wraps both the Prometheus increment
+and the Langfuse event write behind a single \code{emit()} call. The
+calling code has no direct import of either \code{prometheus\_client} or
+\code{langfuse}: it receives an emitter by dependency injection and calls
+\code{emit(result, prompt\_sha)}. This separation makes the emitter
+testable in isolation by injecting a mock \code{Langfuse} client, and it
+makes the calling code testable without a live Prometheus or Langfuse
+endpoint. The \code{prompt\_sha} argument is the SHA-256 digest of the
+prompt string, not the prompt itself: Langfuse event metadata must not
+contain raw prompt text because it may include PII that should not appear
+in the observability backend.
+
+\begin{lstlisting}[language=Python,
+  caption={Module-level counters with label pre-initialisation},
+  label={lst:prom-counters}]
+# src/cache/metrics.py
+from prometheus_client import Counter
+from langfuse import Langfuse
+from src.cache.exact_cache import CacheLookupResult
+
+CACHE_HITS = Counter(
+    "cache_hits_total",
+    "Cache hits by tier",
+    ["cache_tier"],
+)
+CACHE_MISSES = Counter(
+    "cache_misses_total",
+    "Cache misses by tier",
+    ["cache_tier"],
+)
+
+# Pre-initialise all label combinations so scrapes before the
+# first cache event return zero-valued series, not absent series.
+for _tier in ("exact", "semantic", "miss"):
+    CACHE_HITS.labels(cache_tier=_tier)
+    CACHE_MISSES.labels(cache_tier=_tier)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:prom-counters} deserve explanation.
+Both \code{Counter} objects are declared at module level, not inside a
+function or class \code{\_\_init\_\_}. \code{prometheus\_client} raises
+\code{ValueError: Duplicated timeseries in CollectorRegistry} if a
+\code{Counter} with the same name is registered twice in the same
+process --- a mistake trivially made when the counter is instantiated
+inside a factory function called more than once. Module-level declaration
+makes the singleton property structural: Python's module import system
+ensures the module body executes exactly once per process, regardless of
+how many times the module is imported. The \code{for} loop iterates over
+a fixed tuple of known tier values rather than a dynamic list, so the
+pre-initialised series are always exactly the three values that the
+\code{CacheLookupResult} \code{tier} field can take; adding a new tier
+requires a matching entry here, and omitting it produces an absent-series
+alert on the new tier's first occurrence.
+
+\begin{lstlisting}[language=Python,
+  caption={CacheMetricsEmitter: dual Prometheus and Langfuse emission},
+  label={lst:cache-emitter}]
+# src/cache/metrics.py (continued)
+
+class CacheMetricsEmitter:
+    def __init__(self, langfuse: Langfuse) -> None:
+        self._langfuse = langfuse
+
+    def emit(
+        self,
+        result: CacheLookupResult,
+        prompt_sha: str,
+    ) -> None:
+        tier = result["tier"]
+        if result["hit"]:
+            CACHE_HITS.labels(cache_tier=tier).inc()
+        else:
+            CACHE_MISSES.labels(cache_tier=tier).inc()
+
+        self._langfuse.event(
+            name="cache_lookup",
+            metadata={
+                "hit":        result["hit"],
+                "tier":       tier,
+                "prompt_sha": prompt_sha,
+            },
+        )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:cache-emitter} deserve explanation.
+The Prometheus increment uses \code{tier} from the \code{CacheLookupResult}
+even for misses: the \code{tier} field is set to \code{"miss"} by
+\code{two\_tier\_lookup()} when both cache layers return nothing, so the
+label is always populated. Using the field value rather than a
+hard-coded \code{"miss"} string means that a future cache tier --- for
+example, a local in-process LRU cache added before the exact Redis check
+--- is automatically instrumented by populating the \code{tier} field
+correctly, with no change to \code{CacheMetricsEmitter}. The Langfuse
+\code{event()} call uses \code{prompt\_sha} in metadata rather than the
+raw prompt text; a SHA allows correlation of cache events to specific
+queries in debugging sessions where the raw prompt is already available
+from application logs, without exposing PII in the observability
+platform.
+
+The \code{CacheSettings} model and the \code{build\_all\_caches()} factory
+close the configuration surface. Chapter~12 introduced \code{BaseSettings}
+as a pattern that converts missing credentials into startup failures
+rather than mid-request errors; the same discipline applies here.
+
+\begin{lstlisting}[language=Python,
+  caption={CacheSettings and build\_all\_caches factory},
+  label={lst:cache-settings}]
+# src/cache/settings.py
+import redis
+from langchain_community.cache import RedisSemanticCache
+from langchain_core.embeddings import Embeddings
+from langfuse import Langfuse
+from pydantic_settings import BaseSettings
+from src.cache.semantic_cache import build_semantic_cache
+from src.cache.metrics import CacheMetricsEmitter
+
+class CacheSettings(BaseSettings):
+    redis_host:                  str        = "localhost"
+    redis_port:                  int        = 6379
+    redis_password:              str | None = None
+    semantic_score_threshold:    float      = 0.9
+    exact_ttl_seconds:           int        = 3600
+    semantic_ttl_seconds:        int        = 86400
+    prometheus_push_gateway_url: str | None = None
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @property
+    def redis_url(self) -> str:
+        if self.redis_password:
+            return (f"redis://:{self.redis_password}"
+                    f"@{self.redis_host}:{self.redis_port}")
+        return f"redis://{self.redis_host}:{self.redis_port}"
+
+def build_all_caches(
+    settings: CacheSettings,
+    embeddings: Embeddings,
+    langfuse: Langfuse,
+) -> tuple[redis.Redis, RedisSemanticCache, CacheMetricsEmitter]:
+    client  = redis.Redis(host=settings.redis_host,
+                          port=settings.redis_port,
+                          password=settings.redis_password)
+    sem     = build_semantic_cache(
+                  settings.redis_url, embeddings,
+                  settings.semantic_score_threshold)
+    emitter = CacheMetricsEmitter(langfuse)
+    return client, sem, emitter
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:cache-settings} deserve explanation.
+\code{CacheSettings} exposes \code{redis\_host}, \code{redis\_port}, and
+\code{redis\_password} as separate fields rather than a single
+\code{redis\_url} string, eliminating the URL-parsing fragility shown in
+Listing~\ref{lst:semantic-cache}. The \code{redis\_url} property
+assembles the URL from validated components and is the only place where
+URL construction logic lives. \code{build\_all\_caches()} returns a typed
+tuple of three objects rather than a single wrapper class: the
+\code{redis.Redis} client is consumed by \code{exact\_cache\_get} and
+\code{check\_and\_invalidate}; the \code{RedisSemanticCache} is consumed
+by \code{two\_tier\_lookup}; the \code{CacheMetricsEmitter} is consumed
+by the LangGraph node that calls \code{two\_tier\_lookup} and then emits.
+A wrapper class holding all three as attributes would couple those
+three call sites to a shared type none of them individually needs.
+\code{semantic\_ttl\_seconds} is declared in \code{CacheSettings} even
+though it is not currently passed to the \code{RedisSemanticCache}
+constructor --- TTL at the \code{redisvl} index level requires index
+schema configuration applied at deployment time, outside the scope of
+this chapter. The field is declared now so the environment variable is
+documented and the value is available when the index schema is configured.
+
+\begin{tipbox}
+Set \code{PROMETHEUS\_PUSH\_GATEWAY\_URL} only for short-lived worker
+processes --- Celery tasks, one-shot warm-up scripts --- that exit before
+Prometheus can scrape them. Long-running FastAPI services should mount
+\code{prometheus\_client.make\_asgi\_app()} at \code{/metrics} and allow
+Prometheus to scrape passively. The push gateway adds a staleness window
+equal to the push interval; passive scraping avoids this window entirely.
+\end{tipbox}
+
+\begin{notebox}
+Langfuse Python SDK v3 (GA June 2026) is OTEL-based and replaces the
+\code{langfuse\_client.event()} call shown here with OTEL span attribute
+writes. The \code{CacheMetricsEmitter} interface is unchanged --- only
+the \code{Langfuse} client injected into it is swapped for the v3
+client. Chapter~23 performs the full migration and builds the cache hit
+rate dashboard panel from the \code{cache\_lookup} events emitted here.
+\end{notebox}
+
+Chapter~14 opens with the problem the caching layer does not solve:
+the agent still calls the same \emph{tools} repeatedly when the tool's
+output has not changed, paying the full tool latency and rate-limit cost
+on every invocation. The tool memoisation and rate-limit coordination
+patterns that address this are the opening problem of Chapter~14.
