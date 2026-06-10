@@ -161,11 +161,11 @@ the node function, not on the graph runner---wrapping the runner would produce a
 single opaque span for the entire run.
 
 \begin{lstlisting}[language=Python,
-  caption={\code{perceive\_node}: redact, truncate, update beliefs},
+  caption={\code{perceive\_node}: redact, truncate, increment counter, update beliefs},
   label={lst:perceive}]
 @observe(name="perceive_node")
 def perceive_node(state: AgentState) -> dict:
-    updates: dict = {}
+    updates: dict = {"cycle_count": state["cycle_count"] + 1}  # C1: must increment here
     redaction_count = 0
     messages = state.get("messages", [])
 
@@ -185,12 +185,22 @@ def perceive_node(state: AgentState) -> dict:
         ]
 
     langfuse_context.update_current_observation(metadata={
-        "cycle_count":     state["cycle_count"],
+        "cycle_count":     state["cycle_count"] + 1,
         "redaction_count": redaction_count,
         "message_count":   len(messages),
     })
     return updates
 \end{lstlisting}
+
+\begin{warningbox}
+\code{cycle\_count} must be incremented in \code{perceive\_node}, not in
+\code{reflect\_node}. The counter tracks cycles \emph{entered}, not cycles
+\emph{completed}. An incomplete cycle that consumed tokens still counts against
+the \code{max\_cycles} limit. Omitting this increment means
+\code{pre\_cycle\_gate} never sees the counter advance---making the
+application-level guard permanently blind, even though \code{recursion\_limit}
+will eventually fire. Both guards must work independently.
+\end{warningbox}
 
 \begin{tipbox}
 Run \code{presidio-analyzer} in a separate process for high-throughput production
@@ -293,7 +303,7 @@ def reason_node(state: AgentState) -> dict:
 
 \begin{warningbox}
 The token deduction above uses a character-count estimate. This is intentionally
-approximate at this stage. Chapter~9 replaces it with LiteLLM's actual usage
+approximate at this stage. Chapter~5 replaces it with LiteLLM's actual usage
 response object and a proper callback-based accounting system. Never ship the
 approximation to production.
 \end{warningbox}
@@ -476,7 +486,10 @@ node execution is automatically persisted to the configured store.
 
 The two routing functions encode the complete control flow. \code{route\_from\_reason}
 acts on the \code{type} field of \code{last\_action}. \code{route\_from\_reflect}
-acts on the five locked \code{reflect\_decision} values.
+acts on the five locked \code{reflect\_decision} values. \code{TERMINATE} and
+\code{ESCALATE} both route to \code{END} here; Chapter~2 introduces a dedicated
+\code{escalation\_node} that separates the two paths so that human-handoff
+telemetry is distinct from normal completion telemetry.
 
 \begin{lstlisting}[language=Python,
   caption={Routing functions and \code{StateGraph} wiring},
@@ -495,7 +508,8 @@ def route_from_reflect(state: AgentState) -> str:
             "TERMINATE": "end",
             "ESCALATE":  "end"}.get(d, "end")
 
-def build_graph(checkpointer=None):
+def build_graph(policy: TerminationPolicy,
+                checkpointer=None):
     b = StateGraph(AgentState)
     for name, fn in [("perceive_node", perceive_node),
                      ("reason_node",   reason_node),
@@ -512,10 +526,17 @@ def build_graph(checkpointer=None):
         {"perceive_node": "perceive_node",
          "action_node": "action_node", "end": END})
     return b.compile(checkpointer=checkpointer,
-                     recursion_limit=25)
+                     recursion_limit=policy.max_cycles * 4)
 \end{lstlisting}
 
-\code{recursion\_limit=25} is a hard guard: LangGraph raises
+\begin{notebox}
+\code{recursion\_limit} is derived from \code{policy.max\_cycles} at compile
+time---not from a hard-coded constant. This means the structural ceiling and the
+application ceiling are always proportional: a policy change updates both without
+requiring a separate edit to \code{compile()}.
+\end{notebox}
+
+\code{recursion\_limit=policy.max\_cycles * 4} is a hard guard: LangGraph raises
 \code{GraphRecursionError} when it is reached. Chapter~2 explains why increasing
 this number is not a valid alternative to proper termination logic.
 
@@ -672,6 +693,12 @@ Each node is tested in isolation. The key assertions express the
   label={lst:tests}]
 # LANGFUSE_ENABLED=false disables SDK network calls for the test process
 os.environ.setdefault("LANGFUSE_ENABLED", "false")
+
+# --- perceive_node: cycle_count must be incremented ---
+def test_cycle_count_incremented():
+    state  = make_test_state(cycle_count=3)
+    result = perceive_node(state)
+    assert result["cycle_count"] == 4
 
 # --- perceive_node: PII must be redacted before beliefs are written ---
 def test_pii_is_redacted():
