@@ -1,2 +1,799 @@
-%% Chapter 10 — Langfuse Instrumentation
-\chapterquote{You cannot optimise what you cannot observe.}{anon}
+%% ============================================================
+%%  Chapter 10 --- Qdrant Production Setup & Vector Store Architecture
+%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: qdrant-client >= 1.11.0, mem0ai >= 0.1.0 (OSS)
+%% ============================================================
+
+\chapterquote{A vector store that ignores its own metadata is just an expensive random-number generator.}{anon}
+
+Agent memory failures are silent. When an agent retrieves stale, irrelevant,
+or cross-tenant memories, it does not crash --- it simply reasons from bad
+evidence. A team running a multi-tenant assistant at fifty thousand users
+discovered this the hard way when a misconfigured vector store began leaking
+memories across user accounts. The root cause was not a bug in retrieval
+logic: it was a missing payload index on the \code{user\_id} field, a field
+that existed in every stored point but had never been registered with Qdrant.
+Queries were falling back to full-collection scans, the HNSW graph was
+navigating without tenant awareness, and the planner had no cardinality
+estimate to guide its strategy. Recall had silently collapsed to near-zero
+for most users while appearing functional in single-user integration tests.
+This chapter prevents that failure mode.
+
+The solution has four layers. The first layer is \emph{index geometry}: the
+HNSW graph parameters that govern how the vector index is built and queried.
+The second layer is \emph{metric commitment}: the distance function baked
+permanently into the collection at creation time. The third layer is
+\emph{payload indexing}: the structured metadata indexes that allow Qdrant's
+query planner to make cardinality-aware decisions and enable filter-aware HNSW
+traversal. The fourth layer is \emph{tenant architecture}: the collection
+design pattern that keeps user data isolated without multiplying collection
+overhead. These layers are not independent --- each depends on the previous one
+being in place.
+
+The sections in this chapter must be read in dependency order, and that order
+is also the mandatory operational order:
+
+\begin{enumerate}
+  \item \textbf{Create the collection} with explicit HNSW config and distance metric (\S\ref{sec:hnsw-tuning} and \S\ref{sec:metric-commitment})
+  \item \textbf{Create all payload indexes} before any data arrives (\S\ref{sec:payload-indexes})
+  \item \textbf{Ingest data} --- only after steps 1 and 2 are complete
+  \item \textbf{Query with filters} --- filter-aware HNSW traversal is only possible when indexes existed at segment build time (\S\ref{sec:filter-aware-hnsw})
+\end{enumerate}
+
+\begin{warningbox}
+Reversing steps 2 and 3 does not raise an error. Qdrant will accept both data
+and queries without complaint. The consequence is silent recall degradation
+that is invisible in single-user tests and catastrophic at multi-tenant scale.
+\end{warningbox}
+
+Section~\ref{sec:multi-tenancy} applies the complete stack to the multi-tenant
+isolation problem. Section~\ref{sec:mem0-backend} connects everything to the
+mem0 OSS \code{Memory} class introduced in Chapter~8, closing the loop from
+\S8.2.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in this chapter}
+\label{tab:ch10-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+HNSW & Hierarchical Navigable Small World graph; the approximate nearest-neighbour index structure Qdrant builds over stored vectors. \\
+\emph{ef} / \emph{ef\_construct} & Beam width during graph traversal: \code{ef\_construct} applies at index-build time, \code{ef} applies at query time. \\
+Payload index & A field-level index on point metadata enabling fast filtering and cardinality estimation by the query planner. \\
+Tenant index & A payload index variant (\code{is\_tenant=True}) that instructs Qdrant to physically co-locate data belonging to each tenant on disk. \\
+Principal index & A payload index variant (\code{is\_principal=True}) that optimises range-based traversal on a field used as the primary ordering axis (e.g., a timestamp). \\
+Filter cardinality & The estimated number of points that satisfy a filter predicate; used by the query planner to choose between filtered HNSW traversal and payload scan followed by reranking. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+All code in this chapter lives under \code{src/vector\_store/} and
+\code{src/memory/}. The shared \code{QdrantClient} instance is constructed
+once in \code{src/vector\_store/client.py} and passed as an argument
+everywhere else --- the client is never instantiated inside a function that
+performs a search or upsert.
+
+\begin{lstlisting}[language=bash, caption={Chapter source layout}, label={lst:ch10-layout}]
+src/
+  vector_store/
+    client.py           # QdrantClient factory
+    collection_setup.py # create_collection, bulk-load helpers
+    index_setup.py      # create_payload_index loop
+    memory_search.py    # search() and scroll() wrappers
+    models.py           # MemoryPayload, MemoryPoint Pydantic models
+    tenant_ops.py       # build_user_filter, upsert_memory, search_user_memories
+  memory/
+    mem0_client.py      # QdrantSettings, ensure_collection_ready, get_memory
+\end{lstlisting}
+
+The shared client factory is defined once and referenced throughout:
+
+\begin{lstlisting}[language=Python,
+  caption={Shared QdrantClient factory},
+  label={lst:qdrant-client}]
+# src/vector_store/client.py
+from qdrant_client import QdrantClient
+from src.memory.mem0_client import QdrantSettings
+
+def get_qdrant_client(settings: QdrantSettings) -> QdrantClient:
+    return QdrantClient(
+        url=str(settings.url),
+        api_key=settings.api_key.get_secret_value()
+               if settings.api_key else None,
+    )
+\end{lstlisting}
+
+
+%% ------------------------------------------------------------
+\section{Index Geometry Is a Load-Time Decision}
+\label{sec:hnsw-tuning}
+%% ------------------------------------------------------------
+
+The problem HNSW tuning solves is not recall alone --- it is the
+\emph{relationship} between recall, memory consumption, index build
+time, and query latency, all of which move when any single parameter
+changes. The naive approach is to leave the defaults untouched
+(\code{m=16}, \code{ef\_construct=100}) and compensate with a larger
+\code{limit} at query time. This fails at scale because a sparser
+graph with a wider beam wastes latency budget navigating dead-end
+paths rather than improving candidate quality. The principle is that
+index geometry must be specified explicitly at collection creation,
+tuned to the cardinality and recall requirements of the workload, and
+treated as a deployment-time configuration decision rather than a
+default.
+
+\begin{table}[h]
+\centering
+\caption{HNSW parameter guide for agent memory workloads}
+\label{tab:hnsw-params}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Parameter} & \textbf{Range} & \textbf{When to increase} \\
+\midrule
+\code{m} & 16--64 & Recall is below target at high collection sizes ($>$500K points); cosine text embeddings with high dimensionality. Cost: RAM grows linearly with \code{m}. \\
+\code{ef\_construct} & 100--200 & Graph quality matters more than ingestion speed; this is a one-time cost paid per segment build. Cost: slower index construction. \\
+\code{ef} (runtime) & 50--100 & Query recall is below target at serving time; latency budget allows a wider beam. Overridable per query via \code{SearchParams}. \\
+\code{full\_scan\_threshold} & 1\,000--20\,000 & Reduce to force HNSW on smaller warm-up segments; increase to defer HNSW construction on tiny collections. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+A production agent memory collection accumulates points continuously
+as agents process conversations. This means index construction happens
+incrementally, and the most expensive mistake is triggering repeated
+partial segment rebuilds during a large initial load. Qdrant provides a
+mechanism to suppress indexing during bulk ingestion: setting
+\code{indexing\_threshold=0} in \code{OptimizersConfigDiff} disables HNSW
+segment construction entirely until the threshold is restored. The correct
+protocol is to create the collection, create payload indexes
+(Section~\ref{sec:payload-indexes}), disable indexing, run the bulk upsert,
+and then re-enable indexing so that one large HNSW segment is built from the
+complete dataset rather than many small ones being merged.
+
+\begin{lstlisting}[language=Python,
+  caption={Collection creation with explicit HNSW config and bulk-load helpers},
+  label={lst:collection-setup}]
+# src/vector_store/collection_setup.py
+from qdrant_client import QdrantClient, models
+
+COLLECTION = "agent_memory"
+
+def create_agent_memory_collection(client: QdrantClient, dims: int) -> None:
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=models.VectorParams(
+            size=dims,
+            distance=models.Distance.COSINE,
+        ),
+        hnsw_config=models.HnswConfigDiff(
+            m=32,
+            ef_construct=200,
+            full_scan_threshold=5_000,
+            max_indexing_threads=0,  # 0 = use all available cores
+        ),
+        optimizers_config=models.OptimizersConfigDiff(
+            indexing_threshold=10_000,
+        ),
+    )
+
+def disable_indexing_for_bulk_load(client: QdrantClient) -> None:
+    client.update_collection(
+        collection_name=COLLECTION,
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=0),
+    )
+
+def enable_indexing_after_load(client: QdrantClient) -> None:
+    # MAINTENANCE WINDOW: triggers background HNSW segment construction.
+    # Do not call during live traffic; route requests away from this node first.
+    client.update_collection(
+        collection_name=COLLECTION,
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=10_000),
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:collection-setup} deserve explanation.
+\code{max\_indexing\_threads=0} instructs Qdrant to use all available CPU
+cores during segment construction --- this is safe for a dedicated service but
+should be capped to a lower value (e.g., \code{2}) if the Qdrant node also
+serves live traffic. The \code{disable\_indexing\_for\_bulk\_load} and
+\code{enable\_indexing\_after\_load} pair deliberately uses two separate
+functions rather than a context manager because re-enabling indexing is a
+maintenance-window operation: calling \code{update\_collection} with a new
+\code{indexing\_threshold} triggers background HNSW segment construction that
+will increase CPU and memory pressure for the duration of the build. The
+separation makes the maintenance boundary explicit in calling code.
+
+\begin{warningbox}
+Calling \code{update\_collection} with a new \code{hnsw\_config} --- not
+just \code{optimizers\_config} --- triggers a full index rebuild. The official
+Qdrant documentation states: \emph{``We recommend against using this in a
+production database as it may introduce huge overhead due to the rebuilding
+of the index.''} Any change to \code{m} or \code{ef\_construct} on an
+existing collection must be performed in a maintenance window with live
+traffic routed away from the node.
+\end{warningbox}
+
+With index geometry established, the next irreversible decision must be made
+before a single vector is written: the distance metric.
+
+
+%% ------------------------------------------------------------
+\section{Distance Metric Is Permanent}
+\label{sec:metric-commitment}
+%% ------------------------------------------------------------
+
+The problem metric selection solves is matching the mathematical operation
+of similarity comparison to the mathematical space in which the encoder
+was trained. The naive approach --- defaulting to cosine for all embeddings ---
+fails when the encoder was trained using dot product as its objective,
+because the distances Qdrant computes will not correspond to the semantic
+distances the encoder learned. The principle is that metric choice must
+follow encoder training objective, and it must be declared once, permanently.
+
+\begin{warningbox}
+\textbf{The distance metric is locked at collection creation. There is no
+in-place migration path.} Changing the metric requires deleting the collection,
+re-creating it with the new metric, and re-ingesting every vector from source.
+On a collection with tens of millions of agent memories, this is a multi-hour
+operation. Choose the correct metric before writing the first point.
+\end{warningbox}
+
+Three metrics cover the production cases for text agent memory. \code{COSINE}
+is appropriate for raw, unnormalised text embeddings such as those produced by
+OpenAI's \code{text-embedding-3-small} and \code{text-embedding-3-large} or
+\code{sentence-transformers} models --- the metric normalises vectors at query
+time, making it invariant to embedding magnitude. \code{DOT} is appropriate
+when the encoder was trained with dot product as its objective and guarantees
+unit-norm output, such as Cohere \code{embed-v3} or \code{bge-*} models
+configured with unit normalisation: because the vectors are already
+unit-normalised, dot product and cosine are mathematically identical, but
+\code{DOT} avoids the redundant normalisation step inside Qdrant's scoring
+kernel, yielding a modest throughput improvement at high query volumes.
+\code{EUCLID} is appropriate for encoders whose training objective was
+Euclidean distance --- typically geometric embedding models applied to
+structured coordinate data, not free-text memory content.
+
+\begin{lstlisting}[language=Python,
+  caption={Metric selection at collection creation for two common encoder families},
+  label={lst:metric-selection}]
+# src/vector_store/collection_setup.py (continued)
+from qdrant_client import QdrantClient, models
+
+# Raw OpenAI embeddings: magnitude varies; cosine is correct.
+def create_openai_collection(client: QdrantClient) -> None:
+    client.create_collection(
+        collection_name="agent_memory_openai",
+        vectors_config=models.VectorParams(
+            size=1536,
+            distance=models.Distance.COSINE,
+        ),
+    )
+
+# Cohere embed-v3 with int8 output: unit-norm, pre-quantised.
+# Requires qdrant-client >= 1.9.0 and Qdrant server >= 1.9.0.
+def create_cohere_collection(client: QdrantClient) -> None:
+    client.create_collection(
+        collection_name="agent_memory_cohere",
+        vectors_config=models.VectorParams(
+            size=1024,
+            distance=models.Distance.DOT,
+            datatype=models.Datatype.UINT8,  # int8 compact storage
+        ),
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:metric-selection} deserve explanation.
+\code{models.Datatype.UINT8} is only valid when the encoder produces
+pre-quantised 8-bit integer output --- using it with a float32 encoder will
+silently truncate values and destroy recall. The two functions are deliberately
+named after their encoder family, not their collection name, to make the
+encoder-metric coupling explicit in calling code and prevent future engineers
+from reusing the collection-creation helper with a different encoder.
+
+\begin{notebox}
+The choice between \code{COSINE} and \code{DOT} for a new encoder family is
+not guesswork: read the encoder model card. If the card specifies ``cosine
+similarity'' as the recommended scoring method, use \code{COSINE}. If it
+specifies ``dot product'' or guarantees unit-norm output, use \code{DOT}. If
+the card is absent or ambiguous, default to \code{COSINE} --- it is never
+incorrect for text, only occasionally slightly slower than \code{DOT}.
+\end{notebox}
+
+With collection geometry and metric committed, the collection is structurally
+ready but not yet queryable with filters --- that requires the payload indexes
+that must be installed before any data arrives.
+
+
+%% ------------------------------------------------------------
+\section{Payload Indexes Must Precede Data}
+\label{sec:payload-indexes}
+%% ------------------------------------------------------------
+
+The problem this section solves is making structured metadata on stored
+points efficiently queryable without scanning the entire collection on every
+filtered search. The naive approach --- running searches with payload filters
+on unindexed fields --- does not raise an error; it silently falls back to a
+full collection scan, consuming proportionally more CPU and memory the larger
+the collection grows. By the time the performance problem is noticed in
+production, the collection has hundreds of millions of points and rebuilding
+the HNSW index to incorporate the new payload indexes is a multi-hour
+maintenance operation. The principle is that payload indexes are created
+immediately after collection creation and before any data ingestion, and the
+setup function is written to be idempotent so it can be called safely on
+every deployment.
+
+The five fields that every agent memory point must carry --- and that must be
+indexed --- are: \code{user\_id} (tenant identification), \code{memory\_type}
+(episodic, semantic, or procedural), \code{importance\_score} (float for
+range-based relevance filtering), \code{created\_at} (UNIX integer timestamp,
+principal-indexed for time-range queries), and \code{ttl\_expires\_at} (UNIX
+integer timestamp for TTL sweep range scans). Both timestamp fields are stored
+as UNIX integers rather than ISO datetime strings. While Qdrant does support
+\code{is\_principal} on \code{DatetimeIndexParams} as of v1.11.0, storing
+timestamps as integers with \code{IntegerIndexParams} offers an additional
+advantage: the parameterized integer index exposes separate \code{lookup} and
+\code{range} flags, allowing lookup indexes to be disabled on fields that are
+queried exclusively by range comparators. This reduces the memory footprint of
+the integer index without any functional cost.
+
+\begin{notebox}
+Qdrant's official documentation states: \emph{``Payload indexes should be
+created before ingesting data. Qdrant's filterable HNSW index only benefits
+from additional filter-aware edges when it is generated after the payload
+indexes have been created. If you create a payload index after data has
+already been ingested, you need to rebuild the HNSW index to take advantage
+of the new payload indexes.''} This is not a recommendation --- it is a
+structural requirement.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={Idempotent payload index setup loop},
+  label={lst:payload-indexes}]
+# src/vector_store/index_setup.py
+import logging
+from qdrant_client import QdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse
+
+log = logging.getLogger(__name__)
+
+PAYLOAD_INDEX_SPECS = {
+    "user_id": models.KeywordIndexParams(
+        type=models.KeywordIndexType.KEYWORD,
+        is_tenant=True,
+    ),
+    "memory_type": models.KeywordIndexParams(
+        type=models.KeywordIndexType.KEYWORD,
+        is_tenant=False,
+    ),
+    "importance_score": models.FloatIndexParams(
+        type=models.FloatIndexType.FLOAT,
+        is_principal=False,  # not a primary ordering axis
+    ),
+    "created_at": models.IntegerIndexParams(
+        type=models.IntegerIndexType.INTEGER,
+        is_principal=True,   # primary time-range ordering axis
+        lookup=False,        # no equality queries on timestamps
+        range=True,
+    ),
+    "ttl_expires_at": models.IntegerIndexParams(
+        type=models.IntegerIndexType.INTEGER,
+        is_principal=False,
+        lookup=False,
+        range=True,
+    ),
+}
+
+def setup_payload_indexes(client: QdrantClient, collection: str) -> None:
+    for field, schema in PAYLOAD_INDEX_SPECS.items():
+        try:
+            client.create_payload_index(
+                collection_name=collection,
+                field_name=field,
+                field_schema=schema,
+                wait=True,
+            )
+        except UnexpectedResponse as exc:
+            if exc.status_code == 400:
+                log.info("Index already exists for %r, skipping.", field)
+            else:
+                raise
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:payload-indexes} deserve explanation.
+The \code{try/except UnexpectedResponse} block with an HTTP 400 guard makes
+the function idempotent: Qdrant returns a 400 status when an index already
+exists with the same schema, so this function can run on every deployment
+without failing on collections that were already configured. Errors with any
+other status code are re-raised immediately to surface genuine problems.
+The \code{lookup=False, range=True} combination on both timestamp fields is
+intentional: these fields are never queried with equality match conditions ---
+only with range comparators. Disabling \code{lookup} reduces the memory
+footprint of the integer index without any functional cost. Finally,
+\code{wait=True} on every call ensures the function blocks until each index
+is confirmed built before returning; calling code can then proceed to
+ingestion without a race condition.
+
+\begin{tipbox}
+After deploying to production, enable strict mode on the collection by
+setting \code{unindexed\_filtering\_retrieve=false}. With strict mode
+active, Qdrant returns an error if a search query filters on a field
+without a payload index, turning silent performance degradation into a
+visible configuration error at the API boundary.
+
+Full-text indexing on the \code{content} field via \code{TextIndexParams}
+and \code{MatchText} conditions is deferred to Chapter~12 \S12.3 hybrid
+retrieval.
+\end{tipbox}
+
+With all payload indexes registered, the collection is ready for data
+ingestion --- and the reason those indexes had to come first will become
+clear in the next section, which explains how Qdrant's query planner uses
+them during HNSW traversal.
+
+
+%% ------------------------------------------------------------
+\section{Recall Does Not Collapse When Filters Are Index-Aware}
+\label{sec:filter-aware-hnsw}
+%% ------------------------------------------------------------
+
+The problem this section solves is the recall collapse that occurs when
+filtered vector search is implemented as two independent steps: run the
+approximate nearest-neighbour search first, then apply a payload predicate
+to the results. The naive approach treats the ANN search and the filter
+as orthogonal operations, which works correctly only when the filter
+passes the majority of points in the collection. When the filter is
+selective --- as it always is in a multi-tenant collection where
+\code{user\_id} identifies one user among tens of thousands --- the top-K
+candidates returned by ANN are almost entirely from other tenants; the
+post-filter step reduces the result set to near-zero without increasing
+recall. The principle is that the filter must participate in the graph
+traversal, not follow it.
+
+Qdrant achieves this by using payload indexes as cardinality oracles during
+query planning. When a search query arrives with a \code{query\_filter},
+Qdrant's planner reads the estimated number of matching points from the
+relevant payload index and uses it to choose a search strategy. When the
+filter is loose (many matching points), the planner runs
+\emph{filtered HNSW traversal}: the beam search navigates the graph and
+evaluates the filter condition at each hop using the payload index for fast
+lookup. When the filter is highly selective (very few matching points), the
+planner runs a \emph{payload scan followed by ANN reranking}: it reads only
+the indexed matching points and reranks them by vector similarity.
+
+These two strategies have different relationships to the build-time ordering
+rule from Section~\ref{sec:payload-indexes}. The filtered HNSW traversal path
+benefits from payload indexes existing at segment build time, because
+filter-aware edges are woven into the graph during initial construction.
+The payload scan path uses the index at query time and does not depend on
+build-time ordering. In both cases, however, the index must exist --- and in
+both cases the post-filter antipattern is avoided.
+
+\begin{lstlisting}[language=Python,
+  caption={Anti-pattern and correct filter-aware search side by side},
+  label={lst:filter-search}]
+# src/vector_store/memory_search.py
+from qdrant_client import QdrantClient, models
+
+# ANTI-PATTERN: ANN first, Python-side filter after.
+# Recall collapses when user_id matches < 1% of collection.
+def search_naive(client, collection, vector, user_id, limit):
+    all_hits = client.search(collection, query_vector=vector, limit=500)
+    return [h for h in all_hits if h.payload["user_id"] == user_id][:limit]
+
+# CORRECT: native query_filter; planner chooses traversal strategy.
+def search_memory(
+    client: QdrantClient,
+    collection: str,
+    vector: list[float],
+    user_id: str,
+    min_importance: float,
+    limit: int = 10,
+    hnsw_ef: int = 80,
+) -> list[models.ScoredPoint]:
+    filt = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="user_id",
+                match=models.MatchValue(value=user_id),
+            ),
+            models.FieldCondition(
+                key="importance_score",
+                range=models.Range(gte=min_importance),
+            ),
+        ]
+    )
+    return client.search(
+        collection_name=collection,
+        query_vector=vector,
+        query_filter=filt,          # <- search() uses query_filter
+        limit=limit,
+        with_payload=True,
+        with_vectors=False,
+        search_params=models.SearchParams(hnsw_ef=hnsw_ef),
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:filter-search} deserve explanation.
+The anti-pattern function requests 500 results to compensate for the
+expected post-filter discard rate --- this is the pattern to eliminate, not
+to refine. The \code{with\_vectors=False} flag halves the wire payload for
+every response: agent memory retrieval uses the scored content, not the raw
+embedding. The \code{models.SearchParams(hnsw\_ef=hnsw\_ef)} override applies
+a per-query beam width, enabling the calling code to tune recall at query time
+without touching the collection-level \code{ef} configuration.
+
+\begin{warningbox}
+The \code{search()} method accepts the parameter \code{query\_filter}.
+The \code{scroll()} method accepts \code{scroll\_filter}. These are
+different keyword argument names on different methods. Passing
+\code{query\_filter=} to a \code{scroll()} call may not raise a
+\code{TypeError} if the extra keyword is silently absorbed; the filter
+will be ignored and the scroll will return unfiltered results. Always
+use the correct named parameter explicitly for each method.
+\end{warningbox}
+
+With filter-aware traversal understood, the design is ready to be applied to
+the multi-tenant isolation problem --- where the \code{user\_id} filter is
+not an occasional constraint but the invariant present in every query.
+
+
+%% ------------------------------------------------------------
+\section{One Collection Isolates All Tenants}
+\label{sec:multi-tenancy}
+%% ------------------------------------------------------------
+
+The problem this section solves is maintaining strict per-user memory
+isolation in a system with a large and growing number of users, without
+multiplying infrastructure overhead with the user count. The naive
+approach --- creating one Qdrant collection per user --- appears to provide
+the strongest isolation because the data boundaries are physical. It fails
+because each Qdrant collection carries fixed overhead: a write-ahead log,
+optimizer threads, HNSW segment files, and memory-mapped payload storage.
+The official Qdrant documentation states directly: \emph{``In most cases,
+you should only use a single collection with payload-based partitioning.''}
+At ten thousand users, ten thousand collections exhaust file descriptors
+and WAL buffer allocations on any realistic server; performance degrades
+non-linearly before that limit is reached. The principle is that isolation
+is a query-time property enforced by mandatory payload filters, not a
+storage-time property enforced by collection boundaries.
+
+The single-collection approach works because of the \code{is\_tenant=True}
+flag introduced in Section~\ref{sec:payload-indexes}. This flag instructs
+Qdrant's storage engine to physically co-locate data belonging to each
+tenant on disk, reducing disk reads required for a tenant-scoped query.
+Combined with filter-aware HNSW traversal, the recall and latency
+characteristics of a per-user query against the shared collection are
+equivalent to querying a per-user collection --- without the operational cost.
+
+Isolation is logical, not physical. The application layer is responsible
+for ensuring that every query includes the correct \code{user\_id} filter.
+Chapter~16 covers the FastAPI middleware that extracts the \code{user\_id}
+claim from the JWT and passes it into the query path; this section
+establishes the data model and the filter factory that the middleware will
+call.
+
+\begin{lstlisting}[language=Python,
+  caption={MemoryPayload model and tenant filter factory},
+  label={lst:tenant-models}]
+# src/vector_store/models.py
+from pydantic import BaseModel
+from typing import Literal
+
+class MemoryPayload(BaseModel):
+    user_id: str                                             # keyword, is_tenant=True
+    memory_type: Literal["episodic", "semantic", "procedural"]  # keyword
+    content: str
+    importance_score: float                                  # float index
+    created_at: int                                          # UNIX timestamp, principal
+    ttl_expires_at: int | None                               # UNIX timestamp, range
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Tenant-scoped filter factory and search helper},
+  label={lst:tenant-ops}]
+# src/vector_store/tenant_ops.py
+from qdrant_client import QdrantClient, models
+from src.vector_store.models import MemoryPayload
+
+def build_user_filter(
+    user_id: str,
+    memory_types: list[str] | None = None,
+    min_importance: float | None = None,
+) -> models.Filter:
+    conditions: list[models.Condition] = [
+        models.FieldCondition(
+            key="user_id",
+            match=models.MatchValue(value=user_id),
+        )
+    ]
+    if memory_types:
+        conditions.append(
+            models.FieldCondition(
+                key="memory_type",
+                match=models.MatchAny(any=memory_types),
+            )
+        )
+    if min_importance is not None:
+        conditions.append(
+            models.FieldCondition(
+                key="importance_score",
+                range=models.Range(gte=min_importance),
+            )
+        )
+    return models.Filter(must=conditions)
+
+def search_user_memories(
+    client: QdrantClient,
+    collection: str,
+    query_vector: list[float],
+    user_id: str,
+    limit: int = 10,
+    memory_types: list[str] | None = None,
+    min_importance: float | None = None,
+) -> list[models.ScoredPoint]:
+    return client.search(
+        collection_name=collection,
+        query_vector=query_vector,
+        query_filter=build_user_filter(user_id, memory_types, min_importance),
+        limit=limit,
+        with_payload=True,
+        with_vectors=False,
+    )
+\end{lstlisting}
+
+Two decisions in Listings~\ref{lst:tenant-models} and~\ref{lst:tenant-ops}
+deserve explanation. The \code{conditions} list is annotated as
+\code{list[models.Condition]} --- the correct supertype --- rather than
+\code{list[models.FieldCondition]}: this allows callers to append
+\code{models.IsNullCondition} or other condition subtypes without a type
+error. \code{models.MatchAny(any=memory\_types)} is used for
+\code{memory\_type} rather than multiple \code{MatchValue} conditions
+wrapped in a \code{should} clause: \code{MatchAny} is a single condition
+object that the planner evaluates in one index lookup, whereas a \code{should}
+clause with multiple conditions requires the planner to union multiple index
+reads and deduplicate the result set.
+
+\begin{notebox}
+The \code{MemoryPayload} model stores timestamps as \code{int} (UNIX epoch
+seconds). This choice is intentional: the parameterized \code{IntegerIndexParams}
+exposes separate \code{lookup} and \code{range} flags that allow disabling
+the lookup component on pure range-query fields, reducing index memory
+footprint. The \code{DatetimeIndexParams} type supports \code{is\_principal}
+as of Qdrant v1.11.0 but does not expose the \code{lookup}/\code{range}
+parameterization, making the integer representation preferable for this
+workload.
+\end{notebox}
+
+The collection, indexes, and isolation pattern are now complete. The final
+section connects them to the mem0 OSS memory layer introduced in Chapter~8.
+
+
+%% ------------------------------------------------------------
+\section{mem0 Connects to a Pre-Configured Collection}
+\label{sec:mem0-backend}
+%% ------------------------------------------------------------
+
+The problem this section solves is wiring the mem0 OSS \code{Memory} class
+--- which provides the agent-facing memory API used throughout this book ---
+to the Qdrant collection configured in Sections~\ref{sec:hnsw-tuning}
+through \ref{sec:multi-tenancy}, without allowing mem0 to silently overwrite
+that configuration. The naive approach is to call \code{Memory.from\_config()}
+with a Qdrant backend config and assume mem0 will use the existing collection.
+This fails because mem0 creates the collection if it does not exist, using
+default HNSW parameters --- and if the collection does not yet exist at the
+time \code{from\_config()} is called (which is likely during first deploy),
+it will be created with \code{m=16}, \code{ef\_construct=100}, and no payload
+indexes. The principle is that collection existence and configuration are
+asserted before the \code{Memory} object is constructed.
+
+\begin{notebox}
+\code{Memory} (OSS, imported as \code{from mem0 import Memory}) and
+\code{MemoryClient} (Platform API, imported as
+\code{from mem0 import MemoryClient}) are different classes.
+\code{MemoryClient} connects to the hosted mem0 API and does not accept
+a Qdrant backend config. Every reference to mem0 in this chapter uses
+\code{Memory} --- the self-hosted OSS class that accepts the
+\code{vector\_store} config dict shown below.
+\end{notebox}
+
+Chapter~8 Section~8.2 introduced \code{Memory.from\_config()} as the
+entry point for the mem0 memory layer and showed the structure of the
+config dict. Here, the \code{vector\_store} block in that config must carry
+the collection name and embedding dimensions that exactly match what was
+used in \code{create\_agent\_memory\_collection()}. A mismatch in
+\code{embedding\_model\_dims} between the config and the
+\code{VectorParams.size} set at collection creation will cause ingestion
+failures or silent dimension errors at query time. The
+\code{QdrantSettings} Pydantic model is the single source of truth for
+both values.
+
+\begin{lstlisting}[language=Python,
+  caption={QdrantSettings and collection guard},
+  label={lst:qdrant-settings}]
+# src/memory/mem0_client.py
+from pydantic import AnyHttpUrl, SecretStr
+from pydantic_settings import BaseSettings
+
+class QdrantSettings(BaseSettings):
+    collection_name: str = "agent_memory"
+    url: AnyHttpUrl
+    api_key: SecretStr | None = None  # set QDRANT_API_KEY for Qdrant Cloud
+    embedding_dims: int = 1536        # must match VectorParams.size
+
+    model_config = {"env_prefix": "QDRANT_"}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Collection guard, mem0 config builder, and Memory factory},
+  label={lst:mem0-client}]
+# src/memory/mem0_client.py (continued)
+from qdrant_client import QdrantClient
+from mem0 import Memory  # OSS class, NOT MemoryClient (Platform)
+from src.vector_store.collection_setup import create_agent_memory_collection
+from src.vector_store.index_setup import setup_payload_indexes
+
+def ensure_collection_ready(
+    client: QdrantClient,
+    settings: QdrantSettings,
+) -> None:
+    if not client.collection_exists(settings.collection_name):
+        create_agent_memory_collection(client, settings.embedding_dims)
+        setup_payload_indexes(client, settings.collection_name)
+
+def build_mem0_config(settings: QdrantSettings, base_config: dict) -> dict:
+    # base_config carries "embedder" and "llm" blocks from Ch.8 §8.2
+    return {
+        **base_config,
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "collection_name": settings.collection_name,
+                "embedding_model_dims": settings.embedding_dims,
+                # Cross-check key name against installed mem0ai version;
+                # it has changed across minor releases.
+                "url": str(settings.url),
+                "api_key": settings.api_key.get_secret_value()
+                           if settings.api_key else None,
+            },
+        },
+    }
+
+def get_memory(
+    client: QdrantClient,
+    settings: QdrantSettings,
+    base_config: dict,
+) -> Memory:
+    ensure_collection_ready(client, settings)
+    return Memory.from_config(build_mem0_config(settings, base_config))
+\end{lstlisting}
+
+Three decisions in Listings~\ref{lst:qdrant-settings}
+and~\ref{lst:mem0-client} deserve explanation. \code{ensure\_collection\_ready}
+checks existence with \code{client.collection\_exists()} before calling the
+creation and index setup functions --- this is the guard that prevents mem0
+from racing with application startup and creating an unconfigured collection.
+\code{settings.api\_key.get\_secret\_value()} unwraps the \code{SecretStr}
+explicitly rather than relying on implicit string conversion: Pydantic's
+\code{SecretStr} does not expose its value via \code{str()}, which would
+produce \code{"**********"} and cause a silent authentication failure against
+Qdrant Cloud. The \code{build\_mem0\_config} function accepts a
+\code{base\_config} dict carrying the \code{embedder} and \code{llm} blocks
+introduced in Chapter~8 \S8.2, merging them with the \code{vector\_store}
+block via \code{**base\_config} so that all three required sections are
+present before \code{Memory.from\_config()} is called.
+
+\begin{tipbox}
+Cross-check the \code{embedding\_model\_dims} key name against the version
+of \code{mem0ai} installed in your environment. The key has changed between
+minor releases. Confirm the correct name by inspecting \code{mem0.memory.main}
+or reading the changelog for the pinned release. Pin \code{mem0ai} in
+\code{pyproject.toml} to avoid silent key-name drift across environments.
+\end{tipbox}
+
+Chapter~11 builds directly on the collection established here, adding scalar
+quantization to compress the vector storage footprint --- an optimisation that
+interacts with the HNSW \code{m} parameter tuned in
+Section~\ref{sec:hnsw-tuning} and that requires the same
+\code{ensure\_collection\_ready} guard introduced in this section.
