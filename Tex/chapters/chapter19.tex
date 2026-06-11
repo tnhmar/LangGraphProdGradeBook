@@ -1,8 +1,878 @@
 %% ============================================================
 %%  Chapter 19 --- Supervisor Pattern
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langgraph >= 0.2.0,
+%%                langfuse >= 3.0.0,
+%%                langchain-litellm >= 0.3.0,
+%%                pydantic >= 2.7.0,
+%%                langchain-core >= 0.3.0
 %% ============================================================
 
-\chapterquote{Coordination without a contract produces chaos with extra steps.}{anon}
+\chapterquote{Routing is not an implementation detail. It is the architecture.}{anon}
 
-% TODO: Chapter 19 content
+The production failure this chapter prevents is coordination collapse at
+scale. A flat LangGraph graph that distributes work across specialised
+subgraphs via \code{add\_conditional\_edges} fails in a predictable way
+as the system grows: every new worker requires edge declarations from every
+other node that might route to it, retry paths need their own conditional
+functions, and there is no single place in the codebase that can read
+current work status and decide which worker should run next. The graph's
+edge table becomes the coordination logic, and it cannot be updated without
+touching every node that participates in routing. At three workers this is
+inconvenient; at six it is a structural defect whose cost is paid in every
+subsequent feature addition.
+
+The solution has five layers. The first is a \emph{routing layer}: a
+single supervisor node calls an LLM with a summary of the current work
+state and returns a \code{Command} that names the next worker and
+optionally updates state, atomically, before routing occurs. The second is
+a \emph{composition layer}: each worker is a compiled subgraph registered
+in the parent graph through an adapter node that translates state across
+the boundary; the supervisor sees a flat node list regardless of how
+complex each worker is internally. The third is an \emph{isolation layer}:
+per-worker output, errors, and retry budget live in a namespaced
+\code{subagent\_state} field with an \code{operator.or\_} reducer that
+merges per-worker keys independently; no worker can overwrite another's
+result. The fourth is a \emph{recovery layer}: per-worker retry budget is
+stored in graph state rather than a decorator closure, making it
+checkpointable, inspectable, and policy-configurable per worker without
+code change. The fifth is an \emph{observability layer}: each worker
+adapter wraps its subgraph call in a Langfuse SDK~v3 context-manager span,
+producing nested child spans automatically through OpenTelemetry context
+propagation without any coupling between the worker and the parent's
+tracing client.
+
+The sections are ordered by dependency. Section~\ref{sec:sup-command}
+establishes \code{Command} first because every subsequent section returns
+one. Section~\ref{sec:sup-subgraph} builds the subgraph composition
+pattern next because the adapter's return type cannot be specified before
+\code{Command} is understood. Section~\ref{sec:sup-state} defines the
+shared state schema after composition because the isolation invariant only
+becomes necessary once multiple subgraphs write to the same parent object.
+Section~\ref{sec:sup-fallback} builds the retry and escalation logic after
+state because per-worker retry budget is a field in \code{SubagentRecord}.
+Section~\ref{sec:sup-langfuse} introduces observability after the full
+node structure is established because the span lifecycle is entirely
+contained within the adapter node. Section~\ref{sec:sup-full} assembles
+all five layers without introducing new concepts.
+
+This chapter introduces six terms defined in Table~\ref{tab:ch19-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~19}
+\label{tab:ch19-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{Command} &
+  \code{from langgraph.types import Command}; a return value from a node
+  that carries \code{goto} (the name of the next node, or \code{END}) and
+  an optional \code{update} dict that is merged into graph state via
+  reducers before routing occurs; the two operations are atomic. \\
+Supervisor node &
+  The single LangGraph node whose only job is to read current state,
+  call an LLM to decide which worker should run next, and return a
+  \code{Command}; it holds no explicit edges to workers in the graph
+  definition---routing is entirely implicit through \code{Command.goto}. \\
+Subgraph &
+  A \code{StateGraph} compiled independently with
+  \code{subgraph.compile()} at module load time and registered in the
+  parent graph through an adapter node that translates
+  \code{AgentState} to a worker-local \code{TypedDict} and back. \\
+\code{subagent\_state} &
+  An
+  \code{Annotated[dict[str,~SubagentRecord],~operator.or\_]}
+  field in \code{AgentState}; keyed by worker name; the
+  \code{operator.or\_} reducer merges per-worker keys independently
+  so concurrent updates cannot overwrite each other. \\
+\code{SubagentRecord} &
+  A \code{TypedDict} with fields \code{output:~str},
+  \code{error:~str~|~None}, \code{retries:~int}, and
+  \code{max\_retries:~int}; one instance per registered worker in
+  \code{subagent\_state}. \\
+\code{RunnableConfig} &
+  \code{from langchain\_core.runnables import RunnableConfig}; the
+  typed config dict passed as the second argument to every LangGraph
+  node; its \code{metadata} key carries per-call observability context
+  (e.g.\ a Langfuse \code{trace\_context} dict); its \code{configurable}
+  key carries per-thread runtime parameters such as the checkpointer
+  thread identifier. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+chapter19/
+  state.py                # §19.3 — AgentState, SubagentRecord,
+                          #          operator.or_, initial_agent_state()
+  supervisor_core.py      # §19.1, §19.4 — supervisor_node,
+                          #                 RoutingDecision,
+                          #                 route_or_escalate,
+                          #                 escalate_node
+  workers.py              # §19.2 — compiled subgraphs + adapter nodes
+  observability.py        # §19.5 — Langfuse SDK v3 span helpers,
+                          #          inject_trace_config
+  supervisor_graph.py     # §19.6 — graph assembly, run_supervisor
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{Routing and State Updates Must Be Atomic}
+\label{sec:sup-command}
+%% ------------------------------------------------------------
+
+The design problem is the gap between a routing decision and the state
+that caused it. In a graph that uses \code{add\_conditional\_edges}, the
+conditional function reads state and returns a destination name, but it
+cannot update state: any change the routing logic wants to record---which
+worker was chosen, why, or what the current retry count is---must be
+written by the node before the conditional function runs. This two-step
+pattern creates a window in which the graph holds a partially updated
+state: the node has written its output, but the routing decision has not
+yet been recorded. Under concurrent execution or after a checkpoint
+restore, that window becomes a consistency hazard. The governing principle
+is that a routing decision and the state update it implies must be a single
+indivisible operation.
+
+\code{Command} is the LangGraph primitive that closes this gap. A node
+that returns \code{Command(goto="next\_node", update=\{"key": "value"\})}
+instructs the graph runtime to merge \code{update} into state via the
+field's reducer and then route to \code{goto}, in that order, as one
+atomic step. No conditional edge function is needed: the graph has no
+static edges between the supervisor and its workers. The supervisor node
+is registered with \code{add\_node}; the workers are registered with
+\code{add\_node}; the only static edge is \code{START} to
+\code{"supervisor"}. Everything else is determined at runtime by
+\code{Command.goto}.
+
+The type annotation \code{Command[Literal[...]]} on the supervisor node is
+not cosmetic. LangGraph uses it to validate the graph's routing structure
+at compile time and to render the graph topology in visualisation tools.
+A supervisor node that omits this annotation produces a graph that works at
+runtime but cannot be statically validated or visualised, which removes two
+diagnostic tools that matter most when the supervisor routes to an
+unexpected node under an edge case.
+
+The supervisor's routing decision comes from a structured LLM call. The
+LLM receives a compact summary of current work state---not the raw
+\code{AgentState} dict---and returns a \code{RoutingDecision} Pydantic
+model whose \code{next\_worker} field names the worker to run, or the
+sentinel string \code{"FINISH"} when all work is complete.
+\code{"FINISH"} is the LLM's output vocabulary; it maps to \code{END},
+the LangGraph module-level constant, inside \code{supervisor\_node}.
+Passing the string \code{"FINISH"} directly to \code{Command.goto} would
+cause a \code{NodeNotFoundError} at the first invocation where the
+supervisor concludes work is done.
+
+\begin{warningbox}
+\code{with\_structured\_output} raises \code{ValidationError} if the LLM
+returns a response that does not conform to \code{RoutingDecision}. This
+happens under load when the model truncates its response, and when a
+provider rate-limit returns an error payload rather than a JSON object.
+Wrap the structured call in a \code{try/except} and route to
+\code{"escalate"} on any failure---do not let a malformed routing response
+propagate as an unhandled exception into the graph runtime.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Supervisor node with atomic \texttt{Command} routing},
+  label={lst:sup-command}]
+# chapter19/supervisor_core.py
+from typing import Literal
+from langgraph.types import Command
+from langgraph.graph import END
+from langchain_core.runnables import RunnableConfig
+from langchain_litellm import ChatLiteLLM
+from pydantic import BaseModel, ValidationError
+from chapter19.state import AgentState
+
+class RoutingDecision(BaseModel):
+    next_worker: str  # worker node name, or "FINISH"
+    reason:      str  # one sentence, stored in state for observability
+
+_llm = ChatLiteLLM(model="anthropic/claude-sonnet-4-8")
+_structured_llm = _llm.with_structured_output(RoutingDecision)
+
+def _build_status_summary(state: AgentState) -> str:
+    lines = [f"Task: {state['task']}"]
+    for name, rec in state["subagent_state"].items():
+        if rec["error"] is None and rec["output"] != "":
+            status = "done"
+        elif rec["error"]:
+            status = f"error: {rec['error']}"
+        else:
+            status = "pending"
+        lines.append(f"  {name}: {status} (retries {rec['retries']})")
+    return "\n".join(lines)
+
+async def supervisor_node(
+    state: AgentState,
+    config: RunnableConfig,
+) -> Command[Literal["researcher", "writer",
+                     "critic", "escalate"]]:
+    try:
+        decision: RoutingDecision = await _structured_llm.ainvoke(
+            _build_status_summary(state)
+        )
+    except (ValidationError, Exception):
+        return Command(goto="escalate")
+    next_node = END if decision.next_worker == "FINISH" \
+                else decision.next_worker
+    return Command(
+        goto=next_node,
+        update={"routing_reason": decision.reason},
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:sup-command} deserve explanation.
+\code{\_build\_status\_summary()} serialises \code{subagent\_state} into a
+bounded string rather than passing the raw state dict to the LLM; this
+decouples the prompt format from Python field names and prevents the
+supervisor's routing behaviour from becoming sensitive to schema changes in
+\code{AgentState}. The \code{\_structured\_llm} module-level binding calls
+\code{with\_structured\_output} once at import time rather than on every
+node invocation; \code{with\_structured\_output} constructs a tool-calling
+chain at call time, and rebuilding it per invocation adds measurable
+overhead at scale. The \code{except (ValidationError, Exception)} clause
+is deliberately broad: a provider HTTP error, a JSON parse failure, and a
+Pydantic schema mismatch all have the same correct response from the
+supervisor---route to \code{"escalate"}---and distinguishing them here
+would produce dead code.
+
+A supervisor that can express any routing decision in a single \code{Command}
+return is only useful if the workers it routes to are themselves independent
+units. The next problem is composition: how to register a multi-step worker
+as a single node without collapsing the state boundary between the worker
+and the supervisor.
+
+
+%% ------------------------------------------------------------
+\section{Each Worker Is an Independent Graph}
+\label{sec:sup-subgraph}
+%% ------------------------------------------------------------
+
+The design problem is the boundary between a worker's internal steps and
+the supervisor's coordination logic. The naive approach is to define worker
+logic as a Python function called directly from a node in the parent graph.
+This makes the worker's internal steps invisible to LangGraph's
+checkpointer, its errors impossible to classify at the subgraph level, and
+its state schema entangled with the parent's. The governing principle is
+that a worker is a graph: it has its own \code{TypedDict} state, its own
+internal nodes, and its own compiled execution context, registered in the
+parent as a single addressable node through an adapter that translates
+state across the boundary.
+
+A \emph{subgraph} is a \code{StateGraph} compiled once with
+\code{subgraph.compile()} and then made available to the parent through
+a Python function---the adapter node---that transforms
+\code{AgentState} into the worker's local \code{TypedDict}, invokes the
+compiled subgraph, and returns a \code{Command} encoding both the state
+update and the routing decision. Calling \code{compile()} at module scope
+rather than inside \code{add\_node} matters: \code{compile()} validates
+the subgraph's internal edge structure and locks its state schema at import
+time. A misconfigured worker fails immediately on startup rather than at
+the first production call.
+
+\begin{notebox}
+\code{CompiledStateGraph.ainvoke()} returns a plain \code{dict}, not the
+typed \code{TypedDict} used as the subgraph's state parameter. The
+annotation \code{result: ResearchState = await research\_compiled.ainvoke(...)}
+is a programmer's cast that passes type-checking but is not enforced at
+runtime. Always access \code{result} with \code{.get()} or verify keys
+before use.
+\end{notebox}
+
+The adapter node owns three responsibilities: translating \code{AgentState}
+fields into the worker-local input, passing the \code{RunnableConfig}
+unchanged to \code{ainvoke} so that Langfuse trace context propagates into
+the subgraph, and calling \code{route\_or\_escalate()}---introduced in
+Section~\ref{sec:sup-fallback}---to produce the \code{Command} that
+carries the updated \code{SubagentRecord} back. Because the adapter must
+choose between returning to the supervisor on success and routing to
+escalation on failure, its return type is
+\code{Command[Literal["supervisor",~"escalate"]]}, not \code{dict}. A node
+that returns a \code{dict} cannot express routing; \code{Command} is the
+only correct return type once routing is a responsibility of the node.
+
+\begin{lstlisting}[language=Python,
+  caption={Compiled subgraph and its parent-facing adapter node},
+  label={lst:sup-subgraph}]
+# chapter19/workers.py
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
+from langchain_core.runnables import RunnableConfig
+from langchain_litellm import ChatLiteLLM
+from chapter19.state import AgentState, SubagentRecord
+
+_llm = ChatLiteLLM(model="anthropic/claude-sonnet-4-8")
+
+class ResearchState(TypedDict):
+    query:    str
+    findings: str
+    error:    str | None
+
+async def _research_step(
+    state: ResearchState,
+    config: RunnableConfig,
+) -> ResearchState:
+    try:
+        findings = (await _llm.ainvoke(state["query"])).content
+        return ResearchState(
+            query=state["query"], findings=findings, error=None,
+        )
+    except Exception as exc:
+        return ResearchState(
+            query=state["query"], findings="", error=str(exc),
+        )
+
+_research_graph = StateGraph(ResearchState)
+_research_graph.add_node("research_step", _research_step)
+_research_graph.add_edge(START, "research_step")
+_research_graph.add_edge("research_step", END)
+research_compiled = _research_graph.compile()   # module scope
+
+async def research_node(
+    state: AgentState,
+    config: RunnableConfig,
+) -> Command[Literal["supervisor", "escalate"]]:
+    result: dict = await research_compiled.ainvoke(
+        ResearchState(query=state["task"], findings="", error=None),
+        config=config,
+    )
+    record = SubagentRecord(
+        output=result.get("findings", ""),
+        error=result.get("error"),
+        retries=state["subagent_state"]["researcher"]["retries"],
+        max_retries=state["subagent_state"]["researcher"]["max_retries"],
+    )
+    from chapter19.supervisor_core import route_or_escalate
+    return route_or_escalate("researcher", record)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:sup-subgraph} deserve explanation.
+The \code{error} field in \code{ResearchState} is set by the worker itself
+inside \code{\_research\_step} rather than caught by the adapter; this
+keeps failure classification inside the subgraph where the exception type
+is known, rather than forcing the adapter to infer meaning from a bare
+\code{Exception} re-raised across a boundary. The \code{config=config}
+passthrough to \code{ainvoke} is not optional: constructing a new
+\code{RunnableConfig} inside the adapter would drop the \code{metadata}
+dict carrying the Langfuse trace context, orphaning all spans the subgraph
+creates from the parent trace. The \code{from chapter19.supervisor\_core
+import route\_or\_escalate} import is deferred to inside the function body
+to break the circular dependency between \code{workers.py} and
+\code{supervisor\_core.py}; both modules reference each other's symbols,
+and a module-level import in either file would raise \code{ImportError} at
+startup before any graph is constructed.
+
+With the subgraph boundary established, the next problem is what happens to
+state on the parent side when multiple worker adapters write to
+\code{subagent\_state}---potentially concurrently in a fan-out scenario.
+
+
+%% ------------------------------------------------------------
+\section{Worker State Must Not Reach Supervisor Fields}
+\label{sec:sup-state}
+%% ------------------------------------------------------------
+
+The design problem is shared mutable state under concurrent writes. When
+two worker adapters return simultaneously in a LangGraph fan-out, both
+write to \code{subagent\_state}. Without a reducer, the graph applies
+state updates as last-write-wins dict replacement: whichever adapter
+finishes last overwrites the other's result entirely. The naive approach
+is a flat set of top-level fields---\code{researcher\_output},
+\code{writer\_output}---that avoids the concurrent-write problem by
+giving each worker its own key, but at the cost of forcing the supervisor
+to enumerate every worker's field by name. Adding a new worker then
+requires modifying \code{AgentState}, every node that reads output by field
+name, and the supervisor's routing prompt. The governing principle is that
+worker-local data belongs in a single namespaced field whose reducer
+guarantees per-key independence regardless of concurrency.
+
+The \code{Annotated} type annotation is LangGraph's mechanism for attaching
+a reducer to a state field. \code{Annotated[dict[str,~SubagentRecord],
+operator.or\_]} binds \code{operator.or\_} as the merge function for
+\code{subagent\_state}. \code{operator.or\_} on two dicts computes
+\code{left | right}, equivalent to \code{\{**left,~**right\}} with
+right-key precedence. When \code{research\_node} returns a \code{Command}
+whose \code{update} contains \code{\{"subagent\_state": \{"researcher":
+record\}\}}, the runtime calls \code{operator.or\_(existing, \{"researcher":
+record\})}, merging only the \code{"researcher"} key while leaving all
+other worker keys untouched.
+
+\begin{warningbox}
+A worker adapter must pass only the delta \code{\{worker\_name: record\}}
+to \code{Command.update}, not the full merged \code{subagent\_state} dict.
+Assembling the full dict inside the node reads state before the reducer
+runs; under concurrent fan-out, this read happens before the other
+worker's write, so merging the full dict will silently overwrite that
+worker's result regardless of the reducer.
+\end{warningbox}
+
+\code{SubagentRecord} carries four fields. \code{output} and \code{error}
+are the worker's result and failure message. \code{retries} and
+\code{max\_retries} encode the per-worker retry policy: \code{max\_retries}
+is set at initialisation time and never changed; \code{retries} is
+incremented by \code{route\_or\_escalate()} when a failed worker is
+re-routed rather than escalated. Per-worker retry budget differs
+intentionally: a researcher calls an external retrieval pipeline and
+network failures are common; a writer failure is almost always a prompt or
+model problem that a retry will not fix. These are schema facts visible in
+\code{initial\_agent\_state()}, not runtime configuration buried in a
+decorator.
+
+\begin{lstlisting}[language=Python,
+  caption={State schema with \texttt{operator.or\_} reducer and per-worker record},
+  label={lst:sup-state}]
+# chapter19/state.py
+import operator
+from typing import Annotated, TypedDict
+
+class SubagentRecord(TypedDict):
+    output:      str
+    error:       str | None
+    retries:     int
+    max_retries: int
+
+class AgentState(TypedDict):
+    task:           str
+    final_answer:   str
+    routing_reason: str
+    subagent_state: Annotated[
+        dict[str, SubagentRecord],
+        operator.or_,
+    ]
+
+def _blank(max_retries: int) -> SubagentRecord:
+    return SubagentRecord(
+        output="", error=None, retries=0, max_retries=max_retries,
+    )
+
+def initial_agent_state(task: str) -> AgentState:
+    return AgentState(
+        task=task,
+        final_answer="",
+        routing_reason="",
+        subagent_state={
+            "researcher": _blank(max_retries=3),
+            "writer":     _blank(max_retries=1),
+            "critic":     _blank(max_retries=2),
+        },
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:sup-state} deserve explanation.
+\code{final\_answer} lives at the top level of \code{AgentState} rather
+than inside the last worker's \code{SubagentRecord} because the supervisor
+writes it when it concludes the task is done---at that moment the
+supervisor does not know and should not care which worker produced the
+final output; the field is a coordination result, not a worker output.
+\code{initial\_agent\_state()} is a plain function rather than a default
+factory on the \code{TypedDict} fields because \code{TypedDict} does not
+support field defaults: attempting to declare \code{subagent\_state:
+Annotated[dict[str,~SubagentRecord], operator.or\_] = \{\}} raises a
+\code{TypeError} at class definition time.
+
+The state schema is now stable. The remaining problem is what to do when a
+worker's \code{SubagentRecord} arrives with a non-null \code{error} field:
+the routing decision is not simply ``retry the same worker'' but a policy
+that depends on how many times that worker has already failed.
+
+
+%% ------------------------------------------------------------
+\section{Retry Budget Lives in State, Not in a Decorator}
+\label{sec:sup-fallback}
+%% ------------------------------------------------------------
+
+The design problem is invisible retry accounting. The conventional
+approach---a \code{tenacity} decorator or a \code{while} loop inside the
+node function---records retry attempts in a closure or a local variable.
+That counter is not part of graph state: it cannot be checkpointed, it
+resets to zero when the process restarts mid-task, it is invisible to the
+supervisor's routing LLM, and it cannot be read by a monitoring system.
+When the retry budget is exhausted and escalation is required, the
+decorator raises an exception that the graph runtime catches as an
+unhandled node error rather than routing to a named escalation node. The
+governing principle is that retry accounting is coordination state and must
+live where all coordination state lives---in \code{AgentState}---where it
+is durable, observable, and policy-configurable per worker without code
+change.
+
+The design separates two concerns that decorators collapse together:
+\emph{execution} and \emph{retry policy}. The worker subgraph executes
+once and reports its result into \code{SubagentRecord.error}; it has no
+knowledge of retry budget. The function \code{route\_or\_escalate()} reads
+the updated record, checks whether \code{retries~<~max\_retries}, and
+returns a \code{Command} that either routes back to the same worker with
+an incremented \code{retries} count, returns to the supervisor, or routes
+to \code{"escalate"}. The \code{Command.update} in all cases passes only
+the delta \code{\{worker\_name:~record\}} so the \code{operator.or\_}
+reducer merges exactly the one changed key.
+
+Escalation routes to a named node rather than directly to \code{END}
+because escalation is a discrete business event, not a graph termination
+condition. A named \code{escalate\_node} appears as a span in Langfuse,
+can be replaced with \code{interrupt()} for human-in-the-loop
+approval---\code{interrupt()} is a LangGraph primitive introduced in
+Chapter~21~\S21.2 that pauses graph execution and surfaces current state
+to an external caller---and can be individually unit-tested. A direct
+\code{Command(goto=END)} from the adapter would make all three of those
+capabilities impossible without restructuring the graph.
+
+\begin{lstlisting}[language=Python,
+  caption={Per-worker retry logic as a pure function},
+  label={lst:sup-fallback}]
+# chapter19/supervisor_core.py  (continued)
+from langgraph.types import Command
+from langgraph.graph import END
+from langchain_core.runnables import RunnableConfig
+from chapter19.state import AgentState, SubagentRecord
+
+def route_or_escalate(
+    worker_name:    str,
+    updated_record: SubagentRecord,
+) -> Command:
+    delta = {"subagent_state": {worker_name: updated_record}}
+    if updated_record["error"] is None:
+        return Command(goto="supervisor", update=delta)
+    if updated_record["retries"] < updated_record["max_retries"]:
+        retried = SubagentRecord(
+            **{**updated_record,
+               "retries": updated_record["retries"] + 1},
+        )
+        return Command(
+            goto=worker_name,
+            update={"subagent_state": {worker_name: retried}},
+        )
+    return Command(goto="escalate", update=delta)
+
+async def escalate_node(
+    state:  AgentState,
+    config: RunnableConfig,
+) -> Command:
+    # Log all workers that exhausted their retry budget.
+    failed = {
+        name: rec for name, rec in state["subagent_state"].items()
+        if rec["error"] is not None
+    }
+    # Production: emit to alerting here. Failed dict is serialisable.
+    _ = failed
+    return Command(goto=END)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:sup-fallback} deserve explanation.
+\code{route\_or\_escalate()} is a plain synchronous function, not a
+coroutine, because it makes no I/O calls; making it \code{async} would
+require an \code{await} at every call site without gaining any concurrency,
+and would make it impossible to call from a synchronous context such as a
+unit test. The \code{SubagentRecord(**\{**updated\_record, "retries": ...\})}
+construction is intentional: \code{TypedDict} does not support
+keyword-override spreading (\code{SubagentRecord(**rec, retries=n)} is a
+\code{TypeError} because \code{TypedDict} constructors do not accept
+keyword argument override after a spread); the explicit dict merge
+\code{\{**updated\_record, "retries": n\}} is the correct pattern.
+\code{escalate\_node} collects failed workers into a local dict rather
+than calling any I/O function inline; the alerting call belongs in the
+production deployment layer (a LangGraph interrupt handler or a
+post-processing hook), not embedded in a node that must remain testable
+in isolation.
+
+The retry and escalation logic is now correct and checkpointable. The
+remaining problem is observability: the supervisor routing cycle and each
+worker's subgraph invocation produce spans in isolation, and without an
+enclosing parent trace those spans cannot be correlated into a single
+end-to-end view of a supervision run.
+
+
+%% ------------------------------------------------------------
+\section{Observability Must Cross the Subgraph Boundary}
+\label{sec:sup-langfuse}
+%% ------------------------------------------------------------
+
+The design problem is span orphaning under nested async execution. When the
+supervisor routes to a worker adapter, and the adapter invokes a compiled
+subgraph via \code{ainvoke}, the subgraph's internal LLM calls emit
+OpenTelemetry spans in the process's active OTEL context. If no enclosing
+Langfuse span exists in that context at the moment \code{ainvoke} is
+called, those spans are either emitted as anonymous root traces or silently
+discarded, making it impossible to correlate a subgraph call with the
+supervision run that triggered it. The naive approach---a module-level
+\code{Langfuse()} singleton---ties all concurrent supervision runs to the
+same tracing context, producing incorrect span nesting under parallelism.
+The governing principle is that observability context is per-invocation:
+the adapter node opens a Langfuse span as a context manager around its
+\code{ainvoke} call, and the Langfuse SDK~v3 OTEL backend nests every span
+created inside that block as a child automatically.
+
+Langfuse Python SDK~v3 (generally available June 2025) is built on
+OpenTelemetry. When a span is opened with
+\code{langfuse.start\_as\_current\_span()} as a context manager, that span
+becomes the active OTEL span for the duration of the \code{with} block.
+Any LLM call made inside the block that is instrumented via
+LangChain's callback system---which LangGraph uses---emits its generation
+span as a child of the active Langfuse span automatically, without any
+additional configuration. This means the adapter's \code{async with}
+block is the only integration point needed: no callbacks are registered,
+no span IDs are threaded through state, and no worker internals are
+modified. The worker subgraph is completely unaware of the tracing context.
+
+The singleton accessor \code{get\_client()} returns the same
+\code{Langfuse} instance throughout the process. Calling
+\code{Langfuse()} a second time with the same public key reuses the
+existing instance rather than creating a new one, but \code{get\_client()}
+makes the singleton contract explicit and requires no constructor
+arguments after the first initialisation.
+
+\begin{notebox}
+\code{RunnableConfig} has two separate namespaces that must not be mixed.
+\code{config["configurable"]} is the LangGraph-managed namespace for
+per-thread runtime keys such as the checkpointer's \code{thread\_id}.
+\code{config["metadata"]} is the user-managed namespace for call-scoped
+context. Placing a Langfuse \code{trace\_context} dict under
+\code{"configurable"} causes the LangGraph checkpointer to attempt to use
+it as a thread parameter; placing \code{thread\_id} under
+\code{"metadata"} causes the checkpointer to miss it entirely.
+\end{notebox}
+
+The \code{inject\_trace\_config()} function in \code{observability.py}
+constructs the \code{RunnableConfig} that every invocation of
+\code{run\_supervisor()} passes to the graph. It opens a root Langfuse span
+for the entire supervision run, reads the W3C-compliant trace identifier
+from that span, and embeds it as a \code{trace\_context} dict under
+\code{config["metadata"]}. Each worker adapter reads this dict and passes
+it to \code{start\_as\_current\_span()} via the \code{trace\_context}
+parameter, which instructs the SDK to attach the new span as a child of
+the root span regardless of which async task is currently running.
+
+\begin{lstlisting}[language=Python,
+  caption={Langfuse SDK v3 root span, worker span, and config injection},
+  label={lst:sup-langfuse}]
+# chapter19/observability.py
+from langfuse import get_client, Langfuse
+from langchain_core.runnables import RunnableConfig
+
+_lf = get_client()
+
+def inject_trace_config(thread_id: str) -> RunnableConfig:
+    root = _lf.start_span(name="supervisor_run")
+    trace_ctx = {"trace_id": root.trace_id,
+                 "parent_span_id": root.id}
+    return {
+        "configurable": {"thread_id": thread_id},
+        "metadata":     {"langfuse_trace_context": trace_ctx,
+                         "langfuse_root_span":     root},
+    }
+
+def close_root_span(config: RunnableConfig) -> None:
+    root = (config.get("metadata") or {}).get("langfuse_root_span")
+    if root is not None:
+        root.end()
+    _lf.flush()
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Adapter node with worker span scoped to \texttt{ainvoke} call},
+  label={lst:sup-langfuse-adapter}]
+# chapter19/workers.py  (research_node with observability)
+async def research_node(
+    state: AgentState,
+    config: RunnableConfig,
+) -> Command[Literal["supervisor", "escalate"]]:
+    meta = config.get("metadata") or {}
+    trace_ctx = meta.get("langfuse_trace_context")
+    span_kwargs = ({"trace_context": trace_ctx}
+                   if trace_ctx else {})
+    async with _lf.start_as_current_span(
+        name="researcher",
+        input={"task": state["task"]},
+        **span_kwargs,
+    ) as worker_span:
+        result: dict = await research_compiled.ainvoke(
+            ResearchState(
+                query=state["task"], findings="", error=None,
+            ),
+            config=config,
+        )
+        worker_span.update(
+            output={"findings": result.get("findings", ""),
+                    "error":    result.get("error")},
+        )
+    record = SubagentRecord(
+        output=result.get("findings", ""),
+        error=result.get("error"),
+        retries=state["subagent_state"]["researcher"]["retries"],
+        max_retries=state["subagent_state"]["researcher"]["max_retries"],
+    )
+    from chapter19.supervisor_core import route_or_escalate
+    return route_or_escalate("researcher", record)
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:sup-langfuse}
+and~\ref{lst:sup-langfuse-adapter} deserve explanation.
+\code{inject\_trace\_config()} uses \code{\_lf.start\_span()} (not
+\code{start\_as\_current\_span()}) for the root span because the root span
+must outlive the function call that creates it; a context manager would
+close it at the end of \code{inject\_trace\_config()}, before any worker
+has run. The root span is stored under
+\code{config["metadata"]["langfuse\_root\_span"]} so \code{close\_root\_span()}
+can call \code{.end()} on it after \code{graph.ainvoke()} returns; without
+this explicit close, the root span's end time is never recorded and the
+Langfuse UI shows an open span indefinitely. The adapter uses
+\code{start\_as\_current\_span()} (not \code{start\_span()}) so that the
+span becomes the active OTEL context during \code{ainvoke}; this is the
+mechanism by which LangChain callback spans emitted inside
+\code{research\_compiled} are automatically nested as children without any
+explicit parent reference.
+
+All five layers are individually correct and independently testable. The
+final problem is assembly: how to register all nodes, verify the absence of
+\code{add\_conditional\_edges}, and confirm that the complete graph
+produces the expected span hierarchy end-to-end.
+
+
+%% ------------------------------------------------------------
+\section{Full System: Three Subagents Under One Supervisor}
+\label{sec:sup-full}
+%% ------------------------------------------------------------
+
+The design problem is silent structural divergence between the intended
+graph topology and the compiled one. With \code{Command}-based routing,
+the graph has no explicit edges between the supervisor and its workers; a
+programmer who adds a new worker and forgets to add it to the
+\code{RoutingDecision} prompt compiles a valid graph where the supervisor's
+LLM never routes to the new worker. There is no compiler error and no
+runtime exception---the new worker is silently unreachable. The governing
+principle is that the graph assembly function must be explicit about every
+registered node, and the integration test must invoke the graph with a task
+that exercises all three workers, asserting not just graph termination but
+that all three workers produced output and left no open errors.
+
+Before the full graph listing, the \code{writer\_node} and
+\code{critic\_node} adapters in \code{workers.py} follow the exact same
+structure as \code{research\_node}: each compiles its own
+\code{StateGraph} at module scope, each adapter wraps its \code{ainvoke}
+call in a \code{start\_as\_current\_span()} context manager keyed to the
+\code{langfuse\_trace\_context} from \code{config["metadata"]}, and each
+returns \code{route\_or\_escalate(worker\_name, record)}. The writer's
+internal step consumes \code{state["subagent\_state"]["researcher"]["output"]}
+to draft a summary; the critic's internal step evaluates that draft and
+writes its verdict directly to \code{final\_answer} via
+\code{Command(goto="supervisor", update=\{"final\_answer": verdict\})}.
+No new structural concepts appear in either adapter; only the internal step
+function and the state fields it reads differ.
+
+\begin{lstlisting}[language=Python,
+  caption={Graph assembly: all nodes registered, one static edge},
+  label={lst:sup-full-graph}]
+# chapter19/supervisor_graph.py
+from langgraph.graph import StateGraph, START
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.checkpoint.memory import MemorySaver
+from chapter19.state import AgentState, initial_agent_state
+from chapter19.supervisor_core import supervisor_node, escalate_node
+from chapter19.workers import research_node, writer_node, critic_node
+from chapter19.observability import inject_trace_config, close_root_span
+
+def build_supervisor_graph() -> CompiledStateGraph:
+    builder = StateGraph(AgentState)
+    builder.add_node("supervisor",  supervisor_node)
+    builder.add_node("researcher",  research_node)
+    builder.add_node("writer",      writer_node)
+    builder.add_node("critic",      critic_node)
+    builder.add_node("escalate",    escalate_node)
+    builder.add_edge(START, "supervisor")
+    # No add_conditional_edges: all routing via Command.goto.
+    return builder.compile(checkpointer=MemorySaver())
+
+async def run_supervisor(task: str, thread_id: str) -> AgentState:
+    graph  = build_supervisor_graph()
+    config = inject_trace_config(thread_id=thread_id)
+    try:
+        result: AgentState = await graph.ainvoke(
+            initial_agent_state(task),
+            config=config,
+        )
+    finally:
+        close_root_span(config)
+    return result
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:sup-full-graph} deserve explanation.
+\code{MemorySaver} is the development checkpointer: it stores all graph
+state in process memory and loses it on restart. It is the correct choice
+here precisely because it makes the retry-in-state limitation concrete---a
+restarted process loses \code{SubagentRecord.retries}, which is exactly
+the failure mode that motivates replacing \code{MemorySaver} with
+\code{AsyncSqliteSaver} from \code{langgraph.checkpoint.sqlite.aio} in
+production, as Chapter~22~\S22.1 introduces. The \code{try/finally} block
+in \code{run\_supervisor()} ensures \code{close\_root\_span()} is called
+even if \code{graph.ainvoke()} raises; without it, the root Langfuse span
+remains open in the Langfuse UI for every failed invocation, producing
+misleading latency histograms.
+
+\begin{lstlisting}[language=Python,
+  caption={Integration test: all three workers produce output},
+  label={lst:sup-full-run}]
+# chapter19/test_supervisor.py
+import pytest
+from chapter19.supervisor_graph import run_supervisor
+
+@pytest.mark.asyncio
+async def test_all_workers_produce_output() -> None:
+    result = await run_supervisor(
+        task="Research and summarise quantum error correction.",
+        thread_id="test-001",
+    )
+    assert result["final_answer"] != "", \
+        "critic must write final_answer before FINISH"
+    for worker in ("researcher", "writer", "critic"):
+        rec = result["subagent_state"][worker]
+        assert rec["error"] is None, \
+            f"{worker} finished with error: {rec['error']}"
+        assert rec["output"] != "", \
+            f"{worker} produced no output"
+
+@pytest.mark.asyncio
+async def test_retry_state_persists_across_nodes() -> None:
+    pytest.skip(
+        "Requires AsyncSqliteSaver: Chapter 22 §22.1 migration"
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:sup-full-run} deserve explanation.
+The first test asserts \code{final\_answer~!=~""} before checking
+individual worker records because that is the highest-level contract: if
+the supervisor never concluded and the critic never wrote a verdict, the
+per-worker assertions are noise that obscures the root cause. The second
+test is not empty---it calls \code{pytest.skip()} with an explicit message
+naming the capability it requires; this makes the test file's position in
+the \code{pytest} output a visible indicator of which Chapter~22 migration
+has not yet been applied, rather than a silent absence that only a diligent
+reader would notice.
+
+\begin{notebox}
+The supervisor graph as built here routes workers sequentially: the
+supervisor activates one worker per cycle. This is correct for tasks where
+worker B's input depends on worker A's output---research feeds writing,
+writing feeds critique. When a task can be decomposed into independent
+subtasks with no data dependency, sequential activation wastes wall-clock
+time. \code{Send}---a LangGraph primitive that spawns a named node with a
+custom input dict, introduced in Chapter~20 as the parallel fan-out
+mechanism---replaces the single-worker-per-supervisor-cycle pattern with a
+batch dispatch, allowing all independent workers to run concurrently. The
+\code{operator.or\_} reducer on \code{subagent\_state} makes this
+transition safe: parallel workers writing to different keys under the same
+reducer produce a correct merged result without any change to the state
+schema or the retry logic.
+\end{notebox}
+
+Chapter~20 takes the next step from this architecture: where this chapter
+asks which single worker should run next, the next chapter asks which set
+of workers can run simultaneously---and what the correct decomposition
+model is for dispatching a task to multiple independent workers in a single
+supervisor cycle rather than one at a time.
