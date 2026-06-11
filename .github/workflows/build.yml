@@ -24,7 +24,8 @@ jobs:
           run: |
             latexmk \
               -xelatex \
-              -f \
+              -halt-on-error \
+              -file-line-error \
               -interaction=nonstopmode \
               -output-directory=Tex/Output \
               Tex/main.tex
