@@ -1,8 +1,999 @@
 %% ============================================================
-%%  Chapter 28 --- Testing & CI/CD
+%%  CHAPTER 28 — Testing & CI/CD
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Author: Haythem Aber
 %% ============================================================
 
-\chapterquote{A test suite that only runs on the happy path is a liability, not an asset.}{anon}
 
-% TODO: Chapter 28 content
+An agent that fails its first production deploy does not fail quietly.
+It fails with a silent wrong answer---a hallucinated fact delivered
+confidently, a routing edge that was never exercised in development, a
+state field that serialises fine in memory but raises \code{TypeError}
+the moment it touches a real PostgreSQL checkpointer.
+By the time monitoring surfaces the problem, hundreds of users may have
+received corrupted responses, and the fix requires a full rollback plus
+a post-mortem.
+The production cost of an untested agent is not measured in bugs; it is
+measured in the cost of the rollback, the time to isolate which node
+broke, and the trust deficit that follows.
+
+The solution this chapter builds has four layers.
+The first layer---\emph{unit tests}---validates every node in complete
+isolation, substituting all network dependencies with typed async mocks;
+a node that passes unit tests is provably correct given correct inputs.
+The second layer---\emph{integration tests}---compiles the full graph
+against a real SQLite checkpointer and exercises routing, interrupt, and
+resume, catching serialisation failures that mocks cannot surface.
+The third layer---\emph{end-to-end tests}---runs the whole agent against
+real Qdrant, Redis, and PostgreSQL instances provisioned by Docker
+Compose, with a sandboxed Ollama LLM replacing vendor API calls.
+The fourth layer---\emph{the regression gate}---attaches quantitative
+thresholds to each node: error rate, latency p99, and RAGAS faithfulness
+score; a deploy is blocked unless every node passes every threshold.
+
+The sections appear in dependency order.
+Section~\ref{sec:unit-isolation} establishes the shared mock fixtures
+that every subsequent tier reuses.
+Section~\ref{sec:integration-topology} builds on those fixtures by
+adding a real checkpointer and asserting state persistence.
+Section~\ref{sec:e2e-sandboxed} replaces the in-process checkpointer
+with Docker-provisioned services, making the environment production-like
+without touching real vendor APIs.
+Section~\ref{sec:replay-fixtures} introduces replay fixtures that let
+CI reproduce a real run deterministically without Docker.
+Section~\ref{sec:regression-matrix} defines the quantitative gate that
+converts passing tests into passing deploys.
+Section~\ref{sec:github-actions} wires all five tiers into a single
+GitHub Actions pipeline where each job is a prerequisite of the next.
+
+\begin{table}[htbp]
+\centering
+\caption{Domain terms introduced in this chapter.}
+\label{tab:ch28-terms}
+\begin{tabularx}{\linewidth}{@{} l P{5cm} P{5.5cm} @{}}
+\toprule
+\textbf{Term} & \textbf{Definition} & \textbf{Where used} \\
+\midrule
+Unit test       & Test of one node in isolation; all external dependencies replaced with typed async mocks & \S28.1 \\
+Integration test & Test of the compiled graph with a real checkpointer; no external network calls & \S28.2 \\
+End-to-end test  & Test against real services (Qdrant, Redis, PostgreSQL) running in Docker Compose & \S28.3 \\
+Replay fixture   & JSON snapshot of a real run's state sequence, replayed deterministically in CI & \S28.4 \\
+Regression gate  & Per-node threshold check on error rate, p99 latency, and RAGAS score; blocks deploy on breach & \S28.5 \\
+RAGAS score      & Faithfulness and answer relevancy metrics computed by the RAGAS library against ground-truth references & \S28.5 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{sourcelayout}
+\dirtree{%
+  .1 tests/.\
+  .2 conftest.py \DTcomment{MockLiteLLM, MockMemory, make\_config, make\_context}.\
+  .2 unit/.\
+  .3 test\_llm\_primary\_node.py \DTcomment{\S28.1}.\
+  .2 integration/.\
+  .3 test\_graph\_routing.py \DTcomment{\S28.2}.\
+  .2 e2e/.\
+  .3 conftest.py \DTcomment{Docker service fixtures}.\
+  .3 test\_full\_agent\_run.py \DTcomment{\S28.3}.\
+  .2 fixtures/.\
+  .3 helpers.py \DTcomment{load\_fixture, save\_fixture}.\
+  .3 schema.py \DTcomment{FixtureEntry Pydantic v2 model}.\
+  .3 happy\_path\_baseline.json \DTcomment{recorded state sequence}.\
+  .2 regression/.\
+  .3 regression\_matrix.py \DTcomment{NodeMetrics, evaluate\_metrics, write\_csv}.\
+  .3 ragas\_eval.py \DTcomment{RAGAS EvaluationDataset builder}.\
+  .3 test\_replay.py \DTcomment{\S28.4}.\
+  .3 test\_regression\_gate.py \DTcomment{\S28.5}.\
+  .3 regression\_thresholds.yaml \DTcomment{per-node thresholds}.\
+  .1 docker-compose.test.yml \DTcomment{Qdrant, Redis, PostgreSQL, Ollama}.\
+  .1 .github/.\
+  .2 workflows/.\
+  .3 ci.yml \DTcomment{\S28.6 --- lint, unit, integration, eval, deploy}.\
+}
+\end{sourcelayout}
+
+%% ─────────────────────────────────────────────────────────────
+\section{Nodes Must Be Testable in Isolation}
+\label{sec:unit-isolation}
+%% ─────────────────────────────────────────────────────────────
+
+The design problem is that a LangGraph node reaches out to three or more
+external systems---an LLM router, a memory client, a vector store---and
+any one of them can fail for reasons unrelated to the logic inside the
+node itself.
+The naive approach is to call the node from a compiled graph and mock at
+the HTTP boundary, but that couples the test to graph topology; when a
+routing edge changes, unrelated node tests break.
+The principle is simpler: a node is a pure Python async function with a
+typed signature, and it can be called directly with typed arguments,
+bypassing the graph entirely.
+
+\begin{warningbox}
+Using \code{unittest.mock.MagicMock} as a stand-in for an async
+dependency raises \code{TypeError: object MagicMock can't be used in
+'await' expression} at runtime.
+Every mock that replaces an \code{async def} method must itself be an
+\code{async def} method.
+A bare \code{AsyncMock(spec=Router)} from the standard library is
+valid, but a hand-written class that mirrors the exact method signatures
+is easier to type-check and easier to read in failure output.
+\end{warningbox}
+
+The shared fixtures live in \code{tests/conftest.py}, which pytest
+discovers automatically for every test in the \code{tests/} tree.
+Two fixture factories---\code{mock\_llm} and \code{mock\_memory}---and two
+builder helpers---\code{make\_config} and \code{make\_context}---form the
+complete surface that all three test tiers import.
+
+\begin{lstlisting}[language=Python, caption={Shared async mock fixtures
+  and config helpers (\texttt{tests/conftest.py}).},
+  label={lst:conftest}]
+import uuid
+import pytest
+from typing import Any
+
+class MockLiteLLM:
+    def __init__(self, response_content: str = "mock response") -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._content = response_content
+
+    async def acompletion(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "choices": [
+                {"message": {"role": "assistant",
+                             "content": self._content}}
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+class MockMemory:
+    async def add(self, messages: list[dict],
+                  user_id: str, **kwargs: Any) -> dict[str, str]:
+        return {"id": "mock-mem-id"}
+    async def search(self, query: str,
+                     user_id: str, **kwargs: Any) -> list[dict]:
+        return []
+    async def get_all(self, user_id: str,
+                      **kwargs: Any) -> list[dict]:
+        return []
+
+@pytest.fixture
+def mock_llm() -> MockLiteLLM:
+    return MockLiteLLM()
+
+@pytest.fixture
+def mock_memory() -> MockMemory:
+    return MockMemory()
+
+def make_config(thread_id: str | None = None) -> dict[str, Any]:
+    return {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
+
+def make_context(llm: MockLiteLLM | None = None,
+                 memory: MockMemory | None = None) -> dict[str, Any]:
+    ctx: dict[str, Any] = {}
+    if llm:    ctx["llm_router"]    = llm
+    if memory: ctx["memory_client"] = memory
+    return ctx
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:conftest} deserve explanation.
+First, \code{make\_config} and \code{make\_context} are separated into
+two helpers rather than one because they represent two different
+concerns: \code{configurable} carries the \code{thread\_id} which is
+required by the checkpointer, while \code{context} carries
+runtime-injected dependencies that LangGraph~v0.6 routes through the
+\code{context\_schema} mechanism---merging them would couple checkpointer
+state to LLM provisioning, forcing every test to supply a
+\code{thread\_id} even when no checkpoint is written.
+Second, the fixtures are \code{scope="function"} (the pytest default),
+not \code{scope="session"}; because \code{MockLiteLLM.calls} accumulates
+per-test call counts, a session-scoped fixture would carry counts from
+previous tests into assertions about the current test, making count-based
+assertions non-deterministic.
+Third, \code{MockMemory} implements all three methods (\code{add},
+\code{search}, \code{get\_all}); a partial mock that omits any one of
+them causes an \code{AttributeError} that looks like a node failure but
+is actually a test configuration error.
+
+\begin{notebox}
+LangGraph~v0.6 introduced two related but distinct mechanisms for
+dependency injection.
+At the call site, \code{graph.ainvoke(input, config=cfg, context=\{...\})}
+passes a context dict that the runtime maps to the graph's declared
+\code{context\_schema}.
+Inside the node itself, the context is accessed via a typed
+\code{Runtime} parameter: \code{from langgraph.types import Runtime} and
+then \code{async def my\_node(state, runtime: Runtime[MyContext])},
+where \code{runtime.context} holds the injected values.
+Unit tests that call the node function directly must construct and pass
+a \code{Runtime} instance, or the node must be written to accept an
+optional \code{context=} kwarg for testability---both are valid
+patterns; the chapter examples use the direct kwarg form for clarity.
+\end{notebox}
+
+\begin{tipbox}
+Add the following snippet to \texttt{pyproject.toml} to eliminate the
+\code{@pytest.mark.asyncio} decorator from every test function.
+Without it, async tests silently pass without executing when
+\code{pytest-asyncio} is installed but \code{asyncio\_mode} is not set.
+\begin{lstlisting}[language=Python]
+# pyproject.toml
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires SqliteSaver",
+    "e2e: requires Docker daemon",
+    "regression: RAGAS gate",
+]
+\end{lstlisting}
+\end{tipbox}
+
+With fixtures defined, a unit test calls the node function directly,
+passes a minimal \code{AgentState}, and asserts on the returned state
+fragment---no graph compilation, no I/O.
+
+\begin{lstlisting}[language=Python, caption={Unit tests for the primary
+  LLM node (\texttt{tests/unit/test\_llm\_primary\_node.py}).},
+  label={lst:unit-node}]
+import pytest
+from unittest.mock import AsyncMock
+from langchain_core.messages import HumanMessage
+from litellm.exceptions import RateLimitError
+from src.graph.nodes import llm_primary_node
+from src.graph.state import AgentState
+from tests.conftest import MockLiteLLM, make_config, make_context
+
+async def test_happy_path(mock_llm: MockLiteLLM) -> None:
+    state: AgentState = {"messages": [HumanMessage(content="hello")]}
+    result = await llm_primary_node(
+        state,
+        config=make_config(),
+        context=make_context(llm=mock_llm),
+    )
+    assert result["messages"]
+    assert mock_llm.calls
+
+async def test_sets_soft_error_on_rate_limit(
+    mock_llm: MockLiteLLM,
+) -> None:
+    mock_llm.acompletion = AsyncMock(
+        side_effect=RateLimitError(
+            "rate limit", model="gpt-4", llm_provider="openai"
+        )
+    )
+    state: AgentState = {"messages": [HumanMessage(content="hello")]}
+    result = await llm_primary_node(
+        state,
+        config=make_config(),
+        context=make_context(llm=mock_llm),
+    )
+    assert result.get("error_class") == "soft"
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:unit-node} deserve explanation.
+The \code{RateLimitError} constructor requires \code{model} and
+\code{llm\_provider} as keyword arguments from LiteLLM~v1.x; omitting
+them raises a \code{TypeError} inside the mock setup, not inside the
+node under test---a confusing failure that implies the node is broken
+when the fixture is broken.
+The test for \code{error\_class} asserts on the returned state fragment,
+not on whether the mock was called with specific arguments; this
+separates the node's observable output contract from its internal
+implementation, so the node can be refactored without breaking the test.
+
+Unit tests confirm that each node behaves correctly given correct inputs
+and correctly classified errors, but they cannot confirm that the graph
+routes between nodes correctly or that state survives a checkpoint cycle;
+that requires a compiled graph with a real persisting checkpointer.
+
+%% ─────────────────────────────────────────────────────────────
+\section{Graph Topology Must Be Validated Against a Real Checkpointer}
+\label{sec:integration-topology}
+%% ─────────────────────────────────────────────────────────────
+
+The design problem is that a compiled graph can have routing edges that
+are logically correct in code but that fail at runtime because the state
+they write cannot be serialised to the checkpointer's storage format.
+The naive approach is to use \code{InMemorySaver} for integration tests;
+it is zero-configuration and fast, but it holds Python objects in memory
+directly and never calls the serialisation codec, so a \code{datetime}
+field without timezone info, a custom class, or a \code{HumanMessage}
+stored as a raw object will all pass \code{InMemorySaver} and fail the
+moment the real checkpointer is used.
+The principle is that integration tests must exercise the full
+serialisation round-trip; the cheapest checkpointer that does so is
+\code{SqliteSaver}.
+
+\begin{warningbox}
+\code{SqliteSaver} is a test-only checkpointer.
+It has no connection pooling, no concurrent-write safety, and no
+migration tooling.
+Any fixture that instantiates \code{SqliteSaver} must carry a comment
+reading \texttt{\# TEST ONLY --- use AsyncPostgresSaver in production}
+so that the pattern is never promoted to a deployment configuration.
+\end{warningbox}
+
+\code{SqliteSaver} is constructed with a DSN string; the
+\code{":memory:"} DSN creates an in-process SQLite database that is
+owned by the \code{SqliteSaver} instance for its lifetime.
+This makes it safe to scope the fixture to the test module: the
+in-memory database is isolated from other modules and disappears when
+the fixture is torn down.
+
+\begin{lstlisting}[language=Python, caption={Integration tests for
+  routing and checkpoint resumption
+  (\texttt{tests/integration/test\_graph\_routing.py}).},
+  label={lst:integration}]
+import pytest
+from unittest.mock import AsyncMock
+from langgraph.checkpoint.sqlite import SqliteSaver
+from litellm.exceptions import RateLimitError
+from src.graph.agent import build_resilient_graph
+from tests.conftest import MockLiteLLM, make_config, make_context
+
+# TEST ONLY -- SqliteSaver has no connection pooling; use AsyncPostgresSaver in prod
+@pytest.fixture(scope="module")
+def saver() -> SqliteSaver:
+    return SqliteSaver.from_conn_string(":memory:")
+
+@pytest.fixture(scope="module")
+def graph(saver: SqliteSaver):
+    return build_resilient_graph(checkpointer=saver)
+
+@pytest.mark.integration
+async def test_checkpoint_roundtrip(graph) -> None:
+    cfg = make_config()
+    await graph.ainvoke(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        config=cfg,
+        context=make_context(llm=MockLiteLLM()),
+    )
+    history = list(graph.get_state_history(cfg))
+    assert len(history) >= 2
+
+@pytest.mark.integration
+async def test_interrupt_and_resume(graph) -> None:
+    mock = MockLiteLLM()
+    mock.acompletion = AsyncMock(
+        side_effect=RateLimitError(
+            "rl", model="gpt-4", llm_provider="openai"
+        )
+    )
+    cfg = make_config()
+    await graph.ainvoke(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        config=cfg,
+        context=make_context(llm=mock),
+        interrupt_before=["llm_cheap"],
+    )
+    resumed = await graph.ainvoke(
+        None, config=cfg,
+        context=make_context(llm=MockLiteLLM()),
+    )
+    assert resumed is not None
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:integration} deserve explanation.
+\code{get\_state\_history} is synchronous and returns an iterator
+ordered newest-first; calling \code{list()} on it in an async test
+is valid because the method does not block the event loop---it reads
+from the in-memory SQLite connection synchronously.
+The assertion \code{len(history) >= 2} is deliberately loose: it
+confirms that the checkpointer wrote at least a START snapshot and one
+node snapshot, without tying the test to the exact number of nodes the
+graph may add or remove in future.
+The resume call passes \code{None} as input; this is the correct
+LangGraph pattern for resuming from an interrupt---the graph reads the
+persisted state from the checkpointer and continues from the last
+saved position, so providing new input would overwrite the saved state.
+
+Integration tests confirm routing and persistence but cannot confirm
+that the agent behaves correctly when talking to a real Qdrant
+collection, a real Redis cache, or a real PostgreSQL checkpointer with
+its schema migrations applied; that boundary is the responsibility of
+end-to-end tests.
+
+%% ─────────────────────────────────────────────────────────────
+\section{External Services Must Be Sandboxed, Not Mocked}
+\label{sec:e2e-sandboxed}
+%% ─────────────────────────────────────────────────────────────
+
+The design problem is that the interaction between the agent and its
+external services involves timing, connection pooling, schema
+versioning, and network serialisation that no mock can faithfully
+reproduce.
+The naive approach is to point E2E tests at shared staging
+environments, but that introduces flakiness from concurrent test
+runs, requires credential rotation on every CI runner, and makes the
+test environment non-reproducible across developer machines and CI
+agents.
+The principle is that every service the agent depends on must be
+provisioned locally and reproducibly for the duration of the test
+session, and torn down completely afterwards.
+
+Docker Compose is the correct tool for this: a single
+\code{docker-compose.test.yml} file declares four services---Qdrant,
+Redis, PostgreSQL, and an Ollama sidecar---and the CI job starts them
+before tests run and stops them after.
+The \code{pytest-docker} plugin provides a session-scoped
+\code{docker\_services} fixture that wraps this lifecycle and exposes
+a \code{wait\_until\_responsive} helper that polls a readiness check
+function until the service accepts connections.
+
+\begin{lstlisting}[language=Python, caption={E2E session fixtures with
+  Docker service readiness checks
+  (\texttt{tests/e2e/conftest.py}).},
+  label={lst:e2e-conftest}]
+import pytest
+import psycopg2
+import requests
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+DSN = "postgresql://agent:agent@localhost:5432/agentdb"
+
+@pytest.fixture(scope="session")
+def docker_compose_file(pytestconfig):
+    return str(pytestconfig.rootdir / "docker-compose.test.yml")
+
+def _pg_ready() -> bool:
+    try:
+        psycopg2.connect(DSN).close()
+        return True
+    except Exception:
+        return False
+
+def _qdrant_ready() -> bool:
+    try:
+        return (requests.get("http://localhost:6333/health",
+                             timeout=2)
+                .json().get("status") == "ok")
+    except Exception:
+        return False
+
+@pytest.fixture(scope="session")
+async def pg_saver(docker_services):
+    docker_services.wait_until_responsive(
+        check=_pg_ready, timeout=60, pause=1
+    )
+    docker_services.wait_until_responsive(
+        check=_qdrant_ready, timeout=60, pause=1
+    )
+    saver = await AsyncPostgresSaver.from_conn_string(DSN)
+    await saver.setup()   # idempotent -- creates tables if absent
+    return saver
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:e2e-conftest} deserve explanation.
+The readiness functions catch all exceptions and return \code{False}
+rather than re-raising them; during the startup window, connection
+refused, DNS resolution failure, and timeout are all expected and
+transient---re-raising would abort the fixture instead of retrying.
+\code{AsyncPostgresSaver.setup()} is idempotent by design; it uses
+\code{CREATE TABLE IF NOT EXISTS} internally, so calling it on a
+database that was previously initialised is safe and produces no
+error---this matters because the same Docker Compose volume may persist
+across CI runs if the runner caches Docker volumes.
+
+\begin{lstlisting}[language=Python, caption={Full-agent E2E test
+  (\texttt{tests/e2e/test\_full\_agent\_run.py}).},
+  label={lst:e2e-test}]
+import pytest
+from src.graph.agent import build_resilient_graph
+from src.graph.llm import build_ollama_router
+from tests.conftest import make_config
+
+@pytest.mark.e2e
+async def test_full_run_no_dead_letter(pg_saver) -> None:
+    graph  = build_resilient_graph(checkpointer=pg_saver)
+    cfg    = make_config()
+    result = await graph.ainvoke(
+        {"messages": [{"role": "user", "content": "What is 2+2?"}]},
+        config=cfg,
+        context={"llm_router": build_ollama_router()},
+    )
+    assert result["messages"][-1].content
+    assert not result.get("dead_letter")
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:e2e-test} deserve explanation.
+The \code{import uuid} line was deliberately omitted: \code{make\_config()}
+generates the \code{thread\_id} UUID internally, so importing \code{uuid}
+directly in the test file would be an unused import that mypy and ruff
+both flag as an error.
+The assertion \code{assert not result.get("dead\_letter")} uses a falsy
+check rather than \code{is None} because \code{dead\_letter} may be
+typed as a list that defaults to \code{[]} in \code{AgentState}; an
+empty list is falsy, so the assertion correctly passes when no
+dead-letter entries were recorded regardless of whether the field is
+absent or present and empty.
+
+The Ollama router constructed by \code{build\_ollama\_router()} points
+LiteLLM at \code{http://localhost:11434} with model string
+\code{"ollama/llama3.2:1b"}; because Ollama is a Docker Compose
+sidecar rather than a vendor API, there are no API keys to rotate, no
+rate limits to hit, and no cost per token---making the E2E suite safe to
+run on every pull request.
+
+E2E tests confirm that the agent completes a real request without
+routing to the dead-letter node, but they do not provide a
+\emph{reproducible} regression baseline: the Ollama model's output
+varies across model versions and the services may return different data
+across runs.
+Reproducibility requires a separate mechanism that records and replays
+a specific state sequence.
+
+%% ─────────────────────────────────────────────────────────────
+\section{Regressions Are Only Detectable Against a Recorded Baseline}
+\label{sec:replay-fixtures}
+%% ─────────────────────────────────────────────────────────────
+
+The design problem is that mocks assert on how the code calls its
+dependencies---the arguments, the call count---but they cannot assert
+on what the code produces, because the mock defines the production.
+A regression in prompt logic, a change to a routing condition, or a
+new state field that overwrites an older one will all pass mock-based
+tests while silently changing agent behaviour in production.
+The principle is that the output of a verified real run must be
+committed to the repository as a fixture, and CI must fail if a
+subsequent run diverges from that output.
+
+A \emph{replay fixture} is a JSON array where each element represents
+one \code{StateSnapshot} from \code{get\_state\_history}: a \code{values}
+dict (the full state at that checkpoint), a \code{next\_node} list, and
+a \code{step} integer.
+The fixtures are stored in \code{tests/fixtures/} as
+\code{\{name\}.json} files and committed to version control alongside
+the code they validate.
+Two helpers---\code{save\_fixture} and \code{load\_fixture}---are the
+entire interface between real runs and replay tests.
+
+\begin{lstlisting}[language=Python, caption={Fixture save and load
+  helpers (\texttt{tests/fixtures/helpers.py}).},
+  label={lst:fixture-helpers}]
+from __future__ import annotations
+import json
+from pathlib import Path
+from typing import Any
+
+FIXTURE_DIR = Path(__file__).parent
+
+def load_fixture(name: str) -> list[dict[str, Any]]:
+    path = FIXTURE_DIR / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Fixture not found: {path}")
+    data = json.loads(path.read_text())
+    if not isinstance(data, list):
+        raise ValueError(
+            f"Fixture '{name}' must be a JSON array, got {type(data)}"
+        )
+    return data
+
+async def save_fixture(name: str, graph, config: dict) -> None:
+    entries: list[dict[str, Any]] = []
+    i = 0
+    async for snap in graph.aget_state_history(config):
+        entries.append({
+            "values":    snap.values,
+            "next_node": list(snap.next),
+            "step":      i,
+        })
+        i += 1
+    entries.reverse()   # aget_state_history yields newest-first
+    path = FIXTURE_DIR / f"{name}.json"
+    path.write_text(json.dumps(entries, indent=2, default=str))
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:fixture-helpers} deserve explanation.
+\code{save\_fixture} uses \code{aget\_state\_history} (the async
+iterator variant) rather than the synchronous \code{get\_state\_history},
+because \code{save\_fixture} is typically called from an async test or
+an async CLI tool; using the sync variant inside a running event loop
+would require wrapping it in \code{asyncio.to\_thread}, adding
+unnecessary complexity.
+The \code{json.dumps(default=str)} fallback serialises
+\code{datetime}, \code{UUID}, and \code{BaseMessage} objects as their
+string representations; on reload, these fields are plain strings, not
+typed objects, so the replay test must reconstruct messages explicitly
+from the fixture data rather than assuming the values dict contains
+\code{HumanMessage} instances.
+
+The replay test references \code{FixtureEntry.validate\_list}, which
+validates each raw fixture dict against a Pydantic~v2 schema before the
+test runs; a schema mismatch raises a \code{ValidationError} that
+identifies exactly which field drifted, turning what would otherwise be
+an obscure \code{KeyError} in the test into an actionable error message.
+
+\begin{lstlisting}[language=Python, caption={Fixture entry schema with
+  Pydantic~v2 \texttt{model\_validate}
+  (\texttt{tests/fixtures/schema.py}).},
+  label={lst:fixture-schema}]
+from __future__ import annotations
+from typing import Any
+from pydantic import BaseModel
+
+class FixtureEntry(BaseModel):
+    values:    dict[str, Any]
+    next_node: list[str]
+    step:      int
+
+    @classmethod
+    def validate_list(
+        cls, data: list[dict[str, Any]]
+    ) -> list["FixtureEntry"]:
+        # model_validate is the Pydantic v2 replacement for parse_obj
+        return [cls.model_validate(entry) for entry in data]
+\end{lstlisting}
+
+One decision in Listing~\ref{lst:fixture-schema} deserves explanation.
+\code{model\_validate} is the Pydantic~v2 classmethod that replaced the
+removed \code{parse\_obj}; calling \code{parse\_obj} on a Pydantic~v2
+model raises \code{AttributeError} at import time, not at validation
+time, which can produce a confusing ``fixture module failed to import''
+error in pytest output that obscures the real cause.
+
+\begin{lstlisting}[language=Python, caption={Replay test that verifies
+  a baseline state sequence
+  (\texttt{tests/regression/test\_replay.py}).},
+  label={lst:replay-test}]
+import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import HumanMessage
+from tests.fixtures.helpers import load_fixture
+from tests.fixtures.schema import FixtureEntry
+from src.graph.agent import build_resilient_graph
+from tests.conftest import MockLiteLLM, make_config, make_context
+
+@pytest.mark.regression
+async def test_replay_happy_path() -> None:
+    raw     = load_fixture("happy_path_baseline")
+    entries = FixtureEntry.validate_list(raw)
+
+    saver   = InMemorySaver()
+    graph   = build_resilient_graph(checkpointer=saver)
+    cfg     = make_config()
+
+    first    = entries[0].values["messages"][0]
+    seed     = HumanMessage(content=first["content"])
+    expected = entries[-1].values["messages"][-1]["content"]
+
+    mock   = MockLiteLLM(response_content=expected)
+    result = await graph.ainvoke(
+        {"messages": [seed]},
+        config=cfg,
+        context=make_context(llm=mock),
+    )
+    assert result["messages"][-1].content == expected
+\end{lstlisting}
+
+The replay test uses \code{InMemorySaver} rather than
+\code{SqliteSaver} because the goal here is to verify output
+correctness, not serialisation fidelity; the integration tier already
+handles serialisation.
+The \code{expected} value is pinned from the fixture's last snapshot,
+then injected into \code{MockLiteLLM} as the canned response; this
+makes the test deterministic---the mock will always return the same
+string that was recorded in the fixture, so any divergence between the
+recorded output and the current output indicates a logic regression,
+not an LLM non-determinism problem.
+
+Replay tests confirm that the agent's observable output has not changed,
+but they do not answer the question of \emph{how much} it has
+degraded---a response that technically matches the baseline string may
+have regressed in faithfulness if the retrieval context changed.
+Quantitative metrics are needed for that boundary.
+
+%% ─────────────────────────────────────────────────────────────
+\section{Quality Degradation Must Be Caught Before It Reaches Users}
+\label{sec:regression-matrix}
+%% ─────────────────────────────────────────────────────────────
+
+The design problem is that a test suite produces a binary result---pass
+or fail---while LLM quality degrades continuously: faithfulness might
+drop from 0.92 to 0.71 across three model updates, with no single
+change large enough to break a deterministic assertion.
+The naive approach is to add numerical assertions directly into test
+functions, but scattered threshold literals across dozens of test files
+cannot be reviewed, versioned, or adjusted without touching code.
+The principle is that thresholds are configuration, not logic: they
+belong in a YAML file that can be reviewed and adjusted independently
+of the test code that enforces them.
+
+The \emph{regression matrix} is a CSV artifact produced by CI: one row
+per node, five metric columns (\code{node\_name}, \code{error\_rate},
+\code{p99\_ms}, \code{ragas\_faithfulness}, \code{ragas\_answer\_relevancy}),
+and a \code{passed} column that is \code{True} only when all applicable
+thresholds are met.
+The deploy job reads this CSV and aborts the rollout if any row has
+\code{passed=False}.
+
+\begin{notebox}
+The RAGAS library changed its dataset schema in v0.2.
+The legacy \code{datasets.Dataset} with columns \code{ground\_truth}
+and \code{contexts} is no longer accepted.
+The current API uses \code{EvaluationDataset} populated with
+\code{SingleTurnSample} objects whose fields are \code{user\_input},
+\code{response}, \code{retrieved\_contexts} (a list of strings), and
+\code{reference} (the ground-truth string).
+Metric classes must be instantiated---\code{Faithfulness()} and
+\code{AnswerRelevancy()}---not passed as bare class objects;
+passing the class raises a \code{TypeError} at \code{evaluate()} time.
+\end{notebox}
+
+\begin{lstlisting}[language=Python, caption={Per-node metrics schema
+  and threshold enforcement
+  (\texttt{tests/regression/regression\_matrix.py}).},
+  label={lst:regression-matrix}]
+from __future__ import annotations
+import csv, dataclasses, yaml
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class NodeMetrics:
+    node_name:              str
+    error_rate:             float
+    p99_ms:                 float
+    ragas_faithfulness:     Optional[float]
+    ragas_answer_relevancy: Optional[float]
+    passed:                 bool = True
+
+def load_thresholds(path: str = "tests/regression_thresholds.yaml") -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)["thresholds"]
+
+def evaluate_metrics(metrics: list[NodeMetrics],
+                     thresholds: dict) -> list[NodeMetrics]:
+    for m in metrics:
+        t = thresholds.get(m.node_name, {})
+        min_faith = t.get("min_ragas_faithfulness")
+        m.passed = (
+            m.error_rate <= t.get("max_error_rate", 1.0)
+            and m.p99_ms  <= t.get("max_p99_ms", float("inf"))
+            and (min_faith is None
+                 or (m.ragas_faithfulness or 0.0) >= min_faith)
+        )
+    return metrics
+
+def write_csv(metrics: list[NodeMetrics],
+              path: str = "regression_matrix.csv") -> None:
+    fieldnames = [f.name for f in dataclasses.fields(NodeMetrics)]
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for m in metrics:
+            writer.writerow(dataclasses.asdict(m))
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:regression-matrix} deserve explanation.
+\code{write\_csv} derives \code{fieldnames} from
+\code{dataclasses.fields(NodeMetrics)} rather than from
+\code{NodeMetrics.\_\_dataclass\_fields\_\_}: the latter returns a dict
+of \code{Field} objects, not strings, so passing it directly to
+\code{DictWriter} produces column headers like
+\code{Field(name='node\_name',\ldots)} instead of \code{node\_name}.
+\code{evaluate\_metrics} treats a \code{None} threshold
+(\code{min\_ragas\_faithfulness: null} in YAML) as ``not applicable''
+and skips the check for non-LLM nodes like \code{static\_fallback};
+this avoids a false-positive failure when a node that never calls an
+LLM is evaluated against a RAGAS threshold that has no meaning for it.
+
+\begin{lstlisting}[language=Python, caption={RAGAS evaluation helper
+  using the v0.2 \texttt{EvaluationDataset} API
+  (\texttt{tests/regression/ragas\_eval.py}).},
+  label={lst:ragas-eval}]
+from ragas import evaluate
+from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
+from ragas.metrics import Faithfulness, AnswerRelevancy
+
+def run_ragas_eval(question: str, answer: str,
+                   contexts: list[str], reference: str) -> dict[str, float]:
+    sample = SingleTurnSample(
+        user_input=question,
+        response=answer,
+        retrieved_contexts=contexts,
+        reference=reference,
+    )
+    dataset = EvaluationDataset(samples=[sample])
+    result  = evaluate(
+        dataset=dataset,
+        metrics=[Faithfulness(), AnswerRelevancy()],
+    )
+    df = result.to_pandas()
+    return {
+        "faithfulness":     float(df["faithfulness"].iloc[0]),
+        "answer_relevancy": float(df["answer_relevancy"].iloc[0]),
+    }
+\end{lstlisting}
+
+The helper returns a plain \code{dict[str, float]} rather than the
+\code{Result} object directly; this decouples the test code from the
+RAGAS internal API, which changed its schema twice between v0.1 and
+v0.2.
+If RAGAS changes its column names again, only this one helper needs to
+change, and every test that calls \code{run\_ragas\_eval} remains
+unaffected.
+
+With quantitative thresholds defined and enforced by test code, the
+remaining question is how to sequence, parallelise, and enforce these
+four tiers automatically on every push and pull request---which is the
+responsibility of the CI pipeline.
+
+%% ─────────────────────────────────────────────────────────────
+\section{Each Test Tier Must Be an Independent CI Gate}
+\label{sec:github-actions}
+%% ─────────────────────────────────────────────────────────────
+
+The design problem is that a single CI job running all test tiers
+sequentially is both slow---unit tests must wait for Docker to start---
+and uninformative---when integration tests fail, it is unclear whether
+they failed because of a logic regression or because a Docker service
+did not start in time.
+The naive approach is to put everything in one job with a long timeout;
+the consequence is that a lint error costs the same CI minutes as a
+full E2E run, and every developer waits for Docker even when only
+fixing a comment.
+The principle is that each tier is an independent job with its own
+\code{needs:} dependency; the cheapest tier runs first, and a failure
+at any tier aborts the chain before the more expensive tiers begin.
+
+The five jobs are: \code{lint} (ruff + mypy, no services, approximately
+30 seconds), \code{unit} (no services, approximately 60 seconds),
+\code{integration} (three Docker services via the \code{services:}
+block), \code{eval} (four Docker services via Docker Compose, includes
+the RAGAS gate and artifact upload), and \code{deploy} (downloads the
+artifact, asserts no threshold breaches, then runs \code{kubectl
+rollout restart}).
+
+\begin{warningbox}
+The GitHub Actions \code{services:} block starts individual containers
+and does not accept a Docker Compose file.
+The \code{--health-cmd} value in \code{options:} is passed directly to
+\code{docker run} as a shell command that must exist inside the
+container image.
+For \code{postgres:16-alpine}, use \code{pg\_isready -U agent -d agentdb}.
+For \code{qdrant/qdrant:latest}, use \code{wget -qO- http://localhost:6333/health}.
+Using \code{curl} in a Qdrant health check will fail silently because
+the official Qdrant image does not ship \code{curl}; it ships \code{wget}.
+\end{warningbox}
+
+\begin{lstlisting}[language=yaml, caption={CI pipeline: lint, unit, and
+  integration jobs (\texttt{.github/workflows/ci.yml}, Part~1).},
+  label={lst:ci-part1}]
+name: Agent CI
+on:
+  push:   { branches: [main] }
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv && uv sync --frozen
+      - run: uv run ruff check . && uv run mypy src/
+
+  unit:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv && uv sync --frozen
+      - run: |
+          uv run pytest tests/unit/ tests/conftest.py \
+            -m "not integration and not e2e and not regression" \
+            -x -q
+
+  integration:
+    needs: unit
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB:       agentdb
+          POSTGRES_USER:     agent
+          POSTGRES_PASSWORD: agent
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U agent -d agentdb"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-retries 5
+      qdrant:
+        image: qdrant/qdrant:latest
+        ports: ["6333:6333"]
+        options: >-
+          --health-cmd "wget -qO- http://localhost:6333/health"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv && uv sync --frozen
+      - run: uv run pytest tests/integration/ -m integration -x -q
+\end{lstlisting}
+
+\begin{lstlisting}[language=yaml, caption={CI pipeline: eval gate and
+  deploy jobs (\texttt{.github/workflows/ci.yml}, Part~2).},
+  label={lst:ci-part2}]
+  eval:
+    needs: integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv && uv sync --frozen
+      - name: Start test services with Ollama
+        run: docker compose -f docker-compose.test.yml up -d
+      - name: Wait for Ollama and pull model
+        run: |
+          timeout 120 bash -c \
+            'until curl -sf http://localhost:11434/api/tags; do sleep 2; done'
+          docker exec \
+            $(docker compose -f docker-compose.test.yml ps -q ollama) \
+            ollama pull llama3.2:1b
+      - name: Run regression gate
+        run: uv run pytest tests/regression/ -m regression -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: regression-matrix
+          path: regression_matrix.csv
+      - name: Tear down services
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  deploy:
+    needs: [eval]
+    if: github.ref == 'refs/heads/main' && success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: regression-matrix }
+      - name: Assert no threshold breaches
+        run: |
+          python - <<'EOF'
+          import csv, sys
+          rows = list(csv.DictReader(open("regression_matrix.csv")))
+          fails = [r for r in rows if r["passed"] != "True"]
+          if fails:
+              for f in fails: print(f"BREACH: {f}", file=sys.stderr)
+              sys.exit(1)
+          print(f"All {len(rows)} node(s) within thresholds.")
+          EOF
+      - name: Rollout to Kubernetes
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
+        run: |
+          echo "$KUBECONFIG_DATA" | base64 -d > /tmp/kubeconfig
+          KUBECONFIG=/tmp/kubeconfig \
+            kubectl rollout restart deployment/agent-api
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:ci-part1}
+and~\ref{lst:ci-part2} deserve explanation.
+\code{uv sync --frozen} uses the committed lockfile exactly as it was
+written, preventing implicit dependency upgrades during CI; a
+\code{uv sync} without \code{--frozen} would silently upgrade packages
+whose version constraints allow a new release, potentially changing
+agent behaviour between the developer's machine and the CI run.
+The \code{if: always()} condition on the Docker Compose teardown step
+ensures that services are stopped and volumes deleted even when the
+regression test fails; without it, a failed test leaves Docker
+containers running on the CI runner, consuming memory and eventually
+causing port conflicts on subsequent runs.
+The \code{KUBECONFIG\_DATA} secret is base64-encoded and decoded inline
+rather than written to a persistent file; the decoded file is written
+to \code{/tmp/kubeconfig} and referenced only via the \code{KUBECONFIG}
+environment variable scoped to the single \code{kubectl} step, so the
+raw cluster credentials are never accessible to subsequent steps in the
+same job.
