@@ -1,8 +1,995 @@
-%% ============================================================
-%%  Chapter 17 --- A2A: Agent-to-Agent Protocol
-%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
-%% ============================================================
 
-\chapterquote{An agent that cannot delegate cannot scale.}{anon}
+\chapterquote{Coupling is not a design smell. Invisible coupling is.}{anon}
 
-% TODO: Chapter 17 content
+The production failure this chapter prevents appears the moment one agent
+must call another and the two teams have no shared, versioned contract for
+identity, task state, or authentication scope. The naive approach is a
+private HTTP endpoint and an informal document describing the payloads,
+which works until the remote agent changes a field, adds a new pause state,
+or tightens authentication and the caller discovers the change only after
+shipping. The cost is not one failed request but a network of agents whose
+integration surface grows faster than the number of agents themselves.
+
+The solution has four layers. The first is \emph{identity}: every agent
+publishes a machine-readable \code{AgentCard} describing its skills,
+transport, and security expectations. The second is \emph{lifecycle}:
+every delegated unit of work moves through one of nine canonical
+\code{TaskState} values, with each transition written to durable state
+before it is observed. The third is \emph{transport}: the official SDK
+standardises request dispatch and SSE streaming so the caller consumes a
+typed event stream rather than inventing its own wire protocol. The fourth
+is \emph{delegation}: the parent agent mints short-lived, scope-narrowed
+credentials for a single child call, preventing privilege escalation when
+work crosses process boundaries.
+
+The sections are ordered by dependency. Section~\ref{sec:a2a-lifecycle}
+defines the task state machine first because every subsequent section
+creates, observes, or routes on these states. Section~\ref{sec:a2a-agent-card}
+builds the public identity document next, because the caller cannot safely
+construct a client before it validates the remote agent's card.
+Section~\ref{sec:a2a-sdk} introduces the official SDK on both the server
+and caller sides, because the remaining sections assume the transport layer
+is already solved. Section~\ref{sec:a2a-delegation} narrows delegated
+authority with short-lived JWTs, and Section~\ref{sec:a2a-errors} maps
+subagent failures to retry-or-escalate decisions while preserving partial
+artifacts. Section~\ref{sec:a2a-integration} assembles the complete system
+and hands the identity problem outward to the decentralised discovery model
+of Chapter~18.
+
+This chapter introduces eight terms defined in Table~\ref{tab:ch17-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~17}
+\label{tab:ch17-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{TaskState} &
+  A \code{Literal} type alias of exactly nine lowercase string values:
+  \code{"submitted"}, \code{"working"}, \code{"input-required"},
+  \code{"completed"}, \code{"canceled"}, \code{"failed"},
+  \code{"rejected"}, \code{"auth-required"}, and \code{"unknown"}. \\
+\code{TaskStatus} &
+  A wrapper object containing \code{state: TaskState}, an optional
+  \code{message: Message}, and an optional \code{timestamp: str}. \\
+\code{AgentCard} &
+  The well-known JSON document served from
+  \code{/.well-known/agent.json} that declares an agent's identity,
+  capabilities, skills, and security requirements. \\
+\code{AgentSkill} &
+  A single named capability within an \code{AgentCard}; it is the unit
+  of discovery and the granularity at which delegation tokens scope
+  access. \\
+Pause state &
+  A non-terminal state that suspends execution pending caller action;
+  in A2A these are \code{"input-required"} and
+  \code{"auth-required"}. \\
+\code{A2ATaskEvent} &
+  A Pydantic model used in this chapter to validate every lifecycle
+  transition before it is sent to Langfuse. \\
+\code{TaskHandler} &
+  The server-side SDK abstraction whose \code{on\_message()} method
+  translates an incoming A2A request into \code{TaskStatusUpdateEvent}
+  and \code{TaskArtifactUpdateEvent} objects. \\
+Delegation token &
+  A short-lived RS256 JWT minted by a parent agent and scoped to one
+  or more child \code{AgentSkill.id} values. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+chapter17/
+  a2a_lifecycle.py          # §17.1 — lifecycle + Langfuse events
+  agent_card.py             # §17.2 — AgentCard factory + routes
+  a2a_server_base.py        # §17.3 — SDK server + client streaming
+  delegation_tokens.py      # §17.4 — scoped JWT delegation
+  error_propagation.py      # §17.5 — retry vs ESCALATE
+  orchestrator.py           # §17.6 — parent LangGraph orchestrator
+  subagent_summarizer.py    # §17.6 — summarizer subagent
+  subagent_translator.py    # §17.6 — translator subagent
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{A Task Has a Finite Number of Valid States}
+\label{sec:a2a-lifecycle}
+%% ------------------------------------------------------------
+
+The design problem is state drift: if two agents use different internal
+labels for the same phase of work, the caller cannot reliably decide
+whether to wait, retry, or escalate. The naive approach is a free-form
+\code{status} string or a local \code{Enum} whose members are convenient
+for one codebase but meaningless to every other one. The governing
+principle is that the lifecycle vocabulary is shared protocol, not local
+implementation detail: \code{TaskState} is an exhaustive set of nine
+lowercase string literals, and every transition is an atomic
+store-then-observe write.
+
+The nine states split naturally into three families. \code{"submitted"}
+and \code{"working"} indicate forward progress. \code{"input-required"}
+and \code{"auth-required"} are pause states: they suspend execution while
+keeping the task open, because the correct next action belongs to the
+caller rather than the callee. \code{"completed"}, \code{"canceled"},
+\code{"failed"}, \code{"rejected"}, and \code{"unknown"} are terminal
+states; once a task reaches one of them, a second transition call must be
+a no-op. This is also why \code{Task.contextId} matters alongside
+\code{Task.id}: the \code{id} identifies one task record, while the
+\code{contextId} ties together the caller's follow-up messages when a task
+enters a pause state and later resumes.
+
+Observability follows the state machine rather than defining it. The store
+is written first, then a validated \code{A2ATaskEvent} is emitted to
+Langfuse. Reversing that order would let an observability failure corrupt
+the system of record: if the event is emitted first and the store write
+fails second, the trace claims work happened that the store cannot prove.
+Chapter~23~\S23.1 introduces Langfuse spans as a higher-level tracing
+mechanism; here the event is deliberately lower level because transitions
+must remain valid even when the rest of the trace pipeline is degraded.
+
+\begin{warningbox}
+Terminal writes must be idempotent. Without a guard that checks the
+current state before writing, a slow \code{"working"} update can arrive
+after a fast \code{"completed"} update and silently resurrect a task that
+should already be closed.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Task lifecycle: atomic transition with validated event emission},
+  label={lst:a2a-lifecycle}]
+# chapter17/a2a_lifecycle.py
+from datetime import datetime, timezone
+from typing import Any, Protocol
+from pydantic import BaseModel, ConfigDict
+from a2a.types import Task, TaskState, TaskStatus
+
+TERMINAL: frozenset[TaskState] = frozenset({
+    "completed", "canceled", "failed", "rejected", "unknown",
+})
+
+class TaskStore(Protocol):
+    async def get_task(self, task_id: str) -> Task: ...
+    async def save_task(self, task: Task) -> None: ...
+
+class A2ATaskEvent(BaseModel):
+    model_config = ConfigDict(use_enum_values=False)
+    task_id:    str
+    context_id: str
+    agent_id:   str
+    from_state: TaskState | None
+    to_state:   TaskState
+    timestamp:  datetime
+    metadata:   dict[str, Any] = {}
+
+def emit_transition(lf_trace, event: A2ATaskEvent) -> None:
+    payload = event.model_dump(mode="json")
+    lf_trace.event(name=f"task.{event.to_state}", input=payload)
+
+async def transition(
+    store: TaskStore,
+    task_id: str,
+    to_state: TaskState,
+    lf_trace,
+    agent_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> Task:
+    task = await store.get_task(task_id)
+    if task.status.state in TERMINAL:
+        return task
+    from_state = task.status.state
+    task.status = TaskStatus(state=to_state)
+    await store.save_task(task)
+    emit_transition(lf_trace, A2ATaskEvent(
+        task_id=task.id,
+        context_id=task.contextId,
+        agent_id=agent_id,
+        from_state=from_state,
+        to_state=to_state,
+        timestamp=datetime.now(timezone.utc),
+        metadata=metadata or {},
+    ))
+    return task
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:a2a-lifecycle} deserve explanation.
+\code{TaskState} is used directly as a string literal type instead of
+being wrapped in a Python \code{Enum}; that keeps the wire format and the
+in-memory representation identical, which is exactly what a protocol type
+should do. The \code{TaskStore} is expressed as a \code{Protocol} rather
+than a concrete class because both \code{InMemoryTaskStore} for
+development and a persistent store from Chapter~22~\S22.3 can satisfy the
+same contract without sharing an implementation. The write happens before
+\code{emit\_transition()}; this is the chapter's core invariant, because
+a failed Langfuse event must never roll back the task's actual state.
+
+Pause states need one additional convention: they must carry a structured
+prompt in \code{TaskStatus.message} so the caller knows what information is
+missing. The next section addresses where the caller discovers that such a
+pause is even possible, and which skills on the remote agent can trigger
+it.
+
+
+%% ------------------------------------------------------------
+\section{An Agent's Public Identity Is a Contract, Not Documentation}
+\label{sec:a2a-agent-card}
+%% ------------------------------------------------------------
+
+The design problem is discovery without validation: a caller that learns
+about a remote agent from prose documentation has no machine-checkable
+proof that the document is current, complete, or even written for the same
+version of the service. The naive approach is to hard-code the remote
+agent's URL and payload shape in the caller, which works exactly until the
+remote team changes either one. The governing principle is that identity
+must be served as a typed contract: \code{AgentCard} is the single public
+document a caller trusts before it sends its first task.
+
+The well-known path matters as much as the document shape.
+\code{/.well-known/agent.json} is intentionally unauthenticated: the
+caller must be able to fetch the card before it knows what security scheme
+the task endpoint expects. This is not a convenience exception; it is the
+security boundary that prevents a bootstrap deadlock. The task endpoint
+itself remains protected, and the card advertises that protection through
+\code{securitySchemes} and \code{security}, which follow the OpenAPI
+Security Scheme Object pattern rather than the older
+\code{authentication: dict} style that no longer matches the spec.
+
+\code{defaultInputModes} and \code{defaultOutputModes} are required, even
+if every skill on the agent also sets its own mode overrides. They define
+the agent-level defaults that a generic client can assume before it reads
+individual skills. \code{AgentSkill.id} must be unique within one agent,
+because the delegation token in Section~\ref{sec:a2a-delegation} scopes
+authority to skill IDs rather than to route names. \code{AgentSkill.tags}
+is also required; Chapter~18~\S18.4 uses these tags as discovery facets
+when a registry needs to find a suitable remote agent by capability rather
+than by hard-coded URL.
+
+\begin{warningbox}
+Do not protect \code{/.well-known/agent.json} with the same Bearer-token
+dependency as \code{/a2a}. Doing so turns the card into a secret rather
+than an identity document and makes generic client resolution impossible.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Spec-compliant \texttt{AgentCard} factory and route split},
+  label={lst:a2a-agent-card}]
+# chapter17/agent_card.py
+from a2a.types import (
+    AgentCard, AgentCapabilities, AgentSkill, SecurityScheme,
+)
+from fastapi import APIRouter, Depends
+from pydantic import ConfigDict
+
+router = APIRouter()
+
+summarize_skill = AgentSkill(
+    id="summarize-text-v1",
+    name="Text Summarizer",
+    description="Summarise text to a target length.",
+    tags=["nlp", "summarization"],
+    inputModes=["text/plain"],
+    outputModes=["text/plain"],
+)
+
+def build_summarizer_card(base_url: str) -> AgentCard:
+    return AgentCard(
+        name="Summarizer Agent",
+        description="Condenses documents for downstream processing.",
+        url=f"{base_url}/a2a",
+        version="1.0.0",
+        capabilities=AgentCapabilities(
+            streaming=True,
+            pushNotifications=False,
+        ),
+        securitySchemes={
+            "bearerAuth": SecurityScheme(
+                type="http", scheme="bearer"
+            )
+        },
+        security=[{"bearerAuth": []}],
+        defaultInputModes=["text/plain", "application/json"],
+        defaultOutputModes=["text/plain"],
+        skills=[summarize_skill],
+    )
+
+@router.get("/.well-known/agent.json", response_model=AgentCard)
+async def get_agent_card() -> AgentCard:
+    return build_summarizer_card("http://localhost:8001")
+
+@router.post("/a2a")
+async def a2a_endpoint(token: str = Depends(verify_bearer)):
+    ...
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:a2a-agent-card} deserve explanation.
+\code{securitySchemes} and \code{security} are included even in this small
+example because leaving them out would hide the core architectural point of
+the route split: the card is public, but it still describes a protected
+task endpoint. The skill ID uses kebab-case with a version suffix
+(\code{"summarize-text-v1"}) rather than a Pythonic identifier such as
+\code{"summarize\_text"} because this value is not code --- it is public
+protocol, and versioned protocol names should remain stable even if the
+server-side function name changes.
+
+A valid card tells the caller what the remote agent claims to support. The
+next problem is turning that claim into a real network session without
+reimplementing the transport or the SSE protocol by hand.
+
+
+%% ------------------------------------------------------------
+\section{The SDK Owns the Wire; Your Code Owns the Logic}
+\label{sec:a2a-sdk}
+%% ------------------------------------------------------------
+
+The design problem is protocol reimplementation: if every team builds its
+own \code{httpx} wrapper around A2A, the organisation ends up with several
+slightly different interpretations of the same protocol and no reliable way
+to reason about failure. The naive approach is to write the transport
+layer directly because it appears to save a dependency, but in practice it
+turns your application code into a part-time SDK maintainer. The governing
+principle is separation of concerns: \code{A2AClient} and
+\code{A2AStarletteApplication} own the wire protocol, and the application
+owns only task logic.
+
+The caller side starts with \code{A2ACardResolver}. This matters because
+it validates the remote \code{AgentCard} before the client is even
+constructed, which means the caller can fail fast if the card is missing
+required fields or claims to support streaming when it does not. Skipping
+resolution and building a client from a URL string discards the only
+pre-flight validation step in the protocol.
+
+The server side centers on \code{TaskHandler.on\_message()}. That method
+does not write raw SSE frames or manage sockets; it places typed events
+into an \code{EventQueue}, and the SDK serialises them to the client.
+There are only two event families the caller must handle in the streaming
+loop: \code{TaskStatusUpdateEvent} for lifecycle changes and
+\code{TaskArtifactUpdateEvent} for output chunks. Treating artifacts as
+status or status as output is not a cosmetic mistake; it loses either
+progress semantics or data.
+
+\begin{lstlisting}[language=Python,
+  caption={Server-side \texttt{TaskHandler} with typed status and artifact events},
+  label={lst:a2a-sdk-server}]
+# chapter17/a2a_server_base.py
+from uuid import uuid4
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.events import EventQueue
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore, TaskHandler
+from a2a.types import (
+    Artifact, TaskArtifactUpdateEvent,
+    TaskStatus, TaskStatusUpdateEvent, TextPart,
+)
+from langchain_litellm import ChatLiteLLM
+
+llm = ChatLiteLLM(model="anthropic/claude-sonnet-4-8")
+
+class SummarizerHandler(TaskHandler):
+    async def on_message(self, context, event_queue: EventQueue) -> None:
+        await event_queue.put(TaskStatusUpdateEvent(
+            status=TaskStatus(state="submitted"), final=False,
+        ))
+        await event_queue.put(TaskStatusUpdateEvent(
+            status=TaskStatus(state="working"), final=False,
+        ))
+        text = context.message.parts[0].text
+        summary = llm.invoke(
+            f"Summarise in <= 50 words:\n{text}"
+        ).content
+        await event_queue.put(TaskArtifactUpdateEvent(
+            artifact=Artifact(
+                artifactId=uuid4().hex,
+                name="summary",
+                parts=[TextPart(kind="text", text=summary)],
+            )
+        ))
+        await event_queue.put(TaskStatusUpdateEvent(
+            status=TaskStatus(state="completed"), final=True,
+        ))
+
+app = A2AStarletteApplication(
+    agent_card=build_summarizer_card("http://localhost:8001"),
+    http_handler=DefaultRequestHandler(
+        agent_executor=SummarizerHandler(),
+        task_store=InMemoryTaskStore(),
+    ),
+).build()
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Client-side streaming loop with typed event dispatch},
+  label={lst:a2a-sdk-client}]
+# chapter17/a2a_server_base.py  (client section)
+from uuid import uuid4
+import httpx
+from a2a.client import A2AClient, A2ACardResolver
+from a2a.types import (
+    Message, Role, SendMessageRequest, TextPart,
+    TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
+)
+
+async def stream_summary(text: str) -> str:
+    async with httpx.AsyncClient() as http:
+        resolver = A2ACardResolver(http)
+        card = await resolver.get_agent_card(
+            "http://localhost:8001/.well-known/agent.json"
+        )
+        client = A2AClient(http, card)
+        request = SendMessageRequest(
+            message=Message(
+                messageId=uuid4().hex,
+                kind="message",
+                role=Role.user,
+                parts=[TextPart(kind="text", text=text)],
+            )
+        )
+        chunks: list[str] = []
+        async for event in client.send_message_streaming(request):
+            match event:
+                case TaskArtifactUpdateEvent():
+                    chunks.extend(
+                        part.text for part in event.artifact.parts
+                    )
+                case TaskStatusUpdateEvent():
+                    if event.status.state == "failed":
+                        raise RuntimeError("remote task failed")
+        return "".join(chunks)
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:a2a-sdk-server}
+and~\ref{lst:a2a-sdk-client} deserve explanation.
+The server emits \code{final=True} only on the terminal status event
+because stream closure is a lifecycle fact, not an artifact fact; closing
+the stream on an artifact would make partial-output workflows impossible.
+The client uses pattern matching on event types rather than trying to
+infer semantics from fields, which keeps the dispatch logic aligned with
+the protocol's type system instead of with fragile string inspection.
+\code{A2ACardResolver} and \code{A2AClient} share the same
+\code{httpx.AsyncClient}, which means card resolution and task streaming
+reuse the same connection pool rather than opening two independent network
+stacks to the same host.
+
+\begin{notebox}
+\code{A2AClient.send\_message()} is appropriate when the caller wants only
+the final task result. \code{send\_message\_streaming()} is required when
+the caller must surface progress, pause on \code{"input-required"}, or
+retain partial artifacts from a task that eventually fails.
+\end{notebox}
+
+The SDK solves transport and typing, but it does not answer a more subtle
+question: how a parent agent proves it may delegate a specific skill to a
+specific child without forwarding all of its own authority.
+
+
+%% ------------------------------------------------------------
+\section{Delegated Authority Must Be Narrower Than the Source}
+\label{sec:a2a-delegation}
+%% ------------------------------------------------------------
+
+The design problem is privilege escalation by convenience: if the parent
+agent simply forwards its own Bearer token to the child, the child gains
+every right the parent possesses for the full lifetime of that token. The
+naive approach is attractive because it requires no additional crypto or
+token plumbing, but it turns delegation into impersonation. The governing
+principle is least authority: every child call receives a short-lived token
+whose claims are bound to one audience, one parent task, and one or more
+explicit \code{AgentSkill.id} values.
+
+RS256 is a good fit here because signature verification and signing
+authority are separated. The parent keeps the RSA private key; the child
+receives only the signed token and verifies it against the parent's public
+JWKS. This prevents key material from crossing service boundaries and
+allows rotation via the JWT \code{kid} header. The \code{scope} claim is a
+space-separated list of skill IDs, not route names or arbitrary labels,
+because the agent card already defines skill IDs as the public capability
+surface. A five-minute TTL is short enough to make replay expensive and
+long enough to survive a normal subagent call.
+
+Enforcement belongs at the HTTP boundary, before any task state is created.
+A FastAPI dependency that validates the token and checks
+\code{required\_scope in claims.scope.split()} can reject unauthorised
+requests with \code{403} before the request ever reaches
+\code{TaskHandler.on\_message()}. That avoids creating ghost tasks whose
+only lifecycle event would have been a rejected credential.
+
+\begin{warningbox}
+Do not validate delegation scope inside \code{TaskHandler.on\_message()}.
+By the time that method runs, the request has already crossed the
+application boundary and may already have caused task allocation or metric
+increments that should never exist for an unauthorised caller.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Scoped delegation token: mint, validate, inject},
+  label={lst:a2a-delegation}]
+# chapter17/delegation_tokens.py
+from typing import Generator
+import httpx
+from jose import JWTError, jwt
+from jose.constants import ALGORITHMS
+from pydantic import BaseModel
+
+class DelegationTokenClaims(BaseModel):
+    sub:            str
+    aud:            str
+    scope:          str
+    parent_task_id: str
+    exp:            int
+    iat:            int
+    iss:            str
+
+def mint_delegation_token(
+    claims: DelegationTokenClaims,
+    private_key: str,
+    kid: str,
+) -> str:
+    return jwt.encode(
+        claims.model_dump(),
+        private_key,
+        algorithm=ALGORITHMS.RS256,
+        headers={"kid": kid},
+    )
+
+def validate_delegation_token(
+    token: str,
+    jwks_url: str,
+    expected_aud: str,
+    required_scope: str,
+) -> DelegationTokenClaims:
+    header = jwt.get_unverified_header(token)
+    jwks = httpx.get(jwks_url, timeout=5).json()
+    key = next(k for k in jwks["keys"] if k["kid"] == header["kid"])
+    claims = jwt.decode(
+        token, key, algorithms=[ALGORITHMS.RS256],
+        audience=expected_aud,
+    )
+    if required_scope not in claims["scope"].split():
+        raise JWTError("delegation scope missing")
+    return DelegationTokenClaims(**claims)
+
+class ScopedBearerAuth(httpx.Auth):
+    def __init__(self, token: str) -> None:
+        self._token = token
+    def auth_flow(
+        self, request: httpx.Request,
+    ) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers["Authorization"] = f"Bearer {self._token}"
+        yield request
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:a2a-delegation} deserve explanation.
+The \code{aud} claim is the child agent's public URL rather than its name,
+because audience is a property of where the token may be presented, not of
+who minted it. \code{validate\_delegation\_token()} checks scope after
+signature verification and audience validation, which preserves the normal
+JWT trust chain: claim-level authorisation only matters once the token has
+already been proven authentic and intended for this service.
+\code{ScopedBearerAuth} uses \code{httpx.Auth} instead of manual headers so
+every request emitted by the client --- including internal retries or
+redirects handled by \code{httpx} --- carries the same credential path.
+
+Delegated identity narrows authority, but it does not decide what to do
+when the remote side fails. The next section classifies those failures and
+connects them to LangGraph routing.
+
+
+%% ------------------------------------------------------------
+\section{Not All Failures Deserve a Retry}
+\label{sec:a2a-errors}
+%% ------------------------------------------------------------
+
+The design problem is undifferentiated error handling: a caller that
+treats every subagent failure as retryable converts permanent request bugs
+into delayed permanent request bugs. The naive approach is a blanket retry
+decorator around the A2A call, which makes transient failures look robust
+while obscuring the difference between bad input and bad infrastructure.
+The governing principle is failure typing before recovery: the caller must
+inspect the SDK error, classify it as retryable or terminal, preserve any
+partial artifacts, and route explicitly to retry or escalation.
+
+\code{A2AError} is the SDK base class, while \code{ServerError} carries a
+JSON-RPC \code{code} and \code{message}. The mapping is operational rather
+than theoretical. \code{-32600}, \code{-32601}, and \code{-32602} are
+request-shape errors and therefore non-retryable. \code{-32603} and
+\code{-32000} represent internal or server-side failure and are often
+transient, so they can justify bounded retry. Partial artifacts from a
+failed task are still valuable; they may contain a summary generated before
+the translation step failed, or the first half of a streamed answer that a
+human can still inspect. Losing them makes escalation harder, not cleaner.
+
+The routing contract in this section relies on \code{next} as a state
+field. On success, a node writes the name of the next business node. On
+failure, it writes the name of the node that failed, so the error handler
+knows which operation would be retried if the error proves transient. This
+keeps retry count inside graph state rather than in a decorator's hidden
+closure, which is why the section uses \code{AsyncRetrying} conceptually
+but records retry budget explicitly in the graph state.
+
+\begin{lstlisting}[language=Python,
+  caption={Error classification with preserved artifacts and explicit routing},
+  label={lst:a2a-errors}]
+# chapter17/error_propagation.py
+from typing import Any, TypedDict
+from a2a.client import A2AClient
+from a2a.errors import A2AError, ServerError
+from a2a.types import (
+    SendMessageRequest,
+    TaskArtifactUpdateEvent,
+    TaskStatusUpdateEvent,
+)
+from langgraph.graph import END
+from langgraph.types import Command
+
+RETRYABLE_CODES: frozenset[int] = frozenset({-32603, -32000})
+MAX_RETRIES: int = 3
+
+class OrchestratorState(TypedDict):
+    input_text:        str
+    summary:           str
+    translation:       str
+    last_error:        A2AError | None
+    retry_count:       int
+    partial_artifacts: list[dict[str, Any]]
+    next:              str
+
+async def safe_delegate(
+    client: A2AClient,
+    request: SendMessageRequest,
+    state: OrchestratorState,
+) -> OrchestratorState:
+    artifacts: list[dict[str, Any]] = []
+    try:
+        async for event in client.send_message_streaming(request):
+            match event:
+                case TaskArtifactUpdateEvent():
+                    artifacts.append(event.artifact.model_dump())
+                case TaskStatusUpdateEvent():
+                    if event.status.state == "failed":
+                        raise ServerError(-32603, "subagent failed")
+    except A2AError as exc:
+        return {**state, "last_error": exc,
+                "partial_artifacts": artifacts}
+    return {**state, "last_error": None,
+            "partial_artifacts": artifacts}
+
+def handle_subagent_error(state: OrchestratorState) -> OrchestratorState:
+    err = state["last_error"]
+    retryable = (
+        isinstance(err, ServerError)
+        and err.code in RETRYABLE_CODES
+        and state["retry_count"] < MAX_RETRIES
+    )
+    return {
+        **state,
+        "retry_count": state["retry_count"] + (1 if retryable else 0),
+        "next": state["next"] if retryable else "ESCALATE",
+    }
+
+def escalate_node(state: OrchestratorState) -> Command:
+    return Command(goto=END)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:a2a-errors} deserve explanation.
+\code{safe\_delegate()} collects artifacts on the success path and the
+failure path alike; this keeps the node interface simple, and the caller
+can decide later whether those artifacts are complete output or merely
+partial salvage. \code{handle\_subagent\_error()} does not itself choose a
+business node such as \code{"summarize"} or \code{"translate"}; it trusts
+the failing node to have already written its own identity into
+\code{state["next"]}, which preserves locality of responsibility. The
+escalation path returns \code{Command(goto=END)} instead of raising an
+exception because escalation is a valid terminal outcome, not an unhandled
+error in the graph runtime.
+
+\begin{notebox}
+Chapter~1~\S1.5 introduced \code{ReflectNode} as the place where an agent
+concludes it should stop autonomous action and hand control to a more
+authoritative decision maker. The \code{ESCALATE} branch here is the
+protocol-level equivalent: the graph stops cleanly, but it preserves the
+error object and artifacts needed for a human or supervisor to continue.
+\end{notebox}
+
+The individual pieces are now correct in isolation. The remaining problem
+is composition: how to wire two subagents and one parent graph together
+without collapsing the boundaries the chapter has spent five sections
+establishing.
+
+
+%% ------------------------------------------------------------
+\section{Integration Must Preserve Boundaries}
+\label{sec:a2a-integration}
+%% ------------------------------------------------------------
+
+The design problem is boundary erosion during composition: a system whose
+parts are individually well designed can still fail once integration logic
+starts copying credentials, parsing wire events in the wrong layer, or
+smearing business state across transport code. The naive approach is to
+build the capstone as a monolithic script and then pull pieces apart
+later, which guarantees the first working version has the weakest
+architecture. The governing principle is that the capstone should make
+boundaries more visible, not less: each subagent stays a standalone A2A
+server, and the parent orchestrator remains a LangGraph graph that talks
+only through the SDK.
+
+The translator subagent demonstrates why pause states matter. If the
+source language is missing, translation is not failed work; it is
+incomplete work whose next action belongs to the caller. The correct
+behaviour is therefore \code{"input-required"} with a structured
+\code{DataPart} prompt, not \code{"failed"}. In a real system this would
+often route to a human approval or clarification step; Chapter~21~\S21.2
+introduces \code{interrupt()} as the LangGraph mechanism for inserting
+that pause before autonomous work continues.
+
+\begin{lstlisting}[language=Python,
+  caption={Subagent A: summarizer server},
+  label={lst:capstone-summarizer}]
+# chapter17/subagent_summarizer.py
+import uvicorn
+from uuid import uuid4
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.events import EventQueue
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore, TaskHandler
+from a2a.types import (
+    AgentCard, AgentCapabilities, AgentSkill,
+    Artifact, TaskArtifactUpdateEvent,
+    TaskStatus, TaskStatusUpdateEvent, TextPart,
+)
+from langchain_litellm import ChatLiteLLM
+
+llm = ChatLiteLLM(model="anthropic/claude-sonnet-4-8")
+
+class SummarizerHandler(TaskHandler):
+    async def on_message(self, ctx, q: EventQueue) -> None:
+        for state in ("submitted", "working"):
+            await q.put(TaskStatusUpdateEvent(
+                status=TaskStatus(state=state), final=False))
+        text = ctx.message.parts[0].text
+        summary = llm.invoke(f"Summarise <= 50 words:\n{text}").content
+        await q.put(TaskArtifactUpdateEvent(artifact=Artifact(
+            artifactId=uuid4().hex,
+            name="summary",
+            parts=[TextPart(kind="text", text=summary)],
+        )))
+        await q.put(TaskStatusUpdateEvent(
+            status=TaskStatus(state="completed"), final=True))
+
+card = AgentCard(
+    name="Summarizer Agent",
+    description="Summarises raw text.",
+    url="http://localhost:8001/a2a",
+    version="1.0.0",
+    capabilities=AgentCapabilities(streaming=True),
+    defaultInputModes=["text/plain"],
+    defaultOutputModes=["text/plain"],
+    skills=[AgentSkill(id="summarize-text-v1",
+        name="Text Summarizer",
+        description="Summarise text to <= 50 words.",
+        tags=["nlp", "summarization"])],
+)
+app = A2AStarletteApplication(
+    agent_card=card,
+    http_handler=DefaultRequestHandler(
+        agent_executor=SummarizerHandler(),
+        task_store=InMemoryTaskStore(),
+    ),
+).build()
+
+if __name__ == "__main__":
+    uvicorn.run("subagent_summarizer:app", host="0.0.0.0", port=8001)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Subagent B: translator with \texttt{input-required} pause},
+  label={lst:capstone-translator}]
+# chapter17/subagent_translator.py
+import uvicorn
+from uuid import uuid4
+from a2a.server.apps import A2AStarletteApplication
+from a2a.server.events import EventQueue
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.tasks import InMemoryTaskStore, TaskHandler
+from a2a.types import (
+    AgentCard, AgentCapabilities, AgentSkill,
+    Artifact, DataPart, Message, Role,
+    TaskArtifactUpdateEvent, TaskStatus,
+    TaskStatusUpdateEvent, TextPart,
+)
+from langchain_litellm import ChatLiteLLM
+
+llm = ChatLiteLLM(model="anthropic/claude-sonnet-4-8")
+
+class TranslatorHandler(TaskHandler):
+    async def on_message(self, ctx, q: EventQueue) -> None:
+        src = next((p.data.get("source_language")
+                    for p in ctx.message.parts if hasattr(p, "data")), None)
+        if not src:
+            await q.put(TaskStatusUpdateEvent(
+                status=TaskStatus(
+                    state="input-required",
+                    message=Message(
+                        messageId=uuid4().hex,
+                        kind="message",
+                        role=Role.agent,
+                        parts=[DataPart(kind="data",
+                            data={"required_field": "source_language"})],
+                    ),
+                ),
+                final=False,
+            ))
+            return
+        await q.put(TaskStatusUpdateEvent(
+            status=TaskStatus(state="working"), final=False))
+        text = next(p.text for p in ctx.message.parts if hasattr(p, "text"))
+        out = llm.invoke(f"Translate from {src} to English:\n{text}").content
+        await q.put(TaskArtifactUpdateEvent(artifact=Artifact(
+            artifactId=uuid4().hex,
+            name="translation",
+            parts=[TextPart(kind="text", text=out)],
+        )))
+        await q.put(TaskStatusUpdateEvent(
+            status=TaskStatus(state="completed"), final=True))
+\end{lstlisting}
+
+Two decisions across Listings~\ref{lst:capstone-summarizer}
+and~\ref{lst:capstone-translator} deserve explanation.
+The translator emits \code{"input-required"} instead of guessing the source
+language because guessing is a model convenience, not a protocol right;
+the whole point of the pause state is to preserve correctness when caller
+input is missing. Both subagents keep their \code{AgentCard} definition
+inside the server file rather than centralising cards in the orchestrator,
+because the published identity belongs to the service that owns the skill,
+not to the caller that consumes it.
+
+\begin{lstlisting}[language=Python,
+  caption={Parent orchestrator: request builders and delegation nodes},
+  label={lst:capstone-orchestrator-a}]
+# chapter17/orchestrator.py  (part 1)
+from uuid import uuid4
+import os, time, httpx
+from typing import Any
+from a2a.client import A2AClient, A2ACardResolver
+from a2a.types import (
+    DataPart, Message, Role, SendMessageRequest, TextPart,
+)
+from langfuse import Langfuse
+from chapter17.delegation_tokens import (
+    DelegationTokenClaims, ScopedBearerAuth, mint_delegation_token,
+)
+from chapter17.error_propagation import OrchestratorState, safe_delegate
+
+PRIVATE_KEY = os.environ["PARENT_RSA_PRIVATE_KEY"]
+KID = os.environ["PARENT_KEY_ID"]
+lf = Langfuse()
+
+def build_request(text: str, extra: dict[str, Any] | None = None):
+    parts = [TextPart(kind="text", text=text)]
+    if extra:
+        parts.append(DataPart(kind="data", data=extra))
+    return SendMessageRequest(message=Message(
+        messageId=uuid4().hex,
+        kind="message",
+        role=Role.user,
+        parts=parts,
+    ))
+
+def artifact_text(artifacts: list[dict[str, Any]]) -> str:
+    return "".join(
+        part["text"]
+        for art in artifacts
+        for part in art.get("parts", [])
+        if part.get("kind") == "text"
+    )
+
+async def summarize_node(state: OrchestratorState) -> OrchestratorState:
+    now = int(time.time())
+    token = mint_delegation_token(DelegationTokenClaims(
+        sub="Summarizer Agent",
+        aud="http://localhost:8001/a2a",
+        scope="summarize-text-v1",
+        parent_task_id=uuid4().hex,
+        exp=now + 300, iat=now, iss="http://orchestrator:8000",
+    ), PRIVATE_KEY, KID)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Parent orchestrator: delegation nodes and graph wiring},
+  label={lst:capstone-orchestrator-b}]
+# chapter17/orchestrator.py  (part 2)
+    async with httpx.AsyncClient(auth=ScopedBearerAuth(token)) as http:
+        card = await A2ACardResolver(http).get_agent_card(
+            "http://localhost:8001/.well-known/agent.json")
+        client = A2AClient(http, card)
+        span = lf.span(name="summarize_delegate")
+        updated = await safe_delegate(
+            client, build_request(state["input_text"]),
+            {**state, "next": "summarize"},
+        )
+        span.end(output={"artifacts": len(updated["partial_artifacts"])})
+    if updated["last_error"] is not None:
+        return updated
+    return {**updated, "summary": artifact_text(
+        updated["partial_artifacts"]), "partial_artifacts": [],
+        "next": "translate"}
+
+async def translate_node(state: OrchestratorState) -> OrchestratorState:
+    now = int(time.time())
+    token = mint_delegation_token(DelegationTokenClaims(
+        sub="Translator Agent",
+        aud="http://localhost:8002/a2a",
+        scope="translate-text-v1",
+        parent_task_id=uuid4().hex,
+        exp=now + 300, iat=now, iss="http://orchestrator:8000",
+    ), PRIVATE_KEY, KID)
+    async with httpx.AsyncClient(auth=ScopedBearerAuth(token)) as http:
+        card = await A2ACardResolver(http).get_agent_card(
+            "http://localhost:8002/.well-known/agent.json")
+        client = A2AClient(http, card)
+        updated = await safe_delegate(
+            client, build_request(state["summary"],
+            {"source_language": "French"}),
+            {**state, "next": "translate"},
+        )
+    if updated["last_error"] is not None:
+        return updated
+    return {**updated, "translation": artifact_text(
+        updated["partial_artifacts"]), "partial_artifacts": [],
+        "next": "__end__"}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Graph routing for success, retry, and escalation},
+  label={lst:capstone-orchestrator-c}]
+# chapter17/orchestrator.py  (part 3)
+from langgraph.graph import END, START, StateGraph
+from chapter17.error_propagation import (
+    handle_subagent_error, escalate_node,
+)
+
+def route_after_summarize(state: OrchestratorState) -> str:
+    return "handle_error" if state["last_error"] else "translate"
+
+def route_after_translate(state: OrchestratorState) -> str:
+    return "handle_error" if state["last_error"] else "__end__"
+
+builder = StateGraph(OrchestratorState)
+builder.add_node("summarize", summarize_node)
+builder.add_node("translate", translate_node)
+builder.add_node("handle_error", handle_subagent_error)
+builder.add_node("escalate", escalate_node)
+builder.add_edge(START, "summarize")
+builder.add_conditional_edges("summarize", route_after_summarize,
+    {"translate": "translate", "handle_error": "handle_error"})
+builder.add_conditional_edges("translate", route_after_translate,
+    {"__end__": END, "handle_error": "handle_error"})
+builder.add_conditional_edges("handle_error", lambda s: s["next"], {
+    "summarize": "summarize",
+    "translate": "translate",
+    "ESCALATE": "escalate",
+})
+graph = builder.compile()
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:capstone-orchestrator-a},
+\ref{lst:capstone-orchestrator-b}, and
+\ref{lst:capstone-orchestrator-c} deserve explanation.
+The parent mints one token per subagent call rather than per process start,
+which binds delegated authority to a single task boundary and prevents
+token reuse across unrelated work. Each node writes its own identity into
+\code{state["next"]} before failure handling occurs, which lets the shared
+\code{handle\_subagent\_error()} function decide whether to retry the same
+node or route to \code{ESCALATE} without knowing which business operation
+failed. The graph uses conditional edges after both delegation nodes
+instead of a single global error node attached at the end, because failure
+classification is meaningful only while the failing node's context is still
+present in state.
+
+The three-file system in this section is intentionally small, but the
+boundaries are already the production boundaries: each subagent is its own
+A2A service, the parent remains a LangGraph orchestrator, and delegation
+tokens are minted at the moment authority crosses that line. Chapter~18
+takes the next step outward by replacing the known-URL assumption in this
+chapter with registry-backed, decentralised agent discovery and handshake.
