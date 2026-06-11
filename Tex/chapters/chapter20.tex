@@ -1,8 +1,824 @@
 %% ============================================================
-%%  Chapter 20 --- Parallel Execution & Fan-Out/Fan-In
+%%  Chapter 20 --- Parallel Execution and Fan-Out/Fan-In
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langgraph >= 0.2.0,
+%%                langchain-litellm >= 0.3.0,
+%%                pydantic >= 2.7.0,
+%%                langchain-core >= 0.3.0
 %% ============================================================
 
-\chapterquote{Speed without merge discipline is just concurrent failure.}{anon}
+\chapterquote{Serialisation is not safety. It is the refusal to admit that the work was independent all along.}{anon}
 
-% TODO: Chapter 20 content
+The production failure this chapter prevents is serial latency
+masquerading as a design choice. The supervisor pattern of Chapter~19
+activates one worker per routing cycle: the LLM decides which worker
+runs, that worker completes, control returns to the supervisor, and the
+cycle repeats. For a research task that requires five independent
+information sources, this means five sequential LLM-plus-retrieval round
+trips. At three seconds per round trip the minimum wall-clock cost is
+fifteen seconds, regardless of how fast each individual call is. The
+failure is not occasional---it is the guaranteed lower bound of every
+invocation. Deferring parallelism until ``performance becomes a problem''
+misunderstands the cost: the graph is structurally incapable of doing
+better because its topology serialises work that has no data dependency.
+
+The solution has five layers. The first is a \emph{reducer layer}: every
+field in graph state that will receive writes from parallel workers must
+declare an accumulation function through \code{Annotated}; the
+accumulation semantics determine correctness, and they must be chosen
+before any parallel code is written. The second is a \emph{fan-out layer}:
+a \code{decompose\_node} calls an LLM to split the query into at most
+five sub-queries and writes them to state; a pure routing function
+\code{fan\_out\_router} reads those sub-queries and returns a
+\code{list[Send]}, one per sub-query, which LangGraph dispatches as
+concurrent tasks. The third is a \emph{worker layer}: each dispatched
+\code{search\_worker} task runs independently, calling two retrieval
+backends concurrently with \code{asyncio.gather}; a \code{RetryPolicy}
+registered at node-definition time handles transient infrastructure
+failures at the LangGraph level without any code inside the worker. The
+fourth is a \emph{fan-in and aggregation layer}: LangGraph's Pregel
+scheduler waits for all parallel tasks to complete, then advances to
+\code{aggregate\_node}, which receives the fully merged
+\code{worker\_results} field and applies Reciprocal Rank Fusion across
+all workers' results. The fifth is a \emph{synthesis layer}: a separate
+LLM node distinct from the deterministic aggregation step produces the
+final answer, keeping the two functions independently cacheable.
+
+The sections are ordered by dependency.
+Section~\ref{sec:reducers-parallel} establishes reducer semantics first
+because every subsequent section produces or consumes a field whose
+correctness depends on the reducer choice.
+Section~\ref{sec:send-fanout} introduces \code{Send} and the
+decompose-then-route pattern next because the worker's input type cannot
+be specified before the fan-out contract is understood.
+Section~\ref{sec:partial-failure} adds the worker implementation and its
+two-level error containment after the worker's state type is established.
+Section~\ref{sec:map-reduce-topo} shows the complete map-reduce topology
+after all four node types exist.
+Section~\ref{sec:full-parallel} assembles the production graph without
+introducing new concepts.
+
+This chapter introduces seven terms defined in Table~\ref{tab:ch20-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~20}
+\label{tab:ch20-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{Send} &
+  \code{from langgraph.types import Send}; a two-field object
+  \code{Send(node,~arg)} where \code{node} is the name of the target
+  node and \code{arg} is the entire state dict that node will receive;
+  returned as a \code{list} from a conditional edge routing function
+  to spawn multiple concurrent node instances, each with its own
+  independent per-instance state. \\
+Fan-out router &
+  A pure synchronous function registered as the second argument to
+  \code{add\_conditional\_edges}; reads parent graph state and returns
+  \code{list[Send]}; never registered with \code{add\_node} and never
+  performs I/O. \\
+\code{WorkerInput} &
+  A \code{TypedDict} with fields \code{sub\_query:~str} and
+  \code{worker\_id:~int}; the type annotation for
+  \code{search\_worker}'s \code{state} argument; matches the plain
+  \code{dict} literal passed as \code{Send}'s \code{arg}. \\
+\code{operator.add} reducer &
+  \code{Annotated[list[T],~operator.add]} on a state field instructs
+  LangGraph to accumulate parallel worker outputs by list concatenation;
+  every completed worker's return list is appended to the accumulated
+  list, preserving all entries without deduplication. \\
+\code{RetryPolicy} &
+  \code{from langgraph.types import RetryPolicy}; a \code{NamedTuple}
+  passed as the \code{retry} keyword argument to \code{add\_node};
+  key fields: \code{max\_attempts} (default~3, counting the initial
+  attempt), \code{initial\_interval} (0.5~s), \code{backoff\_factor}
+  (2.0), \code{max\_interval} (128~s), \code{jitter} (True),
+  \code{retry\_on} (exception type, sequence, or callable). \\
+\code{CachePolicy} &
+  \code{from langgraph.types import CachePolicy}; a dataclass passed
+  as the \code{cache} keyword argument to \code{add\_node}; fields:
+  \code{key\_func} (defaults to pickle-hash of node input) and
+  \code{ttl} (seconds; \code{None} = never expires within the
+  process). \\
+Pregel fan-in &
+  LangGraph's Pregel-based scheduler accumulates reducer updates from
+  each completed \code{Send} task and advances the graph to the next
+  node only after \emph{all} tasks in the current batch have either
+  completed or been permanently failed following \code{RetryPolicy}
+  exhaustion. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+chapter20/
+  types.py        # §20.1 — SearchResult (all 5 fields incl. worker_id)
+  state.py        # §20.1 — WorkerInput, ResearchState,
+                  #          operator.add reducer, sub_queries field
+  fan_out.py      # §20.2 — decompose_node (async, LLM),
+                  #          fan_out_router (sync, pure routing),
+                  #          MAX_WORKERS, SubQueryList
+  worker.py       # §20.3 — search_worker with asyncio.gather +
+                  #          return_exceptions=True
+  backends.py     # §20.3 — qdrant_search, bm25_search stubs
+  aggregate.py    # §20.4 — aggregate_node (RRF + dedup),
+                  #          synthesise_node
+  graph.py        # §20.5 — build_research_graph(), run_research()
+  test_graph.py   # §20.5 — integration test with backend mocks
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{The Reducer Determines What Parallel Means for Each Field}
+\label{sec:reducers-parallel}
+%% ------------------------------------------------------------
+
+The design problem is correctness under concurrent writes to shared
+state. When LangGraph dispatches five \code{search\_worker} tasks in
+parallel, all five eventually return a partial state update whose key is
+\code{worker\_results}. Without a reducer, the graph applies updates as
+last-write-wins: whichever worker finishes last overwrites every other
+worker's output entirely. The naive workaround---giving each worker its
+own top-level field, \code{worker\_0\_results} through
+\code{worker\_4\_results}---bakes the worker count into the schema and
+forces every downstream node to enumerate all five fields by name,
+requiring a schema change whenever the count changes. The governing
+principle is that a field receiving parallel writes must declare an
+accumulation function that matches the semantics required by the
+downstream consumer.
+
+\code{Annotated[list[T],~operator.add]} is the LangGraph mechanism for
+list-accumulation semantics. The second element of the \code{Annotated}
+tuple is the reducer: a callable with signature \code{(left:~T,
+right:~T)~->~T} where \code{left} is the current accumulated value and
+\code{right} is the incoming partial update from one completed task.
+For lists, \code{operator.add} is Python's list concatenation
+(\code{left + right}): each completed worker appends its
+\code{list[SearchResult]} to the growing accumulated list. By the time
+Pregel fan-in fires, the field contains the concatenation of all workers'
+lists in task-completion order.
+
+\begin{warningbox}
+\code{operator.add} has different semantics for different types.
+On lists it concatenates; on numbers it sums. A field declared as
+\code{Annotated[float,~operator.add]} with two workers each returning
+\code{0.9} produces the accumulated value \code{1.8}. Use a plain
+(unannotated) field for scalars written by a single node, or define a
+custom reducer such as \code{max} for scalars where the highest
+value across workers is the correct merge result.
+\end{warningbox}
+
+The choice of \code{operator.add} over a score-max deduplication reducer
+is deliberate. Reciprocal Rank Fusion---the aggregation algorithm used in
+Section~\ref{sec:map-reduce-topo}---requires knowing each result's rank
+position within its originating worker's independent list.
+Score-max deduplication in the reducer destroys that information: two
+workers returning the same document at different rank positions would be
+collapsed into one entry before RRF can compare them. Deduplication must
+happen \emph{after} RRF in \code{aggregate\_node}, not before it in the
+reducer.
+
+\code{SearchResult} must carry a \code{worker\_id} field from the moment
+it is defined. This field is not observability metadata---it is the
+structural link that allows \code{aggregate\_node} to reconstruct each
+worker's independent ranked list from the flat concatenated
+\code{worker\_results} list before passing those lists to RRF.
+
+\begin{lstlisting}[language=Python,
+  caption={State schema: list-accumulation reducer and per-result
+           worker identifier},
+  label={lst:reducers}]
+# chapter20/types.py
+from pydantic import BaseModel
+
+class SearchResult(BaseModel):
+    doc_id:    str    # f"{source}::{sha256(content)[:8]}"
+    content:   str
+    score:     float  # backend-native score; intra-worker sort key
+    source:    str    # "qdrant" | "bm25"
+    worker_id: int    # originating search_worker instance
+
+# chapter20/state.py
+import operator
+from typing import Annotated, TypedDict
+from chapter20.types import SearchResult
+
+class WorkerInput(TypedDict):
+    sub_query:  str
+    worker_id:  int
+
+class ResearchState(TypedDict):
+    query:          str
+    sub_queries:    list[str]
+    worker_results: Annotated[list[SearchResult], operator.add]
+    fused_ranking:  list[SearchResult]
+    synthesis:      str
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:reducers} deserve explanation.
+\code{SearchResult} is a Pydantic \code{BaseModel} rather than a
+\code{TypedDict} because it passes through the LangGraph checkpointer:
+\code{BaseModel.model\_dump()} produces a JSON-safe dict without custom
+serialisation code, whereas a \code{TypedDict} instance requires explicit
+handling when stored in a checkpoint. \code{WorkerInput} lives in
+\code{state.py} alongside \code{ResearchState} because it is a state
+schema---the shape of a worker node's \code{state} argument---not a
+domain value type; keeping both schemas in one file makes the boundary
+between parent-graph state and worker-local state immediately visible.
+\code{sub\_queries} carries no reducer annotation because it is written
+once by \code{decompose\_node} and only read thereafter; declaring a
+reducer on a single-writer field adds no value and introduces an
+unnecessary merge cost on every checkpoint write.
+
+The reducer contract is now established. The remaining problem is the
+fan-out mechanism itself: how to produce a variable number of concurrent
+worker invocations whose count is determined at runtime by the query
+decomposition result, not at graph-definition time.
+
+
+%% ------------------------------------------------------------
+\section{Dynamic Fan-Out Requires Runtime-Determined Edges}
+\label{sec:send-fanout}
+%% ------------------------------------------------------------
+
+The design problem is edges whose count is not known at graph-definition
+time. \code{add\_conditional\_edges} with a string return value selects
+among a fixed set of named destinations; it cannot spawn multiple
+concurrent instances of the same node with different inputs. The naive
+workaround---five static edges to five statically named worker nodes---
+makes worker count a structural constant of the graph and requires each
+worker node to know its own index. The governing principle is that the
+number and input of parallel tasks must be determined from the state that
+exists at the moment fan-out fires, not from the graph's static definition.
+
+\code{Send(node,~arg)} is the LangGraph primitive that closes this gap.
+When a conditional edge routing function returns a \code{list[Send]},
+LangGraph spawns one independent concurrent task per \code{Send} object.
+Each task runs the named node with \code{arg} as its \emph{entire}
+state---not as a partial update merged into \code{ResearchState}. The node
+receiving the \code{Send} therefore annotates its \code{state} parameter
+as \code{WorkerInput}, not \code{ResearchState}: it sees only the two
+fields packed into the \code{Send}'s \code{arg} dict. This is the critical
+distinction from a normal edge: a normal edge passes the full parent state
+to the next node; \code{Send} passes only what the caller explicitly
+provides.
+
+\begin{warningbox}
+The fan-out routing function must never be registered with \code{add\_node}.
+A routing function returns \code{list[Send]}; a node returns a state-update
+\code{dict} or \code{Command}. Passing the router to \code{add\_node} causes
+LangGraph to attempt to merge the returned \code{list[Send]} into
+\code{ResearchState} as a state update, raising a runtime error on the
+first invocation. The router appears only as the second argument to
+\code{add\_conditional\_edges}.
+\end{warningbox}
+
+The decomposition step and the routing step are two units with
+two separate contracts. \code{decompose\_node} is an \code{async} node
+because it calls an LLM; it writes \code{sub\_queries} to
+\code{ResearchState} and returns a state-update \code{dict}.
+\code{fan\_out\_router} is a pure synchronous function because it makes
+no I/O calls; it reads \code{sub\_queries} from the updated state and
+returns \code{list[Send]}. Collapsing them into one function would require
+that function to be simultaneously a node (returning a state update) and a
+router (returning \code{list[Send]}), which is not a valid LangGraph node
+contract.
+
+\begin{lstlisting}[language=Python,
+  caption={Decomposition node and pure fan-out routing function},
+  label={lst:send-fanout}]
+# chapter20/fan_out.py
+from langgraph.types import Send
+from langchain_core.runnables import RunnableConfig
+from langchain_litellm import ChatLiteLLM
+from pydantic import BaseModel
+from chapter20.state import ResearchState
+
+MAX_WORKERS: int = 5
+
+class SubQueryList(BaseModel):
+    queries: list[str]
+
+_llm = ChatLiteLLM(model="anthropic/claude-sonnet-4-8")
+_structured_llm = _llm.with_structured_output(SubQueryList)
+
+async def decompose_node(
+    state: ResearchState,
+    config: RunnableConfig,
+) -> dict:
+    result: SubQueryList = await _structured_llm.ainvoke(
+        f"Decompose into at most {MAX_WORKERS} independent "
+        f"sub-queries: {state['query']}"
+    )
+    return {"sub_queries": result.queries[:MAX_WORKERS]}
+
+def fan_out_router(state: ResearchState) -> list[Send]:
+    """Pure routing function — only used in add_conditional_edges."""
+    return [
+        Send("search_worker", {"sub_query": q, "worker_id": i})
+        for i, q in enumerate(state["sub_queries"])
+    ]
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:send-fanout} deserve explanation.
+\code{\_structured\_llm} is bound at module scope rather than rebuilt
+inside \code{decompose\_node} on each call: \code{with\_structured\_output}
+constructs a tool-calling chain whose assembly cost is non-trivial, and
+rebuilding it per invocation adds measurable overhead at scale---the same
+pattern established for \code{\_structured\_llm} in Chapter~19~\S19.1.
+The \code{result.queries[:MAX\_WORKERS]} slice is applied before storing
+in state, not inside \code{fan\_out\_router}: the \code{sub\_queries}
+field should accurately reflect the work that will be dispatched; capping
+in the router would mean the field shows more queries than workers were
+actually spawned, misleading any downstream node or audit log that reads
+\code{sub\_queries}. \code{fan\_out\_router} passes plain \code{dict}
+literals to \code{Send} rather than constructing \code{WorkerInput(...)}
+instances because \code{TypedDict} instances are plain \code{dict} objects
+at runtime; the \code{WorkerInput} annotation exists only for the
+static type-checker inspecting \code{search\_worker}'s signature.
+
+The fan-out contract is established. The problem that fan-out creates
+immediately is failure propagation: when two retrieval backends run
+concurrently inside a worker, a failure in one must not cancel the other,
+and a total worker failure must not prevent the fan-in from ever firing.
+
+
+%% ------------------------------------------------------------
+\section{Partial Failure Must Produce Partial Results, Not No Results}
+\label{sec:partial-failure}
+%% ------------------------------------------------------------
+
+The design problem is error propagation across two independent concurrency
+layers. The worker node is one task in a parallel batch managed by
+LangGraph's Pregel scheduler; inside that task, two retrieval backend
+calls run concurrently via \code{asyncio.gather}. These layers have
+different failure semantics and require different containment mechanisms.
+Wrapping the entire worker in a single \code{try/except} that returns an
+empty list on any failure silently discards both backends' results when
+only one fails---a worse outcome than partial results. The governing
+principle is that each layer's failures are contained at that layer:
+intra-worker backend failures by \code{asyncio.gather} with
+\code{return\_exceptions=True}; transient whole-worker failures by
+\code{RetryPolicy} registered at \code{add\_node} time.
+
+\code{asyncio.gather(*coros,~return\_exceptions=True)} changes the gather
+contract: instead of raising the first exception and cancelling all
+remaining coroutines, it returns a mixed list of results and
+\code{Exception} instances in the same positional order as the input
+coroutines. The caller then inspects each element with
+\code{isinstance(r,~Exception)} and decides what to contribute to the
+reducer. A worker whose Qdrant backend times out but whose BM25 backend
+succeeds still contributes the BM25 results; without
+\code{return\_exceptions=True} the timeout would have cancelled the BM25
+call and the worker would contribute nothing.
+
+\code{RetryPolicy} operates at a different level entirely. It is
+registered at \code{add\_node} time and applies to the whole node
+invocation. When \code{search\_worker} raises an unhandled exception---one
+not caught by the \code{asyncio.gather} inspection---LangGraph retries the
+whole node with exponential backoff before marking the task as permanently
+failed. The two mechanisms are complementary, not alternatives:
+\code{return\_exceptions=True} handles cases where partial results are
+better than nothing; \code{RetryPolicy} handles cases where a transient
+infrastructure failure makes the whole worker temporarily unavailable.
+
+\begin{notebox}
+\code{RetryPolicy}'s \code{max\_attempts} field counts the initial attempt
+plus all retries. The default \code{RetryPolicy()} uses
+\code{max\_attempts=3}: one initial attempt and two retries, not three
+retries. The default \code{retry\_on} retries on all exceptions. In
+production, restrict it to transient infrastructure exceptions such as
+\code{httpx.TimeoutException} and \code{ConnectionError} to avoid
+retrying on permanent failures like \code{pydantic.ValidationError} or
+authentication errors, which will fail identically on every retry.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={Worker node with two-level error containment},
+  label={lst:gather-worker}]
+# chapter20/worker.py
+import asyncio
+from langchain_core.runnables import RunnableConfig
+from chapter20.state import WorkerInput
+from chapter20.types import SearchResult
+from chapter20.backends import qdrant_search, bm25_search
+
+async def search_worker(
+    state: WorkerInput,
+    config: RunnableConfig,
+) -> dict:
+    raw = await asyncio.gather(
+        qdrant_search(state["sub_query"],
+                      worker_id=state["worker_id"]),
+        bm25_search(state["sub_query"],
+                    worker_id=state["worker_id"]),
+        return_exceptions=True,
+    )
+    merged: list[SearchResult] = []
+    for r in raw:
+        if isinstance(r, Exception):
+            # Log in production; contribute empty list to reducer.
+            continue
+        merged.extend(r)
+    return {"worker_results": merged}
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:gather-worker} deserve explanation.
+The \code{worker\_id} argument is passed directly to both backend
+functions rather than post-assigned on the returned results: the backend
+functions construct \code{SearchResult} objects and are the correct place
+to assign \code{worker\_id}, keeping it co-located with object construction
+rather than requiring a post-hoc list comprehension after the gather call.
+The return value \code{\{"worker\_results": merged\}} is a partial update
+targeting only the one field this worker owns; the Pregel scheduler merges
+it into \code{ResearchState} via the \code{operator.add} reducer, and the
+worker has no write access to any other \code{ResearchState} field---a bug
+in one worker cannot corrupt fields it never touched.
+
+\begin{lstlisting}[language=Python,
+  caption={Backend stubs: typed signatures with \texttt{worker\_id} propagation},
+  label={lst:backends}]
+# chapter20/backends.py
+from chapter20.types import SearchResult
+
+async def qdrant_search(
+    query:     str,
+    top_k:     int = 20,
+    worker_id: int = 0,
+) -> list[SearchResult]:
+    # Production: see Chapter 11 §11.2 for Qdrant implementation.
+    raise NotImplementedError
+
+async def bm25_search(
+    query:     str,
+    top_k:     int = 20,
+    worker_id: int = 0,
+) -> list[SearchResult]:
+    # Production: see Chapter 11 §11.3 for BM25Okapi implementation.
+    raise NotImplementedError
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:backends} deserve explanation.
+Both functions raise \code{NotImplementedError} rather than returning an
+empty list: the integration test in Section~\ref{sec:full-parallel} mocks
+both backends with fixture data, and a stub that silently returned an
+empty list would make tests pass without exercising retrieval, hiding
+missing implementations entirely. The \code{worker\_id} default value of
+\code{0} allows both functions to be called in backend-level unit tests
+without constructing a full \code{WorkerInput} context.
+
+The worker's two-level error containment is correct. What remains is the
+structural question: how does Pregel fan-in actually fire, what does
+\code{aggregate\_node} receive when it runs, and how does it transform a
+flat accumulated list into a ranked output ready for synthesis.
+
+
+%% ------------------------------------------------------------
+\section{Fan-In Topology: One Aggregation Node Receives the Full Merge}
+\label{sec:map-reduce-topo}
+%% ------------------------------------------------------------
+
+The design problem is the contract between parallel workers and their
+aggregation step. The edge declaration
+\code{add\_edge("search\_worker",~"aggregate")} reads like a per-worker
+trigger, which invites designs where the aggregation node checks how many
+workers have reported and accumulates state internally across repeated
+calls. That design is incorrect and unnecessary: it requires knowing the
+expected worker count at aggregation time, which changes as
+\code{sub\_queries} changes between runs. The governing principle is that
+LangGraph's Pregel scheduler is the accumulator: \code{aggregate\_node}
+runs exactly once, after all tasks in the current \code{Send} batch have
+completed, and receives \code{ResearchState} with \code{worker\_results}
+already fully merged by the \code{operator.add} reducer.
+
+The fan-in mechanism is implicit in one edge declaration. As each parallel
+task completes, its \code{\{"worker\_results":~...\}} partial update is
+applied through the \code{operator.add} reducer to the accumulated state.
+When the last task in the batch finishes---or is permanently failed after
+\code{RetryPolicy} exhaustion---the graph advances to \code{"aggregate"}.
+The aggregation node never checks a worker count or tests completeness:
+the scheduler guarantees both conditions before the node runs.
+
+RRF requires per-worker ranked lists, but \code{operator.add} delivers a
+flat concatenated list. The bridge is the \code{worker\_id} field on every
+\code{SearchResult}: grouping by \code{worker\_id} reconstructs each
+worker's independent list that the reducer intentionally preserved by
+never deduplicating. Sorting each group by \code{score} descending
+restores intra-worker rank order that task-completion interleaving may
+have scrambled. Chapter~11~\S11.4 introduced \code{reciprocal\_rank\_fusion}
+as a function that accepts a list of ranked lists and returns a unified
+re-ranked list; this chapter imports that implementation without
+modification.
+
+\begin{warningbox}
+If any \code{search\_worker} task raises an unhandled exception after
+\code{RetryPolicy} exhaustion, LangGraph marks that task as permanently
+failed. Whether Pregel fan-in then fires depends on the graph's configured
+error policy. To guarantee \code{aggregate\_node} always runs even when
+some workers fail permanently, workers must catch all exceptions and
+return \code{\{"worker\_results":[]\}} rather than raising---exactly what
+the \code{isinstance(r,~Exception)} guard in
+Listing~\ref{lst:gather-worker} achieves by using \code{continue} instead
+of \code{raise}.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Aggregation node: per-worker grouping, RRF, post-fusion
+           deduplication},
+  label={lst:aggregate}]
+# chapter20/aggregate.py
+from langchain_core.runnables import RunnableConfig
+from chapter20.state import ResearchState
+from chapter20.types import SearchResult
+from chapter11.fusion import reciprocal_rank_fusion
+
+async def aggregate_node(
+    state: ResearchState,
+    config: RunnableConfig,
+) -> dict:
+    by_worker: dict[int, list[SearchResult]] = {}
+    for r in state["worker_results"]:
+        by_worker.setdefault(r.worker_id, []).append(r)
+    ranked_lists = [
+        sorted(recs, key=lambda x: x.score, reverse=True)
+        for recs in by_worker.values()
+    ]
+    fused: list[SearchResult] = reciprocal_rank_fusion(
+        ranked_lists, k=60,
+    )
+    deduped: list[SearchResult] = []
+    seen: set[str] = set()
+    for r in fused:
+        if r.doc_id not in seen:
+            seen.add(r.doc_id)
+            deduped.append(r)
+    return {"fused_ranking": deduped}
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:aggregate} deserve explanation.
+Deduplication by \code{doc\_id} happens after RRF, not before it in the
+reducer: RRF's cross-worker rank comparison requires seeing the same
+document at different rank positions across different workers' lists;
+removing duplicates earlier would collapse that signal.
+The deduplication uses an explicit \code{for} loop with a \code{seen} set
+rather than a one-liner list comprehension that exploits
+\code{set.add} returning \code{None}: the loop makes the first-occurrence
+selection intent unambiguous and passes \code{mypy} without a
+\code{\#~type:~ignore} comment. The \code{by\_worker} grouping and
+intra-group sort are needed even though the reducer preserved all records
+with their \code{worker\_id} intact, because \code{operator.add}
+interleaves results from different workers in task-completion order---a
+fast-finishing worker's results may appear at positions that no longer
+reflect their score rank within that worker's contribution.
+
+\begin{lstlisting}[language=Python,
+  caption={Synthesis node: top-ten fused results as numbered snippets},
+  label={lst:synthesise}]
+# chapter20/aggregate.py  (continued)
+from langchain_litellm import ChatLiteLLM
+
+_synth_llm = ChatLiteLLM(model="anthropic/claude-sonnet-4-8")
+
+async def synthesise_node(
+    state: ResearchState,
+    config: RunnableConfig,
+) -> dict:
+    snippets = "\n\n".join(
+        f"[{i + 1}] {r.content}"
+        for i, r in enumerate(state["fused_ranking"][:10])
+    )
+    prompt = (
+        f"Query: {state['query']}\n\n"
+        f"Sources:\n{snippets}\n\n"
+        "Write a synthesised answer. "
+        "Cite sources inline as [1], [2], etc."
+    )
+    response = await _synth_llm.ainvoke(prompt)
+    return {"synthesis": response.content}
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:synthesise} deserve explanation.
+\code{synthesise\_node} is a separate node from \code{aggregate\_node}
+rather than a second phase inside the same function: aggregation is purely
+deterministic (sorting and RRF always produce the same output for the same
+input), making it a candidate for \code{CachePolicy} in
+Section~\ref{sec:full-parallel}; synthesis calls an LLM and is
+non-deterministic, making caching incorrect for it. Mixing the two in one
+node would prevent applying \code{CachePolicy} to either step without
+affecting the other. The \code{\_synth\_llm} binding is declared
+immediately before \code{synthesise\_node} in the file rather than at the
+top of \code{aggregate.py}: a module-level LLM client is a meaningful
+side effect at import time, and positioning it next to its sole consumer
+makes the dependency visible without scrolling past unrelated code.
+
+All five nodes are individually defined and consistent in their type
+contracts. The remaining problem is assembly: wiring them into a graph
+that correctly sources the conditional edge, applies \code{RetryPolicy}
+and \code{CachePolicy} at node registration, and is verified by an
+integration test that mocks backends rather than calling unreachable stubs.
+
+
+%% ------------------------------------------------------------
+\section{Full System: Five Concurrent Searchers Under One Coordinator}
+\label{sec:full-parallel}
+%% ------------------------------------------------------------
+
+The design problem is silent topology divergence between the intended
+graph structure and the compiled one. Three assembly mistakes are possible
+in this topology, none of which produce a compile-time error. First:
+registering \code{fan\_out\_router} with \code{add\_node}, which causes
+LangGraph to treat \code{list[Send]} as a state update. Second: sourcing
+\code{add\_conditional\_edges} from a non-existent node name such as
+\code{"fan\_out"} instead of \code{"decompose"}. Third: omitting the
+\code{["search\_worker"]} path-map argument from
+\code{add\_conditional\_edges}, which removes compile-time validation that
+all \code{Send} destinations exist as registered nodes. The governing
+principle is that the graph assembly function must make topology explicit
+in a form that can be read and reviewed without running the graph.
+
+\code{RetryPolicy} and \code{CachePolicy} are passed as keyword arguments
+to \code{add\_node}, not to \code{compile} or to the node function itself.
+\code{RetryPolicy()} with default arguments is applied to
+\code{"search\_worker"} because workers call external backends subject to
+transient failures. \code{CachePolicy()} with default arguments is applied
+to \code{"aggregate"} because aggregation is deterministic: given the same
+\code{worker\_results} input, RRF and deduplication always produce the
+same \code{fused\_ranking}. LangGraph uses a pickle-hash of the node's
+input as the default cache key, meaning any change in
+\code{worker\_results}---including order differences from non-deterministic
+task completion---produces a cache miss.
+
+\begin{notebox}
+\code{CachePolicy(ttl=None)} means entries never expire within the
+process. With \code{MemorySaver}, both the checkpoint store and the cache
+are in-process memory, so a restart clears both regardless of
+\code{ttl}; the setting has no practical effect in development.
+\code{ttl} becomes meaningful only with a persistent checkpointer such as
+\code{AsyncSqliteSaver}: a cached aggregation from a previous run with
+identical \code{worker\_results} would survive a process restart and be
+served from cache, saving the RRF computation entirely. Chapter~22~\S22.1
+introduces \code{AsyncSqliteSaver} and the point at which \code{ttl}
+should be set to a bounded value for production deployments.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={Graph assembly: correct fan-out topology, \texttt{RetryPolicy},
+           and \texttt{CachePolicy}},
+  label={lst:full-graph}]
+# chapter20/graph.py
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import RetryPolicy, CachePolicy
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.runnables import RunnableConfig
+from chapter20.state import ResearchState
+from chapter20.fan_out import decompose_node, fan_out_router
+from chapter20.worker import search_worker
+from chapter20.aggregate import aggregate_node, synthesise_node
+
+def build_research_graph() -> CompiledStateGraph:
+    b = StateGraph(ResearchState)
+    b.add_node("decompose",     decompose_node)
+    b.add_node("search_worker", search_worker,
+               retry=RetryPolicy())
+    b.add_node("aggregate",     aggregate_node,
+               cache=CachePolicy())
+    b.add_node("synthesise",    synthesise_node)
+    b.add_edge(START, "decompose")
+    b.add_conditional_edges(
+        "decompose", fan_out_router, ["search_worker"],
+    )
+    b.add_edge("search_worker", "aggregate")
+    b.add_edge("aggregate",     "synthesise")
+    b.add_edge("synthesise",    END)
+    return b.compile(checkpointer=MemorySaver())
+
+async def run_research(query: str, thread_id: str) -> ResearchState:
+    graph = build_research_graph()
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id},
+    }
+    return await graph.ainvoke(
+        ResearchState(
+            query=query, sub_queries=[],
+            worker_results=[], fused_ranking=[], synthesis="",
+        ),
+        config=config,
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:full-graph} deserve explanation.
+\code{add\_conditional\_edges("decompose",~fan\_out\_router,~["search\_worker"])}
+sources the conditional edge from \code{"decompose"}---the last node that
+ran before routing is needed, and the node that wrote \code{sub\_queries}
+to state---not from a hypothetical \code{"fan\_out"} node that is not
+registered. The \code{["search\_worker"]} list is the path map: it tells
+LangGraph which node names are valid destinations for this conditional edge,
+enabling compile-time validation that every name produced by a
+\code{Send} in \code{fan\_out\_router} is a registered node; without it, a
+typo in \code{fan\_out\_router}'s \code{Send} node name produces a
+\code{NodeNotFoundError} only at runtime on the first query.
+\code{RetryPolicy()} is instantiated with no arguments to make explicit that
+all defaults are intentional; passing \code{RetryPolicy(max\_attempts=3)}
+would suggest a deliberate override from a different default, when
+\code{max\_attempts=3} is in fact the default value.
+
+\begin{lstlisting}[language=Python,
+  caption={Integration test with backend mocks and structural assertions},
+  label={lst:full-test}]
+# chapter20/test_graph.py
+import pytest
+from unittest.mock import AsyncMock, patch
+from chapter20.graph import run_research
+from chapter20.fan_out import MAX_WORKERS
+from chapter20.types import SearchResult
+
+def _make_results(worker_id: int, n: int = 3) -> list[SearchResult]:
+    return [
+        SearchResult(
+            doc_id=f"w{worker_id}::doc{i}",
+            content=f"Content {i}",
+            score=1.0 / (i + 1),
+            source="mock",
+            worker_id=worker_id,
+        )
+        for i in range(n)
+    ]
+
+@pytest.mark.asyncio
+async def test_parallel_research_produces_synthesis() -> None:
+    mock_r = _make_results(worker_id=0)
+    with patch("chapter20.backends.qdrant_search",
+               new=AsyncMock(return_value=mock_r)), \
+         patch("chapter20.backends.bm25_search",
+               new=AsyncMock(return_value=mock_r)):
+        result = await run_research(
+            query="Quantum error correction methods.",
+            thread_id="test-ch20-001",
+        )
+    assert result["sub_queries"], \
+        "decompose_node must produce at least one sub-query"
+    assert result["fused_ranking"], \
+        "aggregate_node must produce at least one fused result"
+    assert result["synthesis"] != "", \
+        "synthesise_node must write a non-empty synthesis"
+
+@pytest.mark.asyncio
+async def test_worker_count_bounded_by_max_workers() -> None:
+    mock_r = _make_results(worker_id=0)
+    with patch("chapter20.backends.qdrant_search",
+               new=AsyncMock(return_value=mock_r)), \
+         patch("chapter20.backends.bm25_search",
+               new=AsyncMock(return_value=mock_r)):
+        result = await run_research(
+            query="A highly compound query " * 10,
+            thread_id="test-ch20-002",
+        )
+    assert len(result["sub_queries"]) <= MAX_WORKERS
+
+@pytest.mark.asyncio
+async def test_partial_backend_failure_still_synthesises() -> None:
+    pytest.skip(
+        "Requires fault-injection fixture: Chapter 22 §22.4"
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:full-test} deserve explanation.
+\code{\_make\_results} is a module-level fixture factory rather than inline
+dict construction: it ensures every test that needs \code{SearchResult}
+objects uses the same valid \code{doc\_id} format
+(\code{f"w\{worker\_id\}::doc\{i\}"}), making the format contract testable
+rather than repeated and divergent across test functions. The \code{patch}
+calls target the names in \code{chapter20.backends}---the module where
+they are defined and imported from---rather than at their reference site in
+\code{chapter20.worker}: Python's \code{unittest.mock.patch} replaces the
+name in the namespace it is given; patching at the wrong module leaves the
+original unpatched and the test silently calls the \code{NotImplementedError}
+stubs. \code{test\_partial\_backend\_failure\_still\_synthesises} calls
+\code{pytest.skip} with an explicit message naming the missing capability
+rather than an empty body: the test's name precisely states the invariant it
+will verify once the fault-injection fixture exists, making it a visible
+specification item in the suite rather than dead code.
+
+\begin{notebox}
+The parallel research graph as built here dispatches all sub-queries to the
+same \code{search\_worker} node. When sub-queries differ substantially in
+domain---one requiring dense vector retrieval, another requiring structured
+knowledge-graph traversal---a single worker type produces uniformly mediocre
+results. A later chapter shows how to combine \code{Send}-based fan-out
+with the Chapter~19 supervisor pattern to route different sub-queries to
+different specialised worker types while preserving the fan-in topology and
+reducer contracts built here.
+\end{notebox}
+
+Chapter~21 introduces a new dimension to the execution model built here:
+where this chapter parallelises work that has no data dependency and no
+need for human review, the next chapter confronts the case where a graph
+must pause mid-execution---before fan-out commits five concurrent retrieval
+calls---and surface the decomposed sub-queries to a human reviewer who may
+edit, reject, or approve them before execution resumes.
