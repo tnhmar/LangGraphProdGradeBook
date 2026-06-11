@@ -87,18 +87,18 @@ Score config
 
 \begin{sourcelayout}
 \dirtree{%
-  .1 src/.\
-  .2 eval/.\
-  .3 dataset\_manager.py \DTcomment{\S\ref{sec:golden-dataset}}.\
-  .3 online\_judge.py \DTcomment{\S\ref{sec:online-eval}}.\
-  .3 ragas\_suite.py \DTcomment{\S\ref{sec:ragas-metrics}}.\
-  .3 deepeval\_suite.py \DTcomment{\S\ref{sec:deepeval-metrics}}.\
-  .3 success\_criteria.py \DTcomment{\S\ref{sec:success-criteria}}.\
-  .3 run\_eval.py \DTcomment{\S\ref{sec:ci-harness}}.\
-  .2 tests/.\
-  .3 test\_eval\_ci.py \DTcomment{\S\ref{sec:ci-harness}}.\
-  .1 .github/workflows/.\
-  .2 eval.yml \DTcomment{\S\ref{sec:ci-harness}}.\
+  .1 src/.
+  .2 eval/.
+  .3 dataset\_manager.py \DTcomment{\S\ref{sec:golden-dataset}}.
+  .3 online\_judge.py \DTcomment{\S\ref{sec:online-eval}}.
+  .3 ragas\_suite.py \DTcomment{\S\ref{sec:ragas-metrics}}.
+  .3 deepeval\_suite.py \DTcomment{\S\ref{sec:deepeval-metrics}}.
+  .3 success\_criteria.py \DTcomment{\S\ref{sec:success-criteria}}.
+  .3 run\_eval.py \DTcomment{\S\ref{sec:ci-harness}}.
+  .2 tests/.
+  .3 test\_eval\_ci.py \DTcomment{\S\ref{sec:ci-harness}}.
+  .1 .github/workflows/.
+  .2 eval.yml \DTcomment{\S\ref{sec:ci-harness}}.
 }
 \end{sourcelayout}
 
@@ -171,8 +171,8 @@ GOLDEN_INPUT_SCHEMA: dict = {
     "type": "object",
     "required": ["query", "retrieved_contexts"],
     "properties": {
-        "query":               {"type": "string"},
-        "retrieved_contexts":  {
+        "query":              {"type": "string"},
+        "retrieved_contexts": {
             "type": "array", "items": {"type": "string"}
         },
     },
@@ -205,7 +205,8 @@ def fetch_dataset_at_version(version_ts: str) -> list[dict]:
     ds = get_client().get_dataset(DATASET_NAME, version=version_ts)
     return [
         {"id": it.id, "input": it.input,
-         "expected_output": it.expected_output, "metadata": it.metadata}
+         "expected_output": it.expected_output,
+         "metadata": it.metadata}
         for it in ds.items
     ]
 \end{lstlisting}
@@ -247,21 +248,28 @@ immediately.
 Score attachment in Langfuse SDK v4 follows a single path:
 \code{get\_client().create\_score(trace\_id=..., name=..., value=...,
 data\_type=..., comment=...)}.  The \code{data\_type} argument is a plain
-string, either \code{"NUMERIC"} or \code{"CATEGORICAL"} --- it is not an
-imported enum.  An optional \code{observation\_id} narrows the score to a
-specific span rather than the trace root; for online faithfulness and
-relevancy the trace root is the correct granularity because both metrics
-characterise the full response, not any individual retrieval or generation
-step.
+string from the set \code{"NUMERIC"}, \code{"CATEGORICAL"},
+\code{"BOOLEAN"}, and \code{"TEXT"} --- it is not an imported enum.
+The score object's target is determined by exactly one of the four
+mutually-exclusive identifier fields: \code{trace\_id} attaches to the
+trace root, \code{observation\_id} narrows to a specific span,
+\code{session\_id} attaches to a session, and \code{dataset\_run\_id}
+attaches to a dataset run item.  Passing more than one raises a validation
+error on the server.  For online faithfulness and relevancy the trace root
+is the correct granularity because both metrics characterise the full
+response, not any individual retrieval or generation step.
 
 Before scores can be created they must be registered as \emph{score
 configs} on the Langfuse server.  A score config records the metric's name,
-data type, and rubric description so the UI can display labelled scores with
-their definitions inline.  In SDK v4 the correct API path is
+data type, and description so the UI can display labelled scores with
+their definitions inline.  Score configs are \emph{immutable once created}:
+the server rejects a second \code{create} call with the same name.  The
+\code{ensure\_score\_configs} function must therefore guard against
+duplicate-creation errors rather than calling \code{create} unconditionally.
+In SDK v4 the correct API path is
 \code{get\_client().api.score\_configs.create(request=...)} using the
-\code{CreateScoreConfigRequest} model.  There is no top-level convenience
-method: the underlying REST client is accessed through
-\code{get\_client().api}.
+\code{CreateScoreConfigRequest} model; there is no top-level convenience
+method.
 
 \begin{notebox}
 The judge model must be \emph{different} from the agent's own model.
@@ -299,26 +307,35 @@ RELEVANCY_RUBRIC = (
     "Score 0.0-1.0. 1.0 = answer directly and completely addresses "
     "the question. Penalise irrelevant content or evasion."
 )
+_SCORE_CONFIGS = {
+    "faithfulness_online":     FAITHFULNESS_RUBRIC,
+    "answer_relevancy_online": RELEVANCY_RUBRIC,
+}
 
 def ensure_score_configs() -> None:
+    """Idempotent: silently skips configs that already exist."""
     lf = get_client()
-    for name, rubric in [
-        ("faithfulness_online", FAITHFULNESS_RUBRIC),
-        ("answer_relevancy_online", RELEVANCY_RUBRIC),
-    ]:
-        lf.api.score_configs.create(
-            request=CreateScoreConfigRequest(
-                name=name, data_type="NUMERIC", description=rubric,
+    existing = {sc.name for sc in lf.api.score_configs.list().data}
+    for name, rubric in _SCORE_CONFIGS.items():
+        if name not in existing:
+            lf.api.score_configs.create(
+                request=CreateScoreConfigRequest(
+                    name=name,
+                    data_type="NUMERIC",
+                    description=rubric,
+                )
             )
-        )
 
-async def _judge(query, answer, contexts, judge_model) -> dict:
+async def _call_judge(
+    query: str, answer: str,
+    contexts: list[str], judge_model: str,
+) -> dict:
     prompt = (
         f"Query: {query}\nContexts: {contexts}\nAnswer: {answer}\n"
-        "Return JSON: {\"faithfulness\": <0-1>, "
-        "\"answer_relevancy\": <0-1>, "
-        "\"faithfulness_reason\": \"...\", "
-        "\"relevancy_reason\": \"...\"}"
+        'Return JSON with keys "faithfulness" (0-1), '
+        '"answer_relevancy" (0-1), '
+        '"faithfulness_reason" (string), '
+        '"relevancy_reason" (string).'
     )
     resp = await litellm.acompletion(
         model=judge_model,
@@ -331,44 +348,63 @@ async def run_online_judge(
     trace_id: str, query: str, answer: str,
     contexts: list[str], judge_model: str,
 ) -> None:
-    scores = await _judge(query, answer, contexts, judge_model)
+    scores = await _call_judge(query, answer, contexts, judge_model)
     lf = get_client()
-    lf.create_score(trace_id=trace_id, name="faithfulness_online",
-        value=scores["faithfulness"], data_type="NUMERIC",
-        comment=scores["faithfulness_reason"])
-    lf.create_score(trace_id=trace_id, name="answer_relevancy_online",
-        value=scores["answer_relevancy"], data_type="NUMERIC",
-        comment=scores["relevancy_reason"])
+    lf.create_score(
+        trace_id=trace_id,
+        name="faithfulness_online",
+        value=scores["faithfulness"],
+        data_type="NUMERIC",
+        comment=scores.get("faithfulness_reason"),
+    )
+    lf.create_score(
+        trace_id=trace_id,
+        name="answer_relevancy_online",
+        value=scores["answer_relevancy"],
+        data_type="NUMERIC",
+        comment=scores.get("relevancy_reason"),
+    )
 
-def attach_online_judge_to_node(
+def attach_online_judge(
     trace_id: str, query: str, answer: str,
     contexts: list[str], judge_model: str,
 ) -> None:
-    asyncio.create_task(
-        run_online_judge(trace_id, query, answer, contexts, judge_model)
+    """Schedule judging as a background task; must be called
+    from within a running asyncio event loop (ainvoke context)."""
+    asyncio.get_event_loop().create_task(
+        run_online_judge(
+            trace_id, query, answer, contexts, judge_model)
     )
 \end{lstlisting}
 
-Three decisions in Listing~\ref{lst:online-judge} deserve explanation.
-First, \code{response\_format=\{"type": "json\_object"\}} is passed to
-\code{acompletion}; this is LiteLLM's unified way of requesting structured
-JSON output from any model that supports it, eliminating the need to parse
-prose from the judge response.  Second, both scores are attached in the same
-\code{run\_online\_judge} coroutine rather than two separate tasks; if the
-judge call fails, neither score is partially written, keeping the trace's
-score set consistent.  Third, \code{attach\_online\_judge\_to\_node}
-receives a \code{judge\_model} string rather than building it internally,
-which means the CI harness in \S\ref{sec:ci-harness} can call it with the
-same model used for offline metrics, making online and offline scores
-directly comparable on CI-run traces.
+Four decisions in Listing~\ref{lst:online-judge} deserve explanation.
+First, \code{ensure\_score\_configs} queries \code{lf.api.score\_configs.list()}
+before creating; score configs are immutable once registered, so a second
+unconditional \code{create} call for the same name would raise a server-side
+validation error on every CI run after the first.  The existence check makes
+the function safe to call on startup across any number of deployments.
+Second, the JSON prompt uses explicit key names in the instruction string
+rather than embedding JSON template literals; this avoids double-escaping
+issues that arise in f-strings that embed brace-delimited JSON.  Third, both
+\code{create\_score} calls use \code{trace\_id} as the sole target
+identifier; the Langfuse API treats the four target fields
+(\code{trace\_id}, \code{observation\_id}, \code{session\_id},
+\code{dataset\_run\_id}) as mutually exclusive, and supplying more than one
+produces a server validation error.  Fourth, \code{attach\_online\_judge}
+calls \code{asyncio.get\_event\_loop().create\_task} rather than
+\code{asyncio.create\_task}: the latter is the preferred form inside a
+coroutine, but since \code{attach\_online\_judge} is a synchronous function
+called from a LangGraph node, the explicit loop reference avoids the
+\code{RuntimeError} raised when \code{create\_task} is invoked from a
+synchronous frame.
 
 \begin{warningbox}
-\code{asyncio.create\_task} only works inside a running event loop.
-If \code{attach\_online\_judge\_to\_node} is ever called from a synchronous
-context --- for example a LangGraph node executed without \code{await} ---
-it will raise \code{RuntimeError: no running event loop}.  Use
-\code{asyncio.ensure\_future} with an explicit loop reference, or confirm
-the graph is invoked via \code{ainvoke}, not \code{invoke}.
+\code{attach\_online\_judge} relies on a running asyncio event loop already
+existing in the calling thread.  This is guaranteed when the LangGraph graph
+is invoked via \code{ainvoke} or \code{astream}, but not when it is invoked
+via the synchronous \code{invoke}.  If synchronous invocation is required,
+fire judging from a dedicated background thread using
+\code{asyncio.run\_coroutine\_threadsafe}.
 \end{warningbox}
 
 Online scores now accumulate on every production trace.  The next problem
@@ -408,12 +444,12 @@ claim in the reference answer can be attributed to at least one retrieved
 chunk; it requires \code{retrieved\_contexts} and \code{reference}.
 
 \begin{notebox}
-RAGAS field names are \code{user\_input}, \code{response},
-\code{retrieved\_contexts}, and \code{reference} --- not \code{query},
-\code{answer}, \code{contexts}, or \code{ground\_truth}.  Using the wrong
-names produces silent \code{None} fields in \code{SingleTurnSample} which
-RAGAS treats as missing, skipping the metric entirely without raising an
-exception.  Map all incoming data explicitly.
+RAGAS \code{SingleTurnSample} field names are \code{user\_input},
+\code{response}, \code{retrieved\_contexts}, and \code{reference} ---
+not \code{query}, \code{answer}, \code{contexts}, or \code{ground\_truth}.
+Using the wrong names produces silent \code{None} fields which RAGAS treats
+as missing data, skipping the metric entirely without raising an exception.
+Map all incoming data explicitly at the boundary.
 \end{notebox}
 
 RAGAS uses its own LLM client for judge calls by default.  Allowing this
@@ -429,16 +465,18 @@ The \code{RunConfig} timeout deserves explicit attention.  RAGAS's default
 timeout is thirty seconds.  A judge call to a provider under load --- common
 in CI environments running parallel matrix jobs --- can easily exceed that
 limit, causing RAGAS to silently return \code{nan} for the affected metric
-rather than raising an exception.  Setting \code{timeout=120} with
-\code{max\_retries=3} and \code{max\_wait=60} covers the realistic tail
-latency of any supported provider.
+rather than raising an exception.  In RAGAS v0.2 the \code{RunConfig}
+is passed \emph{per metric} at construction time, not to the top-level
+\code{evaluate()} call; setting it once on a shared constant and passing
+it to every metric constructor is the correct pattern.
 
 \begin{lstlisting}[language=Python, caption={RAGAS suite: four metrics\,
-    injected LLM\, and explicit run config},
+    per-metric RunConfig\, and nan-filtered results},
     label={lst:ragas-suite}]
 # src/eval/ragas_suite.py
 from __future__ import annotations
-from ragas import EvaluationDataset, evaluate, RunConfig
+from ragas import EvaluationDataset, evaluate
+from ragas.run_config import RunConfig
 from ragas.dataset_schema import SingleTurnSample
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
@@ -469,39 +507,45 @@ def run_ragas_suite(
     run_config: RunConfig = DEFAULT_RUN_CONFIG,
 ) -> dict[str, float]:
     metrics = [
-        Faithfulness(llm=llm),
-        AnswerRelevancy(llm=llm, embeddings=embeddings),
-        ContextPrecision(llm=llm),
-        ContextRecall(llm=llm),
+        Faithfulness(llm=llm, run_config=run_config),
+        AnswerRelevancy(
+            llm=llm, embeddings=embeddings, run_config=run_config),
+        ContextPrecision(llm=llm, run_config=run_config),
+        ContextRecall(llm=llm, run_config=run_config),
     ]
     result = evaluate(
-        dataset=dataset, metrics=metrics,
-        llm=llm, embeddings=embeddings,
-        run_config=run_config,
+        dataset=dataset,
+        metrics=metrics,
+        llm=llm,
+        embeddings=embeddings,
     )
-    return {k: float(v) for k, v in result.items()
-            if v is not None and str(v) != "nan"}
+    return {
+        k: float(v)
+        for k, v in result.items()
+        if v is not None and str(v) != "nan"
+    }
 \end{lstlisting}
 
 Three decisions in Listing~\ref{lst:ragas-suite} deserve explanation.
-First, the \code{llm} argument is passed \emph{both} at the metric
-constructor level and at the \code{evaluate()} call level; this is
-intentional --- some RAGAS metric implementations read the LLM from the
-metric object while others fall back to the evaluate-level argument, and
-passing both ensures consistent coverage regardless of which internal path a
-given metric version takes.  Second, the \code{dict} comprehension at the
-end filters out \code{None} and \code{"nan"} values explicitly; a caller
-that receives \code{nan} and treats it as a float will silently pass a
-threshold check, which is worse than surfacing the missing metric as an
-absent key.  Third, \code{run\_output} is a nested key rather than a flat
-field because the CI harness in \S\ref{sec:ci-harness} stores the full agent
-response dict --- including retrieved contexts --- alongside the golden item,
-enabling the CI harness to supply both \code{response} and
-\code{retrieved\_contexts} without a second agent invocation.
+First, \code{RunConfig} is passed to each metric's constructor rather than
+to \code{evaluate()}; in RAGAS v0.2, \code{evaluate()} does not accept a
+\code{run\_config} keyword argument --- the timeout and retry policy are
+properties of each metric, not of the evaluation loop.  Passing it to
+\code{evaluate()} would be silently ignored, producing the same thirty-second
+timeout failures the configuration was meant to prevent.  Second, the dict
+comprehension filters out \code{None} and \code{"nan"} values explicitly;
+a caller that receives \code{nan} and compares it against a float threshold
+will silently pass the gate, which is a worse failure mode than surfacing the
+missing metric as an absent key.  Third, the \code{llm} and \code{embeddings}
+arguments are passed \emph{both} at metric constructor level and at
+\code{evaluate()} level; some RAGAS metric implementations read the LLM from
+the metric object while others fall back to the evaluate-level argument, and
+supplying both ensures consistent coverage regardless of which internal path
+a given metric version takes.
 
 RAGAS measures retrieval and generation quality in aggregate across the
 dataset.  The next section adds a complementary framework that measures
-quality at the level of individual test cases, enabling item-level failure
+quality at the level of individual test cases, enabling per-item failure
 reports rather than dataset-level mean scores.
 
 %%------------------------------------------------------------
@@ -524,26 +568,39 @@ DeepEval operates at the test-case level: each \code{LLMTestCase} maps to a
 single golden item, and each metric's \code{measure()} call assigns a score
 and a \code{reason} string to that specific case.  This means a failing CI
 run produces a per-item report --- item ID, metric name, score, reason ---
-that is actionable without additional querying.
+that is actionable without additional querying.  The \code{ItemResult}
+dataclass defined below carries all four fields so downstream code can branch
+on \code{.passed} without string key lookups.
 
 \begin{notebox}
-DeepEval's \code{FaithfulnessMetric}, \code{AnswerRelevancyMetric}, and
-\code{GEval} accept a \code{model} argument that is either an OpenAI model
-name string (for OpenAI-compatible providers) or a subclass of
-\code{DeepEvalBaseLLM}.  Passing a bare non-OpenAI model string such as
-\code{"claude-haiku-4.5"} will raise a \code{ValueError} at runtime because
-DeepEval cannot resolve it to a client.  For non-OpenAI models, implement a
-thin \code{DeepEvalBaseLLM} wrapper that delegates to \code{litellm.completion},
-or expose the model through a LiteLLM OpenAI-compatible proxy and pass the
-resulting OpenAI-format model string.
+DeepEval's built-in metrics (\code{FaithfulnessMetric},
+\code{AnswerRelevancyMetric}) and \code{GEval} accept a \code{model}
+argument that must be either an OpenAI-compatible model name string or a
+subclass of \code{DeepEvalBaseLLM}.  Passing a bare non-OpenAI model string
+such as \code{"claude-haiku-4.5"} raises a \code{ValueError} at runtime
+because DeepEval cannot resolve it to a provider client.  The clean solution
+is to implement a thin \code{DeepEvalBaseLLM} subclass whose
+\code{generate} and \code{a\_generate} methods delegate to
+\code{litellm.completion} and \code{litellm.acompletion} respectively, then
+pass an instance of that class as the \code{model} argument.
 \end{notebox}
 
 \code{GEval} is DeepEval's configurable rubric-based metric.  It evaluates
 a test case against a natural-language criteria string, producing a 0--1
-score and a reason.  This makes it the right choice for domain-specific
-quality dimensions that RAGAS does not cover --- for example, whether a
-legal-domain response correctly cites its jurisdictional scope, or whether a
-medical response includes the appropriate hedging language.
+score and a reason.  The \code{evaluation\_params} argument constrains the
+judge's attention to only the specified \code{LLMTestCaseParams} fields,
+preventing the judge from reading \code{expected\_output} as a shortcut
+and inflating scores.  This makes \code{GEval} the right choice for
+domain-specific quality dimensions that the built-in metrics do not cover.
+
+\begin{tipbox}
+For non-OpenAI models, wrap your LiteLLM call in a \code{DeepEvalBaseLLM}
+subclass and pass the instance directly:
+\texttt{FaithfulnessMetric(threshold=0.85, model=LiteLLMJudge())}.
+Routing through LiteLLM means all provider failover, retry, and spend
+tracking configured in Chapter~\ref{chap:litellm} applies automatically
+to DeepEval judge calls as well.
+\end{tipbox}
 
 \begin{lstlisting}[language=Python, caption={DeepEval suite: per-item
     scoring with built-in and rubric-based metrics},
@@ -551,12 +608,10 @@ medical response includes the appropriate hedging language.
 # src/eval/deepeval_suite.py
 from __future__ import annotations
 from dataclasses import dataclass
-from deepeval import assert_test
-from deepeval.test_case import LLMTestCase
+from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 from deepeval.metrics import (
     FaithfulnessMetric, AnswerRelevancyMetric, GEval,
 )
-from deepeval.test_case import LLMTestCaseParams
 
 @dataclass
 class ItemResult:
@@ -577,7 +632,7 @@ def build_test_case(item: dict) -> LLMTestCase:
 
 def run_deepeval_suite(
     items: list[dict],
-    judge_model: str,
+    judge_model: object,          # DeepEvalBaseLLM instance
     faithfulness_threshold: float,
     relevancy_threshold:    float,
 ) -> list[ItemResult]:
@@ -597,7 +652,8 @@ def run_deepeval_suite(
                 LLMTestCaseParams.ACTUAL_OUTPUT,
                 LLMTestCaseParams.RETRIEVAL_CONTEXT,
             ],
-            threshold=0.70, model=judge_model,
+            threshold=0.70,
+            model=judge_model,
         ),
     ]
     results: list[ItemResult] = []
@@ -608,8 +664,8 @@ def run_deepeval_suite(
             results.append(ItemResult(
                 item_id=item["id"],
                 metric=metric.name,
-                score=metric.score,
-                reason=metric.reason,
+                score=float(metric.score),
+                reason=metric.reason or "",
                 passed=metric.is_successful(),
             ))
     return results
@@ -620,16 +676,15 @@ First, thresholds are passed in as arguments rather than embedded in the
 metric constructors, because the \code{SuccessCriteria} dataclass in
 \S\ref{sec:success-criteria} is the single owner of all threshold values;
 duplicating them here would create the drift the success-criteria design is
-specifically built to prevent.  Second, \code{ItemResult} is a plain
-\code{dataclass} rather than a dict so that downstream code --- the CI
-harness and any reporting step --- can access \code{.passed} with a boolean
-expression rather than a string key lookup, reducing the chance of a
-key-name typo silently treating a failure as a pass.  Third, \code{GEval}
-with \code{evaluation\_params} is used for citation coverage rather than a
-bespoke metric implementation: \code{evaluation\_params} constrains the
-judge's attention to only the specified fields of the test case, preventing
-the judge from using the \code{expected\_output} field as a shortcut and
-producing inflated scores.
+specifically built to prevent.  Second, \code{judge\_model} is typed as
+\code{object} rather than \code{str}; this signals to every caller that a
+\code{DeepEvalBaseLLM} instance is expected, not a bare model-name string,
+and prevents the \code{ValueError} that would otherwise surface only at
+runtime on non-OpenAI providers.  Third, \code{metric.reason or ""} guards
+against a \code{None} reason field: some metric implementations return
+\code{None} when the judge call succeeds but produces no rationale text,
+and a \code{None} reason stored in \code{ItemResult} causes downstream
+string formatting in the CI report to raise a \code{TypeError}.
 
 Item-level results are now available.  Before the harness can aggregate
 them into a pass/fail decision, it needs a machine-readable definition of
@@ -641,17 +696,16 @@ declaration, and readable by CI without parsing prose.
 \label{sec:success-criteria}
 %%------------------------------------------------------------
 
-The design problem is threshold drift: without an explicit, version-
-controlled definition of what constitutes a passing score, thresholds tend
-to migrate toward whatever the system currently achieves.  The engineer
-running CI notices a score of 0.79 against a 0.80 threshold, adjusts the
-threshold to 0.78 ``temporarily'', commits, and forgets.  Six months later
-the thresholds have been lowered four times and no longer reflect product
-quality requirements.  The naive approach of embedding thresholds as magic
-numbers inside test files or environment variables makes them invisible in
-code review.  The principle is that all thresholds live in a single,
-reviewed, immutable module that is the only file CI reads for pass/fail
-decisions.
+The design problem is threshold drift: without an explicit, version-controlled
+definition of what constitutes a passing score, thresholds tend to migrate
+toward whatever the system currently achieves.  The engineer running CI
+notices a score of 0.79 against a 0.80 threshold, adjusts the threshold to
+0.78 ``temporarily'', commits, and forgets.  Six months later the thresholds
+have been lowered four times and no longer reflect product quality
+requirements.  The naive approach of embedding thresholds as magic numbers
+inside test files or environment variables makes them invisible in code
+review.  The principle is that all thresholds live in a single, reviewed,
+immutable module that is the only file CI reads for pass/fail decisions.
 
 The implementation uses a \code{@dataclass(frozen=True)}: frozen prevents
 post-construction mutation, and \code{\_\_post\_init\_\_} validates that every
@@ -665,7 +719,7 @@ impossible.
     label={lst:success-criteria}]
 # src/eval/success_criteria.py
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 @dataclass(frozen=True)
 class SuccessCriteria:
@@ -674,17 +728,17 @@ class SuccessCriteria:
     answer_relevancy_min:   float = 0.80
     context_precision_min:  float = 0.75
     context_recall_min:     float = 0.80
-    # DeepEval per-item pass rates
+    # DeepEval per-item pass rate (fraction of items that pass)
     deepeval_pass_rate_min: float = 0.90
-    # Online judge (alert threshold; not a CI gate)
+    # Online judge — alert threshold only, not a CI gate
     online_faithfulness_alert: float = 0.70
 
     def __post_init__(self) -> None:
-        for field, val in self.__dataclass_fields__.items():
-            v = getattr(self, field)
+        for f in fields(self):
+            v = getattr(self, f.name)
             if not (0.0 <= v <= 1.0):
                 raise ValueError(
-                    f"Threshold {field}={v} must be in [0, 1]"
+                    f"Threshold {f.name}={v} must be in [0, 1]"
                 )
 
     def ragas_passes(self, scores: dict[str, float]) -> bool:
@@ -701,25 +755,28 @@ class SuccessCriteria:
     def deepeval_passes(self, results: list) -> bool:
         if not results:
             return False
-        passed = sum(1 for r in results if r.passed)
-        return (passed / len(results)) >= self.deepeval_pass_rate_min
+        n_passed = sum(1 for r in results if r.passed)
+        return (n_passed / len(results)) >= self.deepeval_pass_rate_min
 
 THRESHOLDS = SuccessCriteria()
 \end{lstlisting}
 
 Three decisions in Listing~\ref{lst:success-criteria} deserve explanation.
-First, \code{deepeval\_pass\_rate\_min} is a pass-rate fraction rather than
-a per-metric threshold, because DeepEval operates at item level: what matters
-for a CI gate is that no more than a specified fraction of items fail across
-all metrics, not that every metric achieves a certain mean.  Second,
-\code{online\_faithfulness\_alert} is defined in \code{SuccessCriteria} but
-is explicitly labelled as an alert threshold, not a CI gate; this places it
-under the same version control and code-review discipline as CI thresholds
-while making its different role explicit in the field name.  Third,
-\code{THRESHOLDS = SuccessCriteria()} creates a module-level singleton that
-every other module imports directly; this ensures that all consumers see the
-same values and that a change to any threshold triggers a visible diff on
-\code{src/eval/success\_criteria.py} in every pull request that touches it.
+First, \code{fields(self)} from the \code{dataclasses} standard library is
+used instead of \code{self.\_\_dataclass\_fields\_.items()}; the latter
+returns \code{(name, Field)} pairs where the \code{Field} object is not the
+current value, making it easy to accidentally validate the descriptor rather
+than the threshold.  \code{fields(self)} returns \code{Field} objects whose
+\code{.name} attribute is then passed to \code{getattr}, keeping the intent
+unambiguous.  Second, \code{deepeval\_pass\_rate\_min} is a pass-rate
+fraction rather than a per-metric threshold, because DeepEval operates at
+item level: what matters for a CI gate is that no more than a specified
+fraction of items fail across all metrics, not that every metric achieves a
+certain mean.  Third, \code{THRESHOLDS = SuccessCriteria()} creates a
+module-level singleton that every other module imports directly; this ensures
+that all consumers see the same values and that a change to any threshold
+triggers a visible diff on \code{src/eval/success\_criteria.py} in every pull
+request that touches it.
 
 With the threshold contract defined, the harness can now assemble the four
 layers into a single reproducible CI run.
@@ -730,8 +787,8 @@ layers into a single reproducible CI run.
 %%------------------------------------------------------------
 
 The design problem is that evaluation is not unit testing.  A unit test is
-deterministic, sub-second, and testing a function's contract.  An evaluation
-run is probabilistic, multi-minute, and measuring a statistical distribution
+deterministic, sub-second, and tests a function's contract.  An evaluation
+run is probabilistic, multi-minute, and measures a statistical distribution
 of outputs across a population of inputs.  Treating evaluation as a pytest
 test file --- one \code{assert} per item, failing the first assertion ---
 produces a misleading CI report: a single failing item halts the run,
@@ -747,7 +804,24 @@ to avoid exhausting provider rate limits), and compute RAGAS and DeepEval
 scores on the collected outputs before consulting \code{THRESHOLDS} for the
 final decision.  The pytest integration is thin: a single test function calls
 the harness and asserts on its boolean return value, so the full item-level
-report is available regardless of whether the test passes or fails.
+report is available in the CI log regardless of whether the test passes or
+fails.
+
+The runner function accepts the LLM, embeddings, and judge model as
+explicit parameters rather than constructing them internally.  This keeps
+the runner free of provider configuration so the test entry point can swap
+providers without modifying source, and so the runner can be exercised
+in isolation with deterministic stubs.
+
+\begin{notebox}
+The \code{run\_all\_items} function does not construct the \code{llm},
+\code{embeddings}, or \code{judge\_model} objects.  These are built at the
+test entry point (Listing~\ref{lst:test-eval-ci}) using \code{ChatLiteLLM}
+and \code{LangchainLLMWrapper}, then injected here.  This separation means
+the runner is testable in isolation: unit tests can pass
+\code{unittest.mock.AsyncMock} for the agent and stub objects for the
+LLM wrappers without touching any network.
+\end{notebox}
 
 \begin{lstlisting}[language=Python, caption={Evaluation runner: concurrent
     agent invocation with bounded parallelism},
@@ -755,6 +829,8 @@ report is available regardless of whether the test passes or fails.
 # src/eval/run_eval.py
 from __future__ import annotations
 import asyncio
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
 from src.eval.dataset_manager import fetch_dataset_at_version
 from src.eval.ragas_suite import build_ragas_dataset, run_ragas_suite
 from src.eval.deepeval_suite import run_deepeval_suite
@@ -762,105 +838,128 @@ from src.eval.success_criteria import THRESHOLDS
 
 MAX_CONCURRENT = 8
 
-async def _run_item(agent, item: dict, sem: asyncio.Semaphore) -> dict:
+async def _run_item(
+    agent, item: dict, sem: asyncio.Semaphore,
+) -> dict:
     async with sem:
         result = await agent.ainvoke(item["input"])
         return {**item, "run_output": result}
 
 async def run_all_items(
-    agent, version_ts: str
+    agent,
+    version_ts: str,
+    llm: LangchainLLMWrapper,
+    embeddings: LangchainEmbeddingsWrapper,
+    judge_model: object,
 ) -> tuple[bool, dict]:
-    items  = fetch_dataset_at_version(version_ts)
-    sem    = asyncio.Semaphore(MAX_CONCURRENT)
-    tasks  = [_run_item(agent, it, sem) for it in items]
-    run_results: list[dict | BaseException] = await asyncio.gather(
-        *tasks, return_exceptions=True
-    )
+    items = fetch_dataset_at_version(version_ts)
+    sem   = asyncio.Semaphore(MAX_CONCURRENT)
+    tasks = [_run_item(agent, it, sem) for it in items]
+    run_results = await asyncio.gather(*tasks, return_exceptions=True)
+
     ok_items = [r for r in run_results
                 if not isinstance(r, BaseException)]
-    failed   = len(run_results) - len(ok_items)
-    if failed > 0:
-        print(f"[eval] {failed} items raised exceptions; skipped.")
+    n_failed  = len(run_results) - len(ok_items)
+    if n_failed:
+        print(f"[eval] {n_failed} items raised exceptions; skipped.")
 
-    ragas_ds      = build_ragas_dataset(ok_items)
-    ragas_scores  = run_ragas_suite(ragas_ds, ...)
+    ragas_scores = run_ragas_suite(
+        build_ragas_dataset(ok_items), llm, embeddings)
 
-    deepeval_res  = run_deepeval_suite(
+    deepeval_res = run_deepeval_suite(
         ok_items,
-        judge_model=...,
+        judge_model=judge_model,
         faithfulness_threshold=THRESHOLDS.faithfulness_min,
         relevancy_threshold=THRESHOLDS.answer_relevancy_min,
     )
 
-    passed = (THRESHOLDS.ragas_passes(ragas_scores)
-              and THRESHOLDS.deepeval_passes(deepeval_res))
-    report = {"ragas": ragas_scores, "deepeval": deepeval_res,
-              "passed": passed, "skipped_items": failed}
+    passed = (
+        THRESHOLDS.ragas_passes(ragas_scores)
+        and THRESHOLDS.deepeval_passes(deepeval_res)
+    )
+    report = {
+        "ragas":         ragas_scores,
+        "deepeval":      deepeval_res,
+        "passed":        passed,
+        "skipped_items": n_failed,
+    }
     return passed, report
 \end{lstlisting}
 
 Three decisions in Listing~\ref{lst:eval-runner} deserve explanation.
 First, \code{asyncio.gather(..., return\_exceptions=True)} returns
 \code{BaseException} objects mixed into the result list rather than raising
-on the first failure; the type annotation \code{list[dict | BaseException]}
-and the subsequent filter make the mixed-type contract explicit rather than
-masking it.  An item that raises --- because the agent returned an
-unexpected schema or the provider timed out --- is logged and skipped rather
-than aborting the run, because the purpose of the harness is to collect
-data, and a partially complete run is more useful than no run.  Second,
-\code{MAX\_CONCURRENT = 8} is a module-level constant rather than an
-environment variable because it protects against provider rate limits and
+on the first failure; the subsequent \code{isinstance} filter makes the
+mixed-type contract explicit.  An item that raises --- because the agent
+returned an unexpected schema or the provider timed out --- is logged and
+skipped rather than aborting the run, because the purpose of the harness is
+to collect data, and a partially complete run is more useful than no run.
+Second, \code{MAX\_CONCURRENT = 8} is a module-level constant rather than
+an environment variable because it protects against provider rate limits and
 is a property of the evaluation workload, not the deployment environment;
-changing it requires a code review, not a secret rotation.  Third, the
-\code{...} placeholders for \code{llm}, \code{embeddings}, and
-\code{judge\_model} signal that those dependencies are injected at the call
-site --- the \code{run\_all\_items} function does not construct them
-internally, so the CI workflow can swap to a cheaper model without modifying
-source.
+changing it requires a code review, not a secret rotation.  Third,
+\code{llm}, \code{embeddings}, and \code{judge\_model} are explicit
+parameters so that the test entry point below owns the construction logic
+and the runner stays portable across providers.
 
-\begin{lstlisting}[language=Python, caption={pytest integration: a single
-    test that collects before asserting},
+\begin{lstlisting}[language=Python, caption={pytest entry point: dependency
+    construction and collect-before-assert},
     label={lst:test-eval-ci}]
 # src/tests/test_eval_ci.py
-import asyncio, os, pytest
-from src.eval.run_eval import run_all_items
-from src.agent.graph import build_agent          # project-specific
+import os
+import pytest
 from langchain_community.chat_models import ChatLiteLLM
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from src.eval.run_eval import run_all_items
+from src.agent.graph import build_agent
+from src.eval.deepeval_suite import LiteLLMJudge  # DeepEvalBaseLLM wrapper
 
-VERSION_TS = os.environ["EVAL_DATASET_VERSION"]
+VERSION_TS  = os.environ["EVAL_DATASET_VERSION"]
+JUDGE_MODEL = os.environ.get("EVAL_JUDGE_MODEL", "claude-haiku-4.5")
 
 @pytest.mark.asyncio
-async def test_eval_suite_passes():
+async def test_eval_suite_passes() -> None:
     agent      = build_agent()
-    passed, report = await run_all_items(agent, VERSION_TS)
-    # Always print the report so it appears in CI logs regardless
-    print(report)
+    llm        = LangchainLLMWrapper(
+                     ChatLiteLLM(model=JUDGE_MODEL))
+    embeddings = LangchainEmbeddingsWrapper(
+                     HuggingFaceEmbeddings(
+                         model_name="BAAI/bge-small-en-v1.5"))
+    judge      = LiteLLMJudge(model=JUDGE_MODEL)
+
+    passed, report = await run_all_items(
+        agent, VERSION_TS, llm, embeddings, judge)
+
+    print(report)   # always visible in pytest -s and CI captured output
+    n_passed = sum(r.passed for r in report["deepeval"])
+    n_total  = len(report["deepeval"])
     assert passed, (
-        f"Evaluation suite failed.\n"
-        f"RAGAS scores: {report['ragas']}\n"
-        f"DeepEval pass rate: "
-        f"{sum(r.passed for r in report['deepeval'])}"
-        f"/{len(report['deepeval'])}\n"
-        f"Skipped items: {report['skipped_items']}"
+        f"Evaluation suite FAILED\n"
+        f"  RAGAS scores      : {report['ragas']}\n"
+        f"  DeepEval pass rate: {n_passed}/{n_total}\n"
+        f"  Skipped items     : {report['skipped_items']}"
     )
 \end{lstlisting}
 
-Two decisions in Listing~\ref{lst:test-eval-ci} deserve explanation.  First,
-\code{print(report)} runs unconditionally before the \code{assert}: pytest
-captures stdout by default and includes it in the failure report, so the
-full metric breakdown appears in the CI log even when the assertion fails
---- the engineer does not need to re-run the suite to see which metrics
-missed their thresholds.  Second, \code{VERSION\_TS} is read from an
-environment variable rather than inlined; the GitHub Actions workflow sets
-this variable at job-start using a stored secret, so updating the pinned
-snapshot requires only rotating the secret, not modifying the test file and
-triggering an unrelated code review.
+Three decisions in Listing~\ref{lst:test-eval-ci} deserve explanation.
+First, \code{print(report)} runs unconditionally before the \code{assert}:
+pytest captures stdout and includes it in the failure report, so the full
+metric breakdown appears in the CI log even when the assertion fails --- the
+engineer does not need to re-run the suite to see which metrics missed their
+thresholds.  Second, \code{JUDGE\_MODEL} falls back to
+\code{"claude-haiku-4.5"} from an environment variable, making it trivially
+overridable in CI without modifying source; the default is a fast, cheap
+model from a different family than the typical agent model, preserving judge
+independence.  Third, the \code{LiteLLMJudge} wrapper imported from
+\code{deepeval\_suite} is the \code{DeepEvalBaseLLM} subclass discussed in
+\S\ref{sec:deepeval-metrics}; importing it here rather than constructing a
+raw model string is the type-safe pattern that surfaces provider resolution
+errors at import time rather than inside a long-running eval loop.
 
-\begin{lstlisting}[language=yaml, caption={GitHub Actions workflow: dataset
-    version pinning and cache-keyed artefact storage},
+\begin{lstlisting}[language=yaml, caption={GitHub Actions workflow: pinned
+    dataset version and compound cache key},
     label={lst:eval-workflow}]
 # .github/workflows/eval.yml
 name: Evaluation Suite
@@ -868,7 +967,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: "0 3 * * *"   # nightly against latest dataset version
+    - cron: "0 3 * * *"    # nightly against latest dataset state
 
 jobs:
   eval:
@@ -877,14 +976,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
-        with: {python-version: "3.12"}
+        with:
+          python-version: "3.12"
 
       - name: Restore RAGAS metric cache
         uses: actions/cache@v4
         with:
           path: .ragas-cache
-          key: ragas-${{ hashFiles('src/eval/success_criteria.py') }}-\
-${{ secrets.EVAL_DATASET_VERSION }}
+          key: >-
+            ragas-${{ hashFiles('src/eval/success_criteria.py') }}-
+            ${{ secrets.EVAL_DATASET_VERSION }}
 
       - name: Install dependencies
         run: pip install -e ".[eval]"
@@ -892,39 +993,46 @@ ${{ secrets.EVAL_DATASET_VERSION }}
       - name: Run evaluation suite
         env:
           EVAL_DATASET_VERSION: ${{ secrets.EVAL_DATASET_VERSION }}
-          LANGFUSE_PUBLIC_KEY:   ${{ secrets.LANGFUSE_PUBLIC_KEY }}
-          LANGFUSE_SECRET_KEY:   ${{ secrets.LANGFUSE_SECRET_KEY }}
-          LANGFUSE_BASE_URL:     ${{ secrets.LANGFUSE_BASE_URL }}
-          OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
+          EVAL_JUDGE_MODEL:     ${{ secrets.EVAL_JUDGE_MODEL }}
+          LANGFUSE_PUBLIC_KEY:  ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY:  ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL:    ${{ secrets.LANGFUSE_BASE_URL }}
+          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
         run: pytest src/tests/test_eval_ci.py -v --tb=short
 \end{lstlisting}
 
-Two decisions in Listing~\ref{lst:eval-workflow} deserve explanation.
-First, the cache key combines a hash of \code{success\_criteria.py} with
-the dataset version secret: changing either the thresholds or the dataset
-snapshot invalidates the cache and forces a fresh metric computation,
-preventing a scenario where a threshold is lowered and stale cached results
-that no longer reflect the new threshold are treated as valid.  Second, the
-workflow triggers on both pull requests and a nightly schedule; the scheduled
-run uses \code{secrets.EVAL\_DATASET\_VERSION} without pinning, which means
-it evaluates against the latest dataset state and catches silent regressions
-from LLM provider updates that do not touch any code.
+Three decisions in Listing~\ref{lst:eval-workflow} deserve explanation.
+First, the cache key uses the YAML \code{>-} block scalar (folded,
+strip-trailing-newline) rather than a backslash line continuation; a
+backslash is a shell continuation character, not a YAML one, and would be
+treated as a literal character in the key string, making cache hits
+impossible.  Second, the cache key combines a hash of
+\code{success\_criteria.py} with the dataset version secret: changing either
+the thresholds or the pinned dataset snapshot invalidates the cache and
+forces a fresh metric computation, preventing a scenario where stale cached
+results from a higher-threshold run are accepted under a lowered threshold.
+Third, \code{EVAL\_JUDGE\_MODEL} is exposed as a secret rather than
+hard-coded so the team can upgrade the judge model independently of the
+code --- useful when a new model family becomes available and the team wants
+to compare judge scores across a model transition without a code diff.
 
 \begin{tipbox}
-Store RAGAS metric results as a job artefact alongside the evaluation report
-JSON.  GitHub Actions retains artefacts for 90 days by default; a team that
-reviews quality weekly can compare consecutive runs without re-running the
-suite, and anomaly detection over the artefact history can flag metric
-trends before they reach the CI gate threshold.
+Upload the evaluation report JSON as a GitHub Actions artefact using
+\texttt{actions/upload-artifact} after the pytest step.  GitHub retains
+artefacts for 90 days by default; storing the per-item DeepEval results and
+RAGAS mean scores in a structured JSON file lets the team track metric
+trends over time and run anomaly detection across the artefact history
+without re-running the full suite.
 \end{tipbox}
 
 The evaluation infrastructure built in this chapter closes the quality loop:
 golden items are curated in Langfuse, online judges fire silently on every
 production trace, offline RAGAS and DeepEval suites gate every pull request,
 and the success-criteria contract prevents threshold drift.  The remaining
-open question is what happens when a test item reveals a failure that
+open question is what happens when an evaluation run reveals a failure that
 requires changing the agent's retrieval strategy --- a change that affects
-the entire system simultaneously rather than a single node.  Chapter~\ref{chap:advanced-rag}
-examines how to restructure the retrieval graph so that strategy changes are
-localised to a swappable subgraph rather than scattered across every node
-that touches a retriever.
+the entire system simultaneously rather than a single node.
+Chapter~\ref{chap:advanced-rag} examines how to restructure the retrieval
+graph so that strategy changes are localised to a swappable subgraph rather
+than scattered across every node that touches a retriever.
