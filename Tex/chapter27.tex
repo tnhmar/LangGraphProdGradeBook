@@ -1,0 +1,1054 @@
+%% ============================================================
+%% Chapter 27 — Resilience & Error Handling
+%% Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%
+%% Deep-review fixes applied (June 2026):
+%%   [F1]  wait_exponential_jitter signature corrected:
+%%         (initial, max, exp_base, jitter) — "max" kwarg, not "min"
+%%   [F2]  InMemorySaver is the current class name (langgraph.checkpoint.memory)
+%%         confirmed via official LangGraph reference docs example
+%%   [F3]  config_schema deprecated in LangGraph v0.6; context_schema is current
+%%   [F4]  Langfuse trace URL: from langfuse_handler.get_trace_id(), NOT config["run_id"]
+%%   [F5]  asynccontextmanager required (not contextmanager) for async node wrapping
+%%   [F6]  route_cascade success path returns END sentinel, not bare string "end"
+%%   [F7]  error_class="none" sentinel removed; field absent on happy path (NotRequired)
+%%   [F8]  reraise + retry_error_callback are mutually exclusive (Tenacity docs confirmed)
+%%   [F9]  NodeInterrupt is handled by LangGraph runtime, never reaches node except blocks
+%%   [F10] RetryPolicy is a native LangGraph add_node param — mentioned in notebox
+%%   [F11] add_conditional_edges path_map "__end__" -> END confirmed via reference docs
+%%   [F12] DeadLetterRecord.model_validate() is Pydantic v2 API; parse_obj() removed
+%%   [F13] failed_at timezone-aware assertion: tzinfo is not None (portable across impls)
+%% ============================================================
+
+\chapter{Resilience \& Error Handling}
+\label{chap:resilience}
+
+A production LLM agent fails in ways that a conventional API service does
+not. A conventional service either returns a result or raises a
+deterministic error; the retry-or-die decision is straightforward. An agent
+can fail at a vendor rate limit, at a content-policy boundary, at a network
+timeout, or at the recursion ceiling of its own graph---and each of these
+failure modes demands a qualitatively different response. Treating them all
+as HTTP~500 is the single most common cause of agent reliability incidents:
+a \code{RateLimitError} that deserves exponential back-off instead crashes
+the run; a \code{ContentPolicyViolationError} that should dead-letter
+immediately instead wastes quota retrying a prompt that will always be
+rejected. The cost is not only a bad user experience: a crashed run loses
+its checkpointed state, and the engineering team has no structured record of
+what went wrong or at which tier of the system.
+
+The solution in this chapter is organised into five layers. The
+\emph{retry layer} wraps individual LLM calls in Tenacity decorators whose
+backoff profiles are matched to the exception class they handle. The
+\emph{routing layer} expresses the distinction between retriable (soft)
+and terminal (hard) failures as LangGraph conditional edges, keeping routing
+logic at the graph level rather than hidden in node try/except blocks. The
+\emph{audit layer} snapshots every terminal failure into a typed
+\code{DeadLetterRecord} Pydantic model that lives in agent state and is
+linked to the Langfuse trace for that run. The \emph{observability layer}
+instruments each node with Prometheus counters and defines alerting rules
+that fire when per-node error rates breach a five-percent SLO budget. The
+\emph{degradation layer} assembles those nodes into a four-tier cascade ---
+full model, cheap model, static fallback, and escalation --- each tier
+activating only when the tier above it has been exhausted.
+
+The sections are ordered by dependency. The retry layer
+(\S\ref{sec:retries-depend-on-failure-type}) must come before the routing
+layer (\S\ref{sec:hard-vs-soft-branches}) because the routing layer reads
+the \emph{result} of exhausted retries: a node writes \code{error\_class}
+only after its Tenacity decorator has given up. The routing layer must come
+before the dead-letter section (\S\ref{sec:dead-letter-state}) because the
+dead-letter node is a routing destination, and its contract is only
+meaningful once the edges that lead to it are defined. Prometheus
+instrumentation (\S\ref{sec:error-budget-tracking}) follows the dead-letter
+section because the counters are incremented inside the dead-letter node
+itself. The degradation cascade (\S\ref{sec:degradation-cascade}) follows
+observability because its nodes are instrumented. The capstone
+(\S\ref{sec:capstone-resilient-agent}) assembles all prior sections and
+verifies each failure path with failure injection tests.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in this chapter}
+\label{tab:ch27-terms}
+\begin{tabular}{lp{9.5cm}}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\emph{soft failure} &
+  A transient, retriable error condition --- such as a vendor rate limit or
+  a network timeout --- where re-sending the same request after a delay has
+  a non-zero probability of succeeding. \\
+\emph{hard failure} &
+  A terminal, non-retriable error condition --- such as a content policy
+  violation --- where re-sending the same request will always produce the
+  same rejection. \\
+\emph{dead-letter state} &
+  A structured record of a terminal failure stored inside the agent's
+  checkpointed state, analogous to a dead-letter queue in message-broker
+  architectures, but queryable via graph state history. \\
+\emph{error budget} &
+  The fraction of requests that a system is allowed to fail while still
+  meeting its SLO; commonly expressed as $1 - \text{availability target}$
+  (e.g.\ a 99.95\% SLO gives a 0.05\% error budget). \\
+\emph{RetryError} &
+  The exception raised by Tenacity when all retry attempts are exhausted
+  and \code{reraise=False}; with \code{reraise=True} the original exception
+  class is re-raised instead, which is the preferred pattern for typed
+  exception flow. \\
+\emph{degradation cascade} &
+  A sequence of progressively cheaper fallback tiers, each activated only
+  when the tier above it has been exhausted, providing partial service
+  under conditions of full LLM unavailability. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+
+\begin{lstlisting}[language=bash, caption={Chapter 27 source tree},
+  label={lst:ch27-tree}]
+src/
+  resilience/
+    decorators.py     # Tenacity per-exception retry decorators (S27.1)
+    dead_letter.py    # DeadLetterRecord model + dead_letter_node (S27.3)
+  graph/
+    state.py          # AgentState TypedDict with error fields (S27.2)
+    routing.py        # route_after_llm, route_cascade (S27.2, S27.5)
+    degradation.py    # four-tier cascade nodes (S27.5)
+    agent.py          # build_resilient_graph factory (S27.6)
+  observability/
+    metrics.py        # Prometheus counters + instrument_node (S27.4)
+k8s/
+  alerts/
+    agent-slo.yaml    # PrometheusRule CRD (S27.4)
+tests/
+  fakes.py            # FailureInjector (S27.6)
+  test_resilient_agent.py  # failure injection tests (S27.6)
+\end{lstlisting}
+
+%%------------------------------------------------------------
+\section{Retries Depend on Failure Type}
+\label{sec:retries-depend-on-failure-type}
+%%------------------------------------------------------------
+
+The design problem here is that a single \code{@retry} decorator applied
+to all LLM call failures treats a vendor rate limit and a network timeout
+as if they were the same kind of problem. They are not: a
+\code{RateLimitError} is a contention problem shared across every pod in
+your deployment, and the canonical solution is \emph{full-jitter
+exponential backoff} --- waiting a random interval drawn from an
+exponentially growing window so that many pods do not retry in lockstep.
+A \code{Timeout} is a transient connection blip, and the appropriate
+response is a fast retry with modest additive jitter, not a 60-second wait.
+Applying the slower strategy to the faster error inflates p99 latency;
+applying the faster strategy to the rate-limit error amplifies the
+thundering herd that caused the limit in the first place. The principle is
+that each exception class requires its own retry decorator whose wait and
+stop parameters match the semantics of that specific failure mode.
+
+\emph{Tenacity} is a Python retry library whose composable primitives ---
+\code{wait}, \code{stop}, \code{retry}, and \code{before\_sleep} --- are
+passed as arguments to the \code{@retry} decorator factory. The \code{wait}
+argument controls the inter-attempt delay; the \code{stop} argument controls
+when to give up; the \code{retry} argument is a predicate that determines
+which exception types trigger a retry attempt. Two wait strategies are
+relevant here. \code{wait\_random\_exponential} implements the Full Jitter
+algorithm: each wait is drawn uniformly from
+\code{[min, multiplier * 2**n]}, where \code{n} is the attempt count;
+Tenacity's own documentation labels this strategy ``suitable for resolving
+contention between multiple processes for a shared resource'' and explicitly
+contrasts it with \code{wait\_exponential}, which uses fixed intervals and
+is ``not suitable'' for that case. \code{wait\_exponential\_jitter} uses
+the formula \code{min(initial * 2**n + random.uniform(0, jitter), max)} ---
+additive jitter on a deterministic exponential base --- and is appropriate
+for per-instance timeouts that are not shared across pods.
+
+Critically, \code{reraise} and \code{retry\_error\_callback} are mutually
+exclusive in Tenacity: the \code{Retrying} class documentation shows both
+as optional constructor arguments, but when \code{retry\_error\_callback}
+is set it takes precedence and \code{reraise} is ignored. The preferred
+pattern for typed exception flow is \code{reraise=True}, which re-raises
+the original exception class rather than Tenacity's \code{RetryError}
+wrapper --- the calling code can then inspect the exception's type to decide
+routing, rather than unwrapping a \code{RetryError} to find what it
+contains.
+
+\begin{lstlisting}[language=Python,
+  caption={Three decorators, three backoff profiles ---
+    \texttt{src/resilience/decorators.py}},
+  label={lst:tenacity-decorators}]
+import logging
+from tenacity import (
+    retry, stop_after_attempt,
+    wait_random_exponential,
+    wait_exponential_jitter,
+    wait_fixed,
+    retry_if_exception_type,
+    before_sleep_log, after_log,
+)
+from litellm.exceptions import (
+    RateLimitError, Timeout, APIConnectionError,
+)
+
+log = logging.getLogger(__name__)
+
+def rate_limit_retry(fn):
+    """Full-jitter backoff for RateLimitError (multi-pod safe)."""
+    return retry(
+        wait=wait_random_exponential(multiplier=1, min=2, max=60),
+        stop=stop_after_attempt(4),
+        retry=retry_if_exception_type(RateLimitError),
+        before_sleep=before_sleep_log(log, logging.INFO),
+        after=after_log(log, logging.WARNING),
+        reraise=True,
+    )(fn)
+
+def timeout_retry(fn):
+    """Additive-jitter exponential backoff for Timeout."""
+    return retry(
+        wait=wait_exponential_jitter(initial=1, max=15),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type(Timeout),
+        before_sleep=before_sleep_log(log, logging.WARNING),
+        reraise=True,
+    )(fn)
+
+def connection_retry(fn):
+    """Fixed short wait for APIConnectionError (transient TCP blips)."""
+    return retry(
+        wait=wait_fixed(1),
+        stop=stop_after_attempt(2),
+        retry=retry_if_exception_type(APIConnectionError),
+        reraise=True,
+    )(fn)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:tenacity-decorators} deserve
+explanation. First, \code{wait\_random\_exponential} is used for
+\code{RateLimitError} and \code{wait\_exponential\_jitter} for
+\code{Timeout}: the Full Jitter algorithm distributes retries uniformly
+across a wide window, preventing multiple pods from retrying simultaneously
+after the same rate-limit response. \code{wait\_exponential\_jitter} adds a
+smaller random term (\code{random.uniform(0, jitter=1.0)} by default) to a
+deterministic base, which is appropriate for per-instance timeouts where
+the pods are not competing for the same resource. The \code{wait\_exponential\_jitter}
+signature is \code{(initial, max, exp\_base, jitter)} --- both \code{max}
+and \code{jitter} are keyword arguments with defaults, so
+\code{wait\_exponential\_jitter(initial=1, max=15)} is a valid call that
+uses the default \code{jitter=1.0} and \code{exp\_base=2}. Second,
+\code{Timeout} and \code{APIConnectionError} are handled by separate
+decorators with different stop budgets:
+\code{stop\_after\_attempt(3)} for timeouts versus
+\code{stop\_after\_attempt(2)} for connection errors, because a connection
+that fails twice is more likely to indicate a dead host than a timeout that
+fails three times. Third, \code{before\_sleep\_log} fires before each sleep
+interval and logs the retry countdown; \code{after\_log} fires after each
+attempt and logs the outcome on exception --- both hooks are necessary for
+full retry observability without writing custom callbacks.
+
+\begin{notebox}
+  \textbf{LangGraph's native \code{RetryPolicy} vs.\ Tenacity decorators.}
+  Since LangGraph~0.2, \code{add\_node} accepts a \code{retry\_policy}
+  parameter of type \code{RetryPolicy} (from \code{langgraph.pregel.retry})
+  that provides coarse-grained node-level retries managed by the LangGraph
+  runtime. Tenacity decorators and \code{RetryPolicy} are complementary:
+  \code{RetryPolicy} retries the entire node (useful for transient
+  infrastructure failures), while Tenacity decorators retry a specific
+  async function call within a node (useful for per-call backoff with
+  exception-type discrimination). Do not use \code{RetryPolicy} as a
+  replacement for the per-exception Tenacity patterns in this section ---
+  \code{RetryPolicy} does not support different backoff profiles per
+  exception class.
+\end{notebox}
+
+Retries defer but do not eliminate failure: when a decorator exhausts all
+attempts and re-raises, the exception propagates out of the node. The graph
+must then decide what to do with it --- and that decision depends on whether
+the failure is retriable in principle or permanently terminal, which is the
+problem the routing layer resolves.
+
+%%------------------------------------------------------------
+\section{Failure Class Determines Routing, Not Just Handling}
+\label{sec:hard-vs-soft-branches}
+%%------------------------------------------------------------
+
+The design problem here is that putting \code{try/except} blocks inside a
+node and returning either a valid result or a sentinel value conflates two
+distinct responsibilities: the node is responsible for computation, and the
+graph is responsible for routing. When routing logic lives inside a node,
+it is invisible to LangGraph Studio's graph renderer, unavailable to
+time-travel replay, and untestable without invoking the full node function.
+The naive approach also requires the calling node to know the names of its
+own successors --- a coupling that makes graph restructuring expensive. The
+principle is that a node writes a typed \code{error\_class} field to state,
+and a conditional edge function reads that field and returns the name of the
+next node; routing logic lives entirely in the edge, not in the node.
+
+The state schema must accommodate this pattern without polluting happy-path
+state with error fields that are never set. \code{NotRequired} (from
+\code{typing\_extensions}, available in the Python 3.11+ stdlib as
+\code{typing.NotRequired}) allows a \code{TypedDict} field to be absent
+from the dict without triggering a type error. The node writes
+\code{error\_class} only on failure; on the happy path the field is absent,
+and the conditional edge's catch-all branch routes to \code{END}. The
+distinction between \code{"soft"} and \code{"hard"} maps directly to the
+taxonomy: a \code{RateLimitError} that exhausts its Tenacity budget is
+soft --- retriable in principle but exhausted in practice; a
+\code{ContentPolicyViolationError} (a subclass of LiteLLM's
+\code{BadRequestError}, HTTP~400) is hard --- re-sending the same prompt
+will always produce the same rejection.
+
+\begin{lstlisting}[language=Python,
+  caption={AgentState TypedDict and the routing edge function ---
+    \texttt{src/graph/state.py} and \texttt{src/graph/routing.py}},
+  label={lst:state-and-routing}]
+# src/graph/state.py
+from typing import Annotated, Literal
+from typing_extensions import NotRequired, TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+class AgentState(TypedDict):
+    messages:          Annotated[list[BaseMessage], add_messages]
+    error_class:       NotRequired[Literal["soft", "hard"]]
+    retry_attempts:    NotRequired[int]
+    tier_attempted:    NotRequired[int]
+    model_variant:     NotRequired[str]
+    prompt_tokens:     NotRequired[int]
+    completion_tokens: NotRequired[int]
+    dead_letter:       NotRequired[dict]   # DeadLetterRecord.model_dump()
+
+# src/graph/routing.py
+from typing import Literal
+from src.graph.state import AgentState
+
+def route_after_llm(
+    state: AgentState,
+) -> Literal["continue", "soft_fallback", "dead_letter"]:
+    match state.get("error_class"):
+        case "hard": return "dead_letter"
+        case "soft": return "soft_fallback"
+        case _:      return "continue"
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:state-and-routing} deserve explanation.
+First, \code{dead\_letter} is typed as \code{dict} rather than as
+\code{DeadLetterRecord}: LangGraph's checkpointer serialises state to JSON,
+and Pydantic models are not JSON-serialisable by default. The correct
+pattern is to store \code{record.model\_dump(mode="json")} in state and
+reconstruct the model with
+\code{DeadLetterRecord.model\_validate(state["dead\_letter"])} when reading
+it back --- the boundary between the Pydantic domain model and the JSON
+storage format is made explicit at the dead-letter node, not hidden in a
+custom JSON encoder. Second, \code{error\_class} does not include a
+\code{"none"} literal: when no error has occurred the field is simply absent
+from the dict, and the \code{case \_} arm of the \code{match} expression
+handles both absence and any unexpected value by routing to
+\code{"continue"}. Adding a \code{"none"} sentinel would require every node
+that does not set an error to explicitly write \code{error\_class="none"},
+introducing a correctness dependency between nodes that should be
+independent.
+
+\begin{warningbox}
+  \textbf{\code{NodeInterrupt} is not an error.}
+  LangGraph raises \code{NodeInterrupt} internally when a node calls
+  \code{interrupt()} to pause for human input. This exception is caught
+  by the LangGraph runtime before it reaches any node code: the state is
+  checkpointed and the run is suspended transparently. Do not add
+  \code{NodeInterrupt} to your exception hierarchy or attempt to catch it
+  in a node's \code{except} block --- the runtime handles it and your
+  handler will never fire.
+\end{warningbox}
+
+With the routing layer defined, the graph knows which terminal failures
+produce a \code{"dead\_letter"} routing decision --- but it has not yet
+defined what that destination does with the failed state, which is the
+responsibility of the audit layer.
+
+%%------------------------------------------------------------
+\section{Terminal Failures Require a Structured Audit Trail}
+\label{sec:dead-letter-state}
+%%------------------------------------------------------------
+
+The design problem here is that a crashed agent run produces an exception
+in a log file and nothing else: no structured record of which node failed,
+at what retry depth, with what messages in flight, linked to the
+observability trace that contains the full LLM call context. The naive
+approach of logging the exception and returning an error response means the
+engineering team reconstructs the failure from scattered log lines, and the
+prompt engineer has no way to correlate a bad model output with the Langfuse
+trace that recorded it. The principle is that every terminal failure must be
+snapshotted into a typed, immutable, auditable record stored inside the
+agent's checkpointed state --- where it is queryable via
+\code{get\_state\_history()}, survives pod restarts, and carries a direct
+link to the Langfuse trace for that run.
+
+\emph{Dead-letter state} is the agent-side analogue of a dead-letter queue
+in message-broker architectures: a terminal holding area for messages that
+could not be processed, retained for inspection and replay rather than
+discarded. The difference from a message-broker dead-letter queue is that
+the record lives in the graph's checkpointed state, not in a separate
+broker, so it travels with the rest of the conversation history and is
+accessible through the same \code{get\_state()} API used for normal state
+inspection. The record is defined as a Pydantic \code{BaseModel} with
+\code{ConfigDict(frozen=True)} because dead-letter records are immutable
+audit artefacts: once created, no field should be writable, and
+\code{frozen=True} enforces this at the instance level while also making
+the model hashable (Pydantic v2 behaviour).
+
+\begin{lstlisting}[language=Python,
+  caption={DeadLetterRecord Pydantic model ---
+    \texttt{src/resilience/dead\_letter.py}},
+  label={lst:dead-letter-record}]
+from datetime import datetime, timezone
+from typing import Literal
+from pydantic import BaseModel, ConfigDict, field_validator
+
+class DeadLetterRecord(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    node_name:              str
+    error_class:            Literal["hard", "soft"]
+    exception_type:         str
+    exception_message:      str          # truncated to 500 chars
+    retry_attempts:         int
+    failed_at:              datetime     # must be timezone-aware
+    thread_id:              str
+    langfuse_trace_id:      str | None
+    langfuse_trace_url:     str | None
+    last_messages_snapshot: list[dict]   # state["messages"][-3:]
+
+    @field_validator("exception_message")
+    @classmethod
+    def _truncate(cls, v: str) -> str:
+        return v[:500]
+
+    @field_validator("failed_at")
+    @classmethod
+    def _require_tz(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("failed_at must be timezone-aware")
+        return v
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:dead-letter-record} deserve explanation.
+First, \code{exception\_message} is truncated to 500 characters via a
+\code{@field\_validator}: LLM vendor error responses are frequently
+structured JSON payloads several kilobytes in size. Storing the raw message
+in the checkpointer risks exceeding column width limits of the underlying
+storage backend (Redis entries are bounded by the configured
+\code{maxmemory} policy, and the full payload is rarely needed for triage).
+Second, \code{failed\_at} is validated to be timezone-aware:
+\code{datetime.now()} without a \code{tz} argument returns a naive datetime
+that serialises to an ambiguous ISO~8601 string and sorts incorrectly in
+Langfuse's trace timeline. The \code{@field\_validator} catches naive
+datetimes at record-creation time rather than at query time.
+
+The dead-letter node must be exception-safe. If the dead-letter node raises
+an unhandled exception, LangGraph propagates it out of the graph entirely,
+bypassing the checkpointer and losing the state snapshot that contains the
+failure context. The node must wrap its entire body in \code{try/except
+Exception}, log any internal failure, and always return a state update ---
+even if that update contains only a partially populated record. This is the
+one location in the codebase where a broad except clause is correct.
+
+\begin{lstlisting}[language=Python,
+  caption={dead\_letter\_node: exception-safe state snapshot with Langfuse
+    trace link --- \texttt{src/resilience/dead\_letter.py} (continued)},
+  label={lst:dead-letter-node}]
+import logging
+from datetime import datetime, timezone
+from langchain_core.runnables import RunnableConfig
+from langfuse.callback import CallbackHandler
+from src.graph.state import AgentState
+
+log = logging.getLogger(__name__)
+
+async def dead_letter_node(
+    state: AgentState,
+    config: RunnableConfig,
+) -> dict:
+    try:
+        cfg       = config.get("configurable", {})
+        thread_id = cfg.get("thread_id", "")
+        callbacks = config.get("callbacks") or []
+        lf        = next(
+            (c for c in callbacks if isinstance(c, CallbackHandler)),
+            None,
+        )
+        trace_id  = lf.get_trace_id() if lf else None
+        trace_url = (
+            f"https://cloud.langfuse.com/trace/{trace_id}"
+            if trace_id else None
+        )
+        record = DeadLetterRecord(
+            node_name=state.get("_node_name", "unknown"),
+            error_class=state.get("error_class", "hard"),
+            exception_type=state.get("_exception_type", "unknown"),
+            exception_message=state.get("_exception_message", ""),
+            retry_attempts=state.get("retry_attempts", 0),
+            failed_at=datetime.now(timezone.utc),
+            thread_id=thread_id,
+            langfuse_trace_id=trace_id,
+            langfuse_trace_url=trace_url,
+            last_messages_snapshot=[
+                m.model_dump() for m in state["messages"][-3:]
+            ],
+        )
+        return {"dead_letter": record.model_dump(mode="json")}
+    except Exception:
+        log.exception("dead_letter_node failed internally")
+        return {"dead_letter": {"error": "dead_letter_node_failed"}}
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:dead-letter-node} deserve explanation.
+First, the Langfuse \code{CallbackHandler} is retrieved from
+\code{config["callbacks"]} rather than from a module-level global: the
+handler is injected at invocation time via the \code{RunnableConfig},
+making the node testable in isolation by passing a mock handler in the
+config's \code{callbacks} list. Second, \code{lf.get\_trace\_id()} returns
+the trace identifier assigned by Langfuse's SDK for the current run; the
+trace URL is constructed deterministically from this identifier, producing a
+direct link from the dead-letter record to the Langfuse trace that contains
+the full LLM call sequence. The Langfuse trace ID is not available via
+\code{RunnableConfig["run\_id"]} --- that key does not exist in
+\code{RunnableConfig}; it is a common mistake to conflate LangSmith's
+run identifier with Langfuse's trace identifier, which are separate systems.
+Third, \code{last\_messages\_snapshot} stores at most three messages: the
+last three messages (the triggering user query, any preceding assistant turn,
+and the most recent tool result if present) are sufficient for triage, and
+storing the full history risks exceeding checkpointer storage limits in
+long-running sessions.
+
+\begin{notebox}
+  \textbf{Infrastructure metadata fields in state.}
+  The fields \code{\_node\_name}, \code{\_exception\_type}, and
+  \code{\_exception\_message} in the dead-letter node are written by each
+  LLM node before routing to dead-letter --- they are prefixed with an
+  underscore to signal infrastructure metadata rather than domain state,
+  and are \code{NotRequired} in \code{AgentState}. A production hardening
+  step is to replace them with a typed \code{FailureContext} sub-model
+  validated at the dead-letter node boundary.
+\end{notebox}
+
+A dead-letter record in state answers \emph{what} went wrong and
+\emph{where}. The question of \emph{how often} nodes fail, and whether
+the rate is approaching an SLO breach, requires a different instrument ---
+one that aggregates across runs and fires before the situation becomes an
+incident.
+
+%%------------------------------------------------------------
+\section{Error Rates Require Real-Time Measurement Against a Budget}
+\label{sec:error-budget-tracking}
+%%------------------------------------------------------------
+
+The design problem here is that examining dead-letter records one by one
+is reactive: by the time an engineer opens a Langfuse trace, a node may
+have been failing at thirty percent for twenty minutes. The naive approach
+of setting an alert on raw error count is equally wrong in the opposite
+direction: an agent that processes 10,000 requests per hour and fails twice
+is healthy; an agent that processes four requests per hour and fails twice
+has a fifty-percent error rate and is broken. Alerting on rates, not counts,
+requires a measurement instrument that aggregates over a rolling time window
+--- which is exactly what \emph{Prometheus counters} and the \code{rate()}
+function provide.
+
+The distinction between a Prometheus \code{Counter} and a \code{Gauge} is
+load-bearing here. A \code{Gauge} represents a value that can go up or down
+(current queue depth, active connections). A \code{Counter} is monotonically
+increasing and represents an accumulated count of events (total requests,
+total errors). The \code{rate()} function in PromQL computes the
+per-second rate of increase of a \code{Counter} over a time window --- it
+requires a \code{Counter} specifically because a \code{Gauge}'s value
+jumping between scrapes would produce nonsensical rates. An SLO breach alert
+of the form ``error rate exceeds five percent over a five-minute window'' is
+expressed as the ratio of two \code{rate()} calls, which requires both the
+error counter and the total-calls counter to be \code{Counter} type.
+
+Because LangGraph nodes are \code{async def} functions, the context manager
+that wraps them must be an \code{@asynccontextmanager} from
+\code{contextlib} --- a sync \code{@contextmanager} cannot yield inside an
+\code{async with} block and raises a \code{RuntimeError} at the first
+attempt. The instrumentation wrapper uses \code{async with} semantics so
+that it wraps the full duration of an async node call, including all
+\code{await} points inside the node, without blocking the event loop.
+
+\begin{lstlisting}[language=Python,
+  caption={Prometheus counters and async instrumentation context manager ---
+    \texttt{src/observability/metrics.py}},
+  label={lst:prometheus-metrics}]
+from prometheus_client import Counter, Histogram
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+NODE_CALLS = Counter(
+    "agent_node_calls_total",
+    "Total calls to each agent node",
+    ["node_name"],
+)
+NODE_ERRORS = Counter(
+    "agent_node_errors_total",
+    "Total errors per agent node and error class",
+    ["node_name", "error_class"],
+)
+NODE_DURATION = Histogram(
+    "agent_node_duration_seconds",
+    "Node execution latency in seconds",
+    ["node_name"],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
+)
+
+@asynccontextmanager
+async def instrument_node(
+    node_name: str,
+) -> AsyncGenerator[None, None]:
+    NODE_CALLS.labels(node_name=node_name).inc()
+    with NODE_DURATION.labels(node_name=node_name).time():
+        try:
+            yield
+        except Exception as exc:
+            NODE_ERRORS.labels(
+                node_name=node_name,
+                error_class=_classify(exc),
+            ).inc()
+            raise
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:prometheus-metrics} deserve explanation.
+First, \code{NODE\_CALLS} uses only \code{node\_name} as a label, while
+\code{NODE\_ERRORS} uses both \code{node\_name} and \code{error\_class}:
+at the time the calls counter is incremented, the node has not yet executed
+and no error class is known. Adding \code{error\_class} to the calls counter
+would require a sentinel value (\code{"none"}) that inflates cardinality
+without adding information. The SLO alert's PromQL expression sums across
+the \code{error\_class} dimension of the errors counter automatically via
+the \code{rate()} aggregation. Second, the \code{Histogram} bucket ceiling
+of 60 seconds is deliberate: \code{prometheus\_client}'s default buckets top
+out at 10 seconds, which clips the distribution of long-running LLM calls
+and makes the 95th percentile unobservable for chain-of-thought invocations.
+
+\begin{lstlisting}[language=Python,
+  caption={Exception classifier for Prometheus labels ---
+    \texttt{src/observability/metrics.py} (continued)},
+  label={lst:exception-classifier}]
+from litellm.exceptions import (
+    RateLimitError, Timeout, APIConnectionError,
+    ContentPolicyViolationError,
+)
+
+def _classify(exc: BaseException) -> str:
+    if isinstance(exc, ContentPolicyViolationError):
+        return "hard"
+    if isinstance(exc, (RateLimitError, Timeout, APIConnectionError)):
+        return "soft"
+    return "unknown"
+\end{lstlisting}
+
+The \code{\_classify} function is kept in \code{metrics.py} rather than in
+\code{decorators.py} to avoid a circular import between
+\code{src/resilience/} and \code{src/observability/}. The three-value
+taxonomy (\code{"hard"}, \code{"soft"}, \code{"unknown"}) maps directly
+onto the \code{error\_class} field in \code{AgentState}, so Prometheus
+label values and state values are always consistent.
+
+\begin{lstlisting}[language=yaml,
+  caption={Prometheus alerting rule for SLO breach ---
+    \texttt{k8s/alerts/agent-slo.yaml}},
+  label={lst:slo-alert}]
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: agent-slo-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: agent.slo
+      interval: 30s
+      rules:
+        - alert: AgentNodeSLOBreach
+          expr: |
+            (
+              rate(agent_node_errors_total[5m])
+              /
+              rate(agent_node_calls_total[5m])
+            ) > 0.05
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: >-
+              Node {{ $labels.node_name }} error rate > 5%
+            description: >-
+              {{ $labels.node_name }} error rate
+              {{ $value | humanizePercentage }}
+              (error_class={{ $labels.error_class }}).
+              SLO threshold 5%. Window 5m.
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:slo-alert} deserve explanation. First,
+\code{for: 2m} requires the alert condition to remain true for two
+consecutive minutes before the alert fires: without this, a single
+anomalous 30-second scrape window produces a page, making the alert noisy
+enough to be ignored. Two minutes of continuous breach catches a node with
+a broken API key before it has degraded the user experience at scale while
+filtering single-window spikes. Second, the PromQL expression divides the
+\code{rate()} of the errors counter by the \code{rate()} of the calls
+counter rather than using a recording rule: recording rules reduce query
+cost at the expense of delayed visibility (the evaluation interval adds
+latency to alert detection). For a five-percent SLO breach, the additional
+compute cost of computing the ratio on each scrape is minimal.
+
+\begin{tipbox}
+  Add a Grafana dashboard panel for each node using
+  \code{rate(agent\_node\_errors\_total\{node\_name="llm\_primary"\}[5m])
+    /\allowbreak{} rate(agent\_node\_calls\_total\{node\_name="llm\_primary"\}[5m])}
+  as the query. Annotate the panel with deployment events using Grafana's
+  annotation API so that a rising error rate can be immediately correlated
+  with a new deployment or a provider-side incident.
+\end{tipbox}
+
+Knowing that a node's error rate is breaching five percent does not, by
+itself, give users a partial service. The degradation cascade converts that
+measurement into an automated response: when primary-tier errors exhaust
+their retries, the cascade activates progressively cheaper fallback tiers
+rather than failing immediately.
+
+%%------------------------------------------------------------
+\section{Service Degrades in Tiers, Not Binary On/Off}
+\label{sec:degradation-cascade}
+%%------------------------------------------------------------
+
+The design problem here is that a binary serve-or-fail architecture gives
+users no service at all during a partial outage. When the primary model's
+rate limit is saturated, every request fails; the user sees an error message
+and learns nothing about when service will be restored. The naive approach
+of a single fallback (primary fails, use cheap model) is better but still
+collapses to a hard failure when the cheap model is also unavailable. The
+principle is that service degrades through a sequence of progressively
+cheaper tiers, each tier activating only when the tier above it has been
+exhausted, so that the system provides the best available service under
+any degradation scenario rather than the worst.
+
+The four-tier cascade consists of: Tier~1, a full-capability model
+decorated with rate-limit and timeout retries; Tier~2, a cheaper, faster
+model with tighter retry budgets; Tier~3, a static fallback that returns
+a pre-written canned response without making any LLM call; and Tier~4,
+an escalation node that posts the failure context to an external webhook
+for human handling. Each tier is a separate LangGraph node rather than a
+conditional branch inside a single node. A loop inside one node would hide
+every tier boundary from Studio and the checkpointer: the \code{tier\_attempted}
+field in state would be unavailable until the loop terminated, and
+time-travel replay could not be initiated from within the loop. Each tier
+as a node means Studio renders every tier transition as a distinct step in
+the run timeline, and Prometheus labels errors by the exact node name.
+
+\begin{lstlisting}[language=Python,
+  caption={STATIC\_RESPONSES registry and cascade router ---
+    \texttt{src/graph/degradation.py}},
+  label={lst:static-responses-router}]
+from typing import Literal
+from langgraph.graph import END
+from src.graph.state import AgentState
+
+STATIC_RESPONSES: dict[str, str] = {
+    "default": (
+        "I am temporarily unable to process your request. "
+        "Please try again in a few minutes."
+    ),
+    "code": (
+        "Code generation is temporarily unavailable. "
+        "Please try again shortly."
+    ),
+    "search": (
+        "Search is temporarily unavailable. "
+        "Please try again shortly."
+    ),
+}
+
+def route_cascade(
+    state: AgentState,
+) -> Literal["llm_cheap", "static_fallback",
+             "escalate", "dead_letter", "__end__"]:
+    error = state.get("error_class")
+    tier  = state.get("tier_attempted", 0)
+    if error is None:    return "__end__"    # success at any tier
+    if error == "hard":  return "dead_letter"
+    match tier:
+        case 1: return "llm_cheap"
+        case 2: return "static_fallback"
+        case 3: return "escalate"
+        case _: return "dead_letter"        # unexpected depth -> dead-letter
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:static-responses-router} deserve
+explanation. First, \code{route\_cascade} returns the string
+\code{"\_\_end\_\_"} for the success case, not a custom \code{"end"} string:
+\code{"\_\_end\_\_"} is LangGraph's internal string constant for the
+\code{END} sentinel, and the \code{path\_map} argument to
+\code{add\_conditional\_edges} maps it to \code{END} directly. Returning
+any other string without registering it in the \code{path\_map} raises a
+\code{ValueError} at \code{compile()} time. Second, \code{route\_cascade}
+handles \code{error\_class="hard"} from \emph{any} tier: a hard failure can
+surface from the cheap model as well as the primary (the cheap model may
+also trigger a content policy violation), and routing it immediately to
+\code{"dead\_letter"} prevents the cascade from re-trying a permanently
+rejected prompt. Third, the \code{case \_} arm for an unexpected
+\code{tier\_attempted} value routes to \code{"dead\_letter"} rather than
+attempting another tier: an unexpected value indicates a state-corruption
+bug, and dead-lettering with a structured record is safer than continuing
+in an undefined state.
+
+Tier~3 is the static fallback, which deserves particular attention because
+it is the only tier that requires zero LLM calls. The fallback reads the
+last user message, applies keyword matching against the
+\code{STATIC\_RESPONSES} keys, and returns the corresponding canned
+response. The classification must not call an LLM: by definition, LLM
+infrastructure is unavailable or exhausted at this tier, and any call would
+fail for exactly the same reason the previous two tiers failed.
+
+\begin{lstlisting}[language=Python,
+  caption={static\_fallback\_node: LLM-free canned response ---
+    \texttt{src/graph/degradation.py} (continued)},
+  label={lst:static-fallback-node}]
+from langchain_core.messages import AIMessage
+
+async def static_fallback_node(state: AgentState) -> dict:
+    last_content = ""
+    for msg in reversed(state["messages"]):
+        if hasattr(msg, "content") and isinstance(msg.content, str):
+            last_content = msg.content.lower()
+            break
+    response_key = "default"
+    for key in STATIC_RESPONSES:
+        if key != "default" and key in last_content:
+            response_key = key
+            break
+    return {
+        "messages":       [AIMessage(content=STATIC_RESPONSES[response_key])],
+        "tier_attempted": 3,
+    }
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:static-fallback-node} deserve
+explanation. First, the message list is iterated in reverse to find the
+most recent user message: the last user message is most relevant to the
+current failure; iterating in reverse avoids scanning the full conversation
+history on every static-fallback invocation. Second, the function signature
+omits \code{config}: the static fallback makes no external calls and reads
+nothing from \code{RunnableConfig}. The LangGraph runtime will not pass
+\code{config} to nodes whose signature omits it, so removing the parameter
+from functions that do not need it reduces surface area for
+misconfiguration and makes the function's input contract explicit.
+
+\begin{warningbox}
+  \textbf{Tier~4 escalation and idempotency.}
+  The escalation node posts to an external webhook. If the graph is
+  retried by the caller (for example, a message-queue redelivery) after
+  the escalation node has already fired, the webhook will receive two posts
+  for the same thread. Make the webhook handler idempotent on
+  \code{thread\_id}: check whether an escalation record already exists for
+  that thread before creating a new one. The \code{dead\_letter} dict in
+  state contains the \code{thread\_id} and serves as the natural
+  idempotency key.
+\end{warningbox}
+
+With all five tiers and the routing logic defined, the remaining work is to
+wire them into a single compiled graph and demonstrate that each failure
+path routes correctly under artificial failure injection.
+
+%%------------------------------------------------------------
+\section{Every Failure Path Must Be Exercised Before Deployment}
+\label{sec:capstone-resilient-agent}
+%%------------------------------------------------------------
+
+The design problem here is that graph routing correctness cannot be verified
+by reading the graph definition: a wrong string in a \code{path\_map}
+argument, a missing \code{error\_class} write in a node, or an incorrect
+\code{match} arm in a router function all produce silent mis-routing rather
+than a startup error. The naive approach of manual testing exercises only
+the happy path. The principle is that the \emph{failure injection} pattern
+--- a drop-in \code{FailureInjector} object that raises a specified exception
+on every \code{acompletion} call, injected via the same \code{configurable}
+channel used for the real LiteLLM Router --- allows each failure path to be
+covered by a focused, deterministic \code{pytest} case without modifying
+graph code.
+
+The graph factory assembles all five nodes and both conditional edge
+functions into a compiled \code{StateGraph}. The \code{checkpointer}
+parameter accepts a \code{BaseCheckpointSaver} instance, which in tests is
+an \code{InMemorySaver} imported from \code{langgraph.checkpoint.memory} ---
+this is the class name shown in the official LangGraph reference
+documentation's \code{StateGraph} example; \code{MemorySaver} is an older
+alias that may still resolve but is not what current documentation shows.
+Each test case creates a fresh \code{InMemorySaver} instance and a unique
+\code{thread\_id} to prevent state bleed: \code{InMemorySaver} is a
+stateful object, and reusing the same instance with the same
+\code{thread\_id} across tests causes subsequent \code{ainvoke} calls to
+resume a previous run's state rather than starting fresh.
+
+\begin{lstlisting}[language=Python,
+  caption={build\_resilient\_graph factory ---
+    \texttt{src/graph/agent.py}},
+  label={lst:build-resilient-graph}]
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from src.graph.state import AgentState
+from src.graph.degradation import (
+    llm_primary_node, llm_cheap_node,
+    static_fallback_node, escalate_node, route_cascade,
+)
+from src.graph.routing import route_after_llm
+from src.resilience.dead_letter import dead_letter_node
+
+def build_resilient_graph(
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> "CompiledStateGraph":
+    b = StateGraph(AgentState)
+    b.add_node("llm_primary",     llm_primary_node)
+    b.add_node("llm_cheap",       llm_cheap_node)
+    b.add_node("static_fallback", static_fallback_node)
+    b.add_node("escalate",        escalate_node)
+    b.add_node("dead_letter",     dead_letter_node)
+    b.add_edge(START, "llm_primary")
+    b.add_conditional_edges(
+        "llm_primary", route_after_llm,
+        {"continue": END, "soft_fallback": "llm_cheap",
+         "dead_letter": "dead_letter"},
+    )
+    b.add_conditional_edges(
+        "llm_cheap", route_cascade,
+        {"__end__": END, "static_fallback": "static_fallback",
+         "escalate": "escalate", "dead_letter": "dead_letter"},
+    )
+    b.add_edge("static_fallback", END)
+    b.add_edge("escalate",        END)
+    b.add_edge("dead_letter",     END)
+    return b.compile(checkpointer=checkpointer)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:build-resilient-graph} deserve
+explanation. First, the \code{path\_map} for the \code{"llm\_cheap"}
+conditional edge uses \code{"\_\_end\_\_"} as the key mapping to \code{END}:
+this is the string constant that LangGraph's edge resolution expects when
+a conditional edge function returns the \code{END} sentinel value; any
+other unmapped string raises a \code{ValueError} at compile time.
+Second, \code{BaseCheckpointSaver} is the type annotation for the
+\code{checkpointer} parameter rather than a specific implementation: this
+makes the factory usable with any backend ---
+\code{InMemorySaver} in tests, a \code{RedisSaver} or
+\code{PostgresSaver} in production --- without changing the factory
+signature.
+
+\begin{lstlisting}[language=Python,
+  caption={FailureInjector and four failure-path test cases ---
+    \texttt{tests/fakes.py} and \texttt{tests/test\_resilient\_agent.py}},
+  label={lst:failure-injection-tests}]
+# tests/fakes.py
+from typing import Type
+
+class FailureInjector:
+    def __init__(self, exc_type: Type[Exception], msg: str = "injected"):
+        self._exc  = exc_type(msg)
+        self.calls = 0
+
+    async def acompletion(self, **kwargs) -> None:
+        self.calls += 1
+        raise self._exc
+
+# tests/test_resilient_agent.py
+import uuid, pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from litellm.exceptions import RateLimitError, ContentPolicyViolationError
+from src.graph.agent import build_resilient_graph
+from src.resilience.dead_letter import DeadLetterRecord
+from tests.fakes import FailureInjector
+
+def _cfg(injector) -> dict:
+    return {"configurable": {
+        "thread_id":  str(uuid.uuid4()),
+        "llm_router": injector,
+    }}
+
+@pytest.fixture
+def graph():
+    return build_resilient_graph(checkpointer=InMemorySaver())
+
+@pytest.mark.asyncio
+async def test_soft_failure_routes_to_cheap_tier(graph):
+    inj   = FailureInjector(RateLimitError)
+    state = await graph.ainvoke(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        config=_cfg(inj),
+    )
+    assert state.get("tier_attempted", 0) >= 1
+
+@pytest.mark.asyncio
+async def test_hard_failure_bypasses_cascade(graph):
+    inj   = FailureInjector(ContentPolicyViolationError)
+    state = await graph.ainvoke(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        config=_cfg(inj),
+    )
+    assert state.get("error_class") == "hard"
+    assert "dead_letter" in state
+    record = DeadLetterRecord.model_validate(state["dead_letter"])
+    assert record.error_class == "hard"
+    assert record.failed_at.tzinfo is not None   # timezone-aware
+
+@pytest.mark.asyncio
+async def test_cascade_exhaustion_reaches_escalate(graph):
+    inj   = FailureInjector(RateLimitError)
+    state = await graph.ainvoke(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        config=_cfg(inj),
+    )
+    assert state.get("tier_attempted") == 3
+
+@pytest.mark.asyncio
+async def test_dead_letter_record_validates(graph):
+    inj   = FailureInjector(ContentPolicyViolationError)
+    state = await graph.ainvoke(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        config=_cfg(inj),
+    )
+    record = DeadLetterRecord.model_validate(state["dead_letter"])
+    assert record.exception_type == "ContentPolicyViolationError"
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:failure-injection-tests} deserve
+explanation. First, \code{\_cfg} generates a new \code{uuid.uuid4()}
+\code{thread\_id} on every call: each invocation must have a unique thread
+identifier so that the \code{InMemorySaver} treats it as a new run rather
+than resuming the checkpointed state of a previous test case. A shared
+\code{thread\_id} across test cases causes \code{test\_cascade\_exhaustion}
+to resume from the state left by \code{test\_soft\_failure}, producing
+spurious assertions. Second, \code{DeadLetterRecord.model\_validate} is the
+Pydantic v2 API for constructing a model from a dict; \code{parse\_obj}
+(Pydantic v1) is removed in Pydantic v2. Third,
+\code{record.failed\_at.tzinfo is not None} is the portable assertion for
+timezone-awareness: \code{isinstance(v.tzinfo, timezone)} is overly specific
+because Pydantic may deserialise the datetime with a different
+\code{tzinfo} implementation (\code{datetime.timezone.utc} vs a
+\code{zoneinfo.ZoneInfo} instance) depending on the platform.
+
+\begin{tipbox}
+  Run the failure injection test suite in CI with
+  \code{pytest --asyncio-mode=auto -x tests/test\_resilient\_agent.py}.
+  The \code{-x} flag stops on the first failure: the tests are ordered by
+  cascade depth, so a failure in \code{test\_soft\_failure\_routes\_to\_cheap\_tier}
+  makes \code{test\_cascade\_exhaustion\_reaches\_escalate} meaningless.
+  Stopping immediately surfaces the root cause rather than masking it with
+  downstream assertion failures.
+\end{tipbox}
+
+The resilience architecture built in this chapter --- per-exception retries,
+typed failure routing, dead-letter state, SLO-aware Prometheus alerting, and
+a four-tier degradation cascade --- provides structural guarantees that
+individual agent runs fail gracefully and leave a structured record when they
+cannot recover. Chapter~28 addresses the complementary problem: ensuring
+that model outputs which \emph{do} arrive are safe, factually bounded, and
+compliant with content policy before they are returned to the user. Where
+this chapter asks ``did the model respond at all?'', Chapter~28 asks
+``should the model's response be forwarded?''
