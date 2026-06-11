@@ -1,8 +1,1062 @@
 %% ============================================================
 %%  Chapter 22 --- Durable Execution & Long-Running Workflows
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langgraph >= 0.2.0,
+%%                langgraph-checkpoint-postgres >= 0.1.0,
+%%                langchain-core >= 0.3.0,
+%%                pydantic >= 2.7.0,
+%%                fastapi >= 0.115.0,
+%%                asyncpg >= 0.29.0,
+%%                celery[redis] >= 5.4.0,
+%%                langgraph-sdk >= 0.1.0
 %% ============================================================
 
-\chapterquote{A workflow that cannot survive a restart was never production-ready.}{anon}
+\chapterquote{A system that loses its work when the process dies is not
+an agent. It is a script with ambitions.}{anon}
 
-% TODO: Chapter 22 content
+The production failure this chapter prevents is silent work loss. The
+approval workflow of Chapter~21 records every decision in an
+\code{InMemorySaver} checkpointer---an in-process \code{defaultdict}
+that exists only as long as the Python interpreter lives. A \code{SIGTERM}
+signal from a Kubernetes node eviction, an unhandled exception in an
+adjacent coroutine, or a routine deployment rollout terminates the process
+and erases every checkpoint. When the process restarts, \code{ainvoke}
+on the same \code{thread\_id} finds no prior state, silently begins a
+fresh run, and overwrites the execution history without a warning. An
+agent workflow that required ten minutes, three LLM calls, and two human
+approvals to reach its third milestone must be restarted from scratch. At
+scale---hundreds of concurrent long-running workflows, each spanning
+minutes to hours---this loss is not an edge case. It is a guarantee that
+every infrastructure event resets every active workflow simultaneously.
+
+The solution has four layers. The first is a \emph{persistence layer}:
+\code{AsyncPostgresSaver} replaces \code{InMemorySaver} as the graph's
+checkpointer, writing each state transition to a Postgres table that
+survives process termination. The second is a \emph{recovery layer}: a
+\code{RecoveryNode} placed at the graph's entry point queries the
+checkpointer at startup, locates the highest committed milestone for the
+current thread, and routes execution forward from that point rather than
+from \code{START}. The third is a \emph{dispatch layer}: a Celery task
+queue backed by Redis decouples the HTTP request lifecycle from graph
+execution, ensuring that a graph run deferred to a worker continues
+independently of the originating request and is retried automatically if
+the worker crashes before completion. The fourth is a \emph{managed
+alternative}: LangGraph Platform provides the first three layers as
+infrastructure, requiring only a single SDK call in deployments where
+self-hosting is not a requirement.
+
+The sections are ordered by the dependency each layer has on the one
+before it.
+Section~\ref{sec:durable-postgres} establishes the persistence layer
+first because the recovery layer has no durable checkpoints to query
+without it.
+Section~\ref{sec:durable-recovery} adds the \code{RecoveryNode} after
+persistence is established, because the node's contract---find the
+highest completed milestone and resume from its
+\code{CheckpointTuple.config}---requires
+\code{AsyncPostgresSaver.alist()} to be available.
+Section~\ref{sec:durable-celery} introduces the dispatch layer after
+recovery, because a Celery task that invokes the graph inherits both
+the persistence and recovery guarantees; the task's own retry contract
+is complementary to, not a replacement for, checkpoint-based recovery.
+Section~\ref{sec:durable-platform} presents the managed alternative
+after the self-hosted stack is fully established, so the trade-offs
+between the two models are concrete.
+Section~\ref{sec:durable-full} provides the integration test that
+exercises all four layers together by spawning three sequential
+subprocesses on the same \code{thread\_id} and asserting that execution
+resumes from the correct milestone after each termination.
+
+This chapter introduces seven terms defined in
+Table~\ref{tab:ch22-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~22}
+\label{tab:ch22-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{AsyncPostgresSaver} &
+  \code{from langgraph.checkpoint.postgres.aio import
+  AsyncPostgresSaver}; a \code{BaseCheckpointSaver} implementation
+  that persists checkpoints to a Postgres \code{checkpoints} table;
+  constructed via \code{async with
+  AsyncPostgresSaver.from\_conn\_string(dsn) as saver}; schema
+  initialised by \code{await saver.setup()} which runs idempotent
+  \code{CREATE TABLE IF NOT EXISTS} DDL on every call. \\
+\code{InMemorySaver} &
+  \code{from langgraph.checkpoint.memory import InMemorySaver};
+  the canonical name (as of LangGraph~0.2) for the in-process
+  checkpointer used in Chapters~19--21 under the alias
+  \code{MemorySaver}; all checkpoints are lost on process exit;
+  never suitable for production long-running workflows. \\
+\code{alist()} &
+  \code{checkpointer.alist(config,~*,~filter,~before,~limit)};
+  returns \code{AsyncIterator[CheckpointTuple]}; yields checkpoints
+  newest-first; each \code{CheckpointTuple} has \code{.checkpoint}
+  (a dict whose \code{"channel\_values"} key holds the full state),
+  \code{.metadata} (\code{source}, \code{step}, \code{writes}),
+  \code{.config} (with \code{checkpoint\_id}), and
+  \code{.parent\_config}. \\
+\code{CheckpointTuple} &
+  \code{from langgraph.checkpoint.base import CheckpointTuple};
+  the unit yielded by \code{alist()}; has no \code{.values} or
+  \code{.next} attributes---those belong to \code{StateSnapshot};
+  \code{.checkpoint["channel\_values"]} holds the state dict;
+  \code{.metadata["writes"]} is \code{dict[node\_name,
+  node\_return\_value]}, keyed by the registered node name that
+  produced the checkpoint. \\
+\code{RecoveryNode} &
+  A graph node placed immediately after \code{START} with a
+  conditional edge; queries \code{alist()} for the highest committed
+  milestone checkpoint; routes to the appropriate resume node when a
+  milestone is found, or to \code{research\_complete} when no
+  milestone exists; performs no LLM calls or external writes. \\
+\code{MILESTONE\_NODES} &
+  A \code{frozenset[str]} of \emph{registered node names} that
+  represent safe resume points; a checkpoint is a milestone checkpoint
+  when \code{metadata["writes"]} contains at least one key from
+  \code{MILESTONE\_NODES}; node names in this set must exactly match
+  the strings passed to \code{add\_node()} in \code{build\_durable\_graph()}. \\
+\code{acks\_late} &
+  A Celery task configuration flag; when \code{True}, the task
+  message is acknowledged (removed from the queue) only after the
+  task function returns, not when the worker receives it; prevents
+  silent task loss when a worker process is killed mid-execution;
+  must be set in both the \code{@task} decorator and
+  \code{celery\_app.conf.update()} to take effect in all broker
+  configurations. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+chapter22/
+  checkpointer.py        # §22.1 — lifespan_checkpointer,
+                         #          get_checkpointer
+  state.py               # §22.5 — DurableWorkflowState
+  recovery.py            # §22.2 — MILESTONE_NODES,
+                         #          find_resume_checkpoint,
+                         #          recovery_node,
+                         #          route_after_recovery
+  graph.py               # §22.5 — build_durable_graph,
+                         #          node functions
+  tasks.py               # §22.3 — celery_app,
+                         #          run_workflow_task
+  platform_runner.py     # §22.4 — create_background_run,
+                         #          poll_run_status
+  worker.py              # §22.5 — subprocess entry point,
+                         #          asyncio SIGTERM handler
+  test_three_restarts.py # §22.5 — three-subprocess harness
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{Durable State Outlives the Process That Wrote It}
+\label{sec:durable-postgres}
+%% ------------------------------------------------------------
+
+The design problem is the gap between when a checkpoint is written and
+when the process that wrote it is expected to still be running.
+\code{InMemorySaver}---the checkpointer used in Chapters~19 through~21
+for its zero-configuration convenience---stores every checkpoint in a
+Python \code{defaultdict} that exists only in the heap of the current
+process. The moment that process exits, for any reason, every checkpoint
+disappears. The naive mitigation is to catch \code{SIGTERM} and flush
+state before exiting; this works for graceful shutdowns but fails for
+\code{SIGKILL}, out-of-memory kills, and hardware failures, which are
+exactly the events a production container scheduler produces most
+frequently. The governing principle is that a checkpoint must be durable
+the instant it is written---the process that wrote it must be able to
+die the next millisecond without data loss.
+
+\code{AsyncPostgresSaver} achieves this by writing each checkpoint as a
+row in a Postgres \code{checkpoints} table inside the same transaction
+that the Pregel scheduler uses to advance the graph. Postgres's
+write-ahead log ensures that a committed row survives process termination,
+node eviction, and instance replacement without additional application-level
+flushing. The checkpointer is constructed via
+\code{async with AsyncPostgresSaver.from\_conn\_string(dsn) as saver}:
+\code{from\_conn\_string} is an \emph{async context manager}, meaning the
+\code{saver} object is only valid inside the \code{async with} block; the
+block must remain open for the lifetime of the process, not just for the
+duration of a single graph invocation. The correct placement is inside a
+FastAPI \code{lifespan} context, which opens on worker startup and closes
+on graceful shutdown.
+
+\code{setup()} must be called once per process startup, not once per
+graph invocation. It executes idempotent \code{CREATE TABLE IF NOT EXISTS}
+DDL that creates the \code{checkpoints}, \code{checkpoint\_blobs}, and
+\code{checkpoint\_migrations} tables when they do not yet exist. Calling
+it on every invocation is harmless but wasteful; calling it never means
+the first \code{ainvoke} on a freshly deployed instance raises a
+\code{UndefinedTableError} before writing the first checkpoint.
+
+\begin{lstlisting}[language=Python,
+  caption={AsyncPostgresSaver as a lifespan-scoped context manager;
+           get\_checkpointer factory with startup guard},
+  label={lst:durable-checkpointer}]
+# chapter22/checkpointer.py
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+_saver: AsyncPostgresSaver | None = None
+
+@asynccontextmanager
+async def lifespan_checkpointer(
+    dsn: str,
+) -> AsyncIterator[AsyncPostgresSaver]:
+    global _saver
+    async with AsyncPostgresSaver.from_conn_string(dsn) as saver:
+        await saver.setup()
+        _saver = saver
+        yield saver
+        _saver = None
+
+def get_checkpointer() -> AsyncPostgresSaver:
+    if _saver is None:
+        raise RuntimeError(
+            "Checkpointer not initialised. "
+            "Use lifespan_checkpointer() in FastAPI lifespan."
+        )
+    return _saver
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:durable-checkpointer} deserve
+explanation.
+\code{\_saver} is a module-level variable rather than a
+dependency-injection singleton because \code{AsyncPostgresSaver} holds
+an open connection pool that must be shared across all concurrent
+requests; constructing a new instance per request would exhaust the
+Postgres connection limit under load and would re-parse the DSN string---
+which may contain credentials---on every invocation. The
+\code{get\_checkpointer()} guard raises \code{RuntimeError} rather than
+silently returning \code{InMemorySaver()} as a fallback: a fallback would
+make the production failure mode (silent work loss) undetectable in
+staging environments that happen to start the checkpointer correctly; an
+explicit error surfaces the misconfiguration at the first graph invocation
+rather than at the first process restart when all work is already lost.
+
+\begin{notebox}
+Chapter~3~\S3.2 established \code{settings.POSTGRES\_DSN} as the
+canonical DSN source for this book's infrastructure. Pass it directly to
+\code{lifespan\_checkpointer(settings.POSTGRES\_DSN)}. Do not open a
+second \code{asyncpg} connection pool independently of the one managed by
+\code{AsyncPostgresSaver}; the checkpointer manages its own internal pool
+from the DSN string, sized separately from the application's query pool.
+\end{notebox}
+
+The wiring into FastAPI is a single \code{lifespan} context that nests
+\code{lifespan\_checkpointer} before yielding control to the application:
+
+\begin{lstlisting}[language=Python,
+  caption={FastAPI lifespan wiring: checkpointer opens on startup and
+           closes on shutdown},
+  label={lst:durable-lifespan}]
+# chapter22/app.py  (excerpt)
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from chapter22.checkpointer import lifespan_checkpointer
+from chapter22.settings import settings   # Ch.14 §14.3 AppSettings
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with lifespan_checkpointer(settings.POSTGRES_DSN):
+        yield   # application serves requests with checkpointer open
+
+app = FastAPI(lifespan=lifespan)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:durable-lifespan} deserve explanation.
+\code{lifespan\_checkpointer} is composed with the \code{app}'s lifespan
+via nesting rather than through a shared lifespan utility: FastAPI accepts
+exactly one \code{lifespan} callable per application instance, so all
+startup and shutdown logic must chain through that single callable;
+nesting \code{async with} blocks is the correct composition pattern and
+avoids the signal-handling conflicts that arise when multiple lifespan
+managers independently register \code{SIGTERM} handlers. The \code{yield}
+is bare---it carries no application state---because \code{get\_checkpointer()}
+provides the module-level access point; any handler that needs the
+checkpointer calls \code{get\_checkpointer()} directly, which avoids
+requiring every route handler to declare an injection dependency for a
+resource that most handlers never touch.
+
+The persistence layer is now in place: every checkpoint written by a
+graph run is durable from the moment of the \code{await}. The remaining
+problem is what happens when a new process starts and calls \code{ainvoke}
+on a \code{thread\_id} that already has prior durable state---the graph
+must resume from the highest completed milestone rather than restarting
+from \code{START}.
+
+
+%% ------------------------------------------------------------
+\section{A Restarted Process Must Resume, Not Restart}
+\label{sec:durable-recovery}
+%% ------------------------------------------------------------
+
+The design problem is the default behaviour of \code{ainvoke} when called
+on a thread that already has checkpoints. The Pregel scheduler loads the
+latest checkpoint for the given \code{thread\_id} and resumes from
+\code{StateSnapshot.next}---the set of nodes that had not yet completed
+when execution was last interrupted. If the process was killed cleanly
+between node completions, \code{.next} points to the correct resume node
+and no special handling is required. But if the process was killed
+mid-node or mid-checkpoint-write, the checkpoint is either absent or
+records a node that has partially executed its side effects. The naive
+fix---catching \code{SIGTERM} and hoping the checkpoint was already
+flushed---is a race condition. The governing principle is that a graph
+must resume only from a \emph{known safe milestone}: a node whose
+completion checkpoint is guaranteed consistent, not whatever the
+checkpoint table happens to record as the latest \code{.next}.
+
+\emph{Milestone nodes} are nodes whose completion represents a
+semantically coherent, externally observable unit of work: a research
+phase completed, a draft written, a review passed. Non-milestone nodes---
+routing helpers, state-mutation steps, intermediate sub-nodes---may
+produce incomplete checkpoints when a process dies mid-execution; re-running
+them from the top is safe because they are idempotent by the contract from
+Chapter~21~\S21.1. The \code{RecoveryNode} is placed immediately after
+\code{START}: it queries \code{AsyncPostgresSaver.alist()} for the highest
+committed milestone checkpoint, then routes execution directly to the node
+that follows that milestone, bypassing all nodes that have already
+completed safely.
+
+\code{alist(config)} returns an \code{AsyncIterator[CheckpointTuple]}
+yielding newest-first. Each \code{CheckpointTuple.metadata["writes"]} is
+a \code{dict[str,~Any]} mapping the \emph{registered node name} that
+produced the checkpoint to that node's return value. Checking whether any
+key in \code{metadata["writes"]} belongs to \code{MILESTONE\_NODES}
+identifies milestone checkpoints as a pure metadata operation---no state
+deserialisation is required.
+
+\begin{warningbox}
+Do not use \code{graph.get\_state\_history(config)} inside
+\code{RecoveryNode}. \code{get\_state\_history} returns
+\code{Iterator[StateSnapshot]}, which deserialises every checkpoint's
+full state values as it iterates. \code{alist()} reads only metadata
+until the caller accesses \code{.checkpoint["channel\_values"]}; in a
+thread with hundreds of checkpoints this is the difference between a
+recovery that takes milliseconds and one that deserialises megabytes of
+state before finding the first milestone.
+\end{warningbox}
+
+One constraint governs the relationship between \code{MILESTONE\_NODES}
+and the graph's node registry: every string in \code{MILESTONE\_NODES}
+must \emph{exactly} match the name passed to \code{b.add\_node(name,~fn)}
+in \code{build\_durable\_graph()}. \code{metadata["writes"]} is keyed by
+the registered node name, not by the function name. A mismatch between
+the frozenset and the registry produces a recovery scan that never finds a
+milestone and always restarts from \code{START}---silently and without
+any error.
+
+\begin{lstlisting}[language=Python,
+  caption={MILESTONE\_NODES frozenset and alist() newest-first
+           milestone scan returning CheckpointTuple},
+  label={lst:durable-find-checkpoint}]
+# chapter22/recovery.py
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.base import CheckpointTuple
+from langchain_core.runnables import RunnableConfig
+
+# Names must exactly match b.add_node() calls in build_durable_graph().
+MILESTONE_NODES: frozenset[str] = frozenset({
+    "research_complete",
+    "draft_complete",
+    "review_complete",
+})
+
+async def find_resume_checkpoint(
+    checkpointer: AsyncPostgresSaver,
+    thread_id:    str,
+) -> CheckpointTuple | None:
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id}
+    }
+    # Yields newest-first; first match is the highest milestone.
+    async for tup in checkpointer.alist(config):
+        writes: dict = tup.metadata.get("writes") or {}
+        if MILESTONE_NODES.intersection(writes.keys()):
+            return tup   # closes iterator immediately
+    return None
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:durable-find-checkpoint} deserve
+explanation.
+The function returns \code{CheckpointTuple~|~None} rather than
+\code{StateSnapshot}: \code{CheckpointTuple.config} carries the
+\code{checkpoint\_id} required to resume from that exact checkpoint,
+whereas obtaining the equivalent from a \code{StateSnapshot} would
+require first calling \code{graph.aget\_state(tup.config)}, which
+deserialises the full state; returning the raw tuple defers
+deserialisation to the caller and keeps the type unambiguous.
+\code{return tup} inside the \code{async for} loop closes the
+\code{alist()} iterator immediately: \code{AsyncPostgresSaver.alist()}
+uses server-side cursors that hold a Postgres transaction open until
+the iterator is exhausted or closed; an unreturned iterator that is
+simply abandoned holds that transaction open until the garbage collector
+finalises it, which under high concurrency exhausts the connection pool.
+
+With the milestone lookup established, the \code{RecoveryNode} is a
+thin wrapper that calls \code{find\_resume\_checkpoint()} and writes a
+\code{stage} routing signal into state. The checkpointer is passed as a
+parameter to \code{build\_durable\_graph()} and threaded into
+\code{recovery\_node} via a closure, avoiding any dependency on the
+module-level \code{get\_checkpointer()} singleton inside node bodies---
+node bodies should be free functions that receive all dependencies from
+the outside.
+
+\begin{lstlisting}[language=Python,
+  caption={RecoveryNode factory, stage extraction from milestone name,
+           and routing function for the conditional edge},
+  label={lst:durable-recovery-node}]
+# chapter22/recovery.py  (continued)
+from chapter22.state import DurableWorkflowState
+
+def make_recovery_node(checkpointer: AsyncPostgresSaver):
+    async def recovery_node(
+        state:  DurableWorkflowState,
+        config: RunnableConfig,
+    ) -> dict:
+        thread_id: str = (
+            (config.get("configurable") or {}).get("thread_id", "")
+        )
+        tup = await find_resume_checkpoint(checkpointer, thread_id)
+        if tup is None:
+            return {"stage": "init"}   # no prior milestone: start fresh
+        milestone = next(
+            k for k in (tup.metadata.get("writes") or {})
+            if k in MILESTONE_NODES
+        )
+        # "research_complete" -> "research", etc.
+        stage = milestone.replace("_complete", "")
+        return {"stage": stage}
+    return recovery_node
+
+def route_after_recovery(state: DurableWorkflowState) -> str:
+    return {
+        "init":     "research_complete",
+        "research": "draft_complete",
+        "draft":    "review_complete",
+        "review":   "synthesise_node",
+    }.get(state["stage"], "research_complete")
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:durable-recovery-node} deserve
+explanation.
+\code{make\_recovery\_node} is a factory that returns a closure over
+\code{checkpointer} rather than calling \code{get\_checkpointer()}
+directly inside the node body: this makes the checkpointer dependency
+explicit at graph-construction time, keeps \code{recovery\_node} a pure
+function of its arguments, and allows tests to inject a mock checkpointer
+without patching a module global. \code{recovery\_node} writes only
+\code{\{"stage":~stage\}} rather than replaying the full state from
+\code{tup.checkpoint["channel\_values"]}: the Pregel scheduler loads the
+correct full state from the checkpoint identified by
+\code{tup.config["configurable"]["checkpoint\_id"]} when it re-enters the
+resume node; writing the full state here would invoke all reducers
+unconditionally and risk overwriting values written by nodes that completed
+after the milestone. \code{route\_after\_recovery} is a module-level free
+function rather than a method because LangGraph's
+\code{add\_conditional\_edges} accepts a callable; a free function with a
+clear \code{DurableWorkflowState} signature is independently testable
+without any graph infrastructure.
+
+The recovery layer ensures a restarted process resumes from the correct
+milestone. The remaining problem is upstream: what guarantees that the
+original \code{ainvoke} call retries at all when the process that received
+the HTTP request is killed before the graph run completes?
+
+
+%% ------------------------------------------------------------
+\section{Long-Running Work Must Outlive the Request That Triggered It}
+\label{sec:durable-celery}
+%% ------------------------------------------------------------
+
+The design problem is the coupling between the HTTP request lifecycle and
+graph execution duration. A graph run spanning minutes is initiated by an
+HTTP \code{POST} request. A synchronous response requires the client to
+hold an open connection for the run's duration, which is impractical for
+any run longer than a load balancer's idle timeout. The naive fix---using
+\code{asyncio.create\_task()} to run the graph in the background and
+responding immediately with 202---decouples the client from the response
+but not the work from the process: if the worker process is killed while
+the graph runs in a background coroutine, the coroutine is silently dropped
+with no retry and no record in any queue. The governing principle is that a
+graph run which must survive the process that triggered it requires a
+\emph{durable task queue}: a system that persists the task message to an
+external store before any worker picks it up, so that a worker crash
+triggers automatic re-delivery to a healthy worker.
+
+\emph{Celery with a Redis broker} is the standard Python implementation
+of a durable task queue. When a caller invokes
+\code{run\_workflow\_task.apply\_async()}, Celery serialises the task
+arguments to JSON and writes the message to Redis before returning. A
+worker process picks up the message and begins executing the task function.
+The two durability guarantees are complementary and non-redundant: Celery
+guarantees the task function runs at least once even if the first worker
+dies mid-execution; \code{AsyncPostgresSaver} guarantees that if the
+Celery retry re-enters the graph on the same \code{thread\_id}, the
+\code{RecoveryNode} resumes from the last committed milestone rather than
+restarting from \code{START}. Without Celery, the task may never retry.
+Without the checkpointer, the retry restarts from \code{START}.
+
+Celery workers use a synchronous \code{prefork} process pool by default.
+The task function is an ordinary Python function, not a coroutine. To
+call the async \code{ainvoke} method, the task function must open a new
+event loop via \code{asyncio.run()}: this is the officially supported
+bridge between Celery's synchronous execution model and the async
+LangGraph runtime.
+
+\begin{warningbox}
+Do not use \code{celery[gevent]} with \code{asyncpg}. The \code{gevent}
+pool monkey-patches Python's socket layer at the process level;
+\code{asyncpg} uses \code{asyncio}'s native socket primitives and is not
+compatible with gevent's patched equivalents. The combination produces
+intermittent deadlocks under load that are difficult to reproduce in
+testing. Use the default \code{prefork} pool with \code{asyncio.run()}.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Celery app instantiation, run\_workflow\_task with
+           asyncio.run() bridge, self.retry() on transient failure},
+  label={lst:durable-celery-task}]
+# chapter22/tasks.py
+import asyncio
+from celery import Celery
+from celery.utils.log import get_task_logger
+from chapter22.settings import settings   # Ch.14 §14.3 AppSettings
+
+celery_app = Celery(
+    "chapter22",
+    broker=settings.REDIS_URL,
+    backend=settings.REDIS_URL,
+)
+logger = get_task_logger(__name__)
+
+@celery_app.task(
+    bind=True,
+    name="chapter22.tasks.run_workflow",
+    max_retries=3,
+    default_retry_delay=60,
+    acks_late=True,
+)
+def run_workflow_task(
+    self,
+    thread_id: str,
+    task:      str,
+) -> dict:
+    async def _run() -> dict:
+        from chapter22.checkpointer import lifespan_checkpointer
+        from chapter22.graph import build_durable_graph
+        from chapter22.state import DurableWorkflowState
+        async with lifespan_checkpointer(settings.POSTGRES_DSN) as cp:
+            graph = build_durable_graph(cp)
+            cfg   = {"configurable": {"thread_id": thread_id}}
+            # RecoveryNode routes: fresh state only used on init.
+            return await graph.ainvoke(
+                DurableWorkflowState(task=task, stage="init",
+                    research_done=False, draft_done=False,
+                    review_done=False, final_output=""),
+                config=cfg,
+            )
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        logger.warning("run_workflow_task transient failure: %s", exc)
+        raise self.retry(exc=exc)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:durable-celery-task} deserve
+explanation.
+\code{lifespan\_checkpointer} is opened inside the async \code{\_run()}
+helper rather than at module scope: each Celery \code{prefork} worker is
+a forked child process; an \code{asyncpg} connection pool opened in the
+parent process before \code{fork()} cannot be used in the child because
+the pool's file descriptors and event loop reference are copied but the
+underlying socket state is not safely shareable; opening the pool inside
+\code{asyncio.run()}---which creates a fresh event loop per task
+invocation---avoids this. Passing a fresh \code{DurableWorkflowState}
+as input on every call is safe because \code{RecoveryNode} runs first:
+when a prior checkpoint exists, \code{recovery\_node} writes the
+appropriate \code{stage} and the Pregel scheduler resumes from the
+milestone's checkpoint state, ignoring the initial-state values for all
+fields that have been committed; when no prior checkpoint exists,
+the initial state is used as-is. \code{self.retry(exc=exc)} re-raises
+the exception as a Celery retry signal rather than returning a default
+value: a task that catches an exception and returns normally signals
+success to Celery and stops all further retries; wrapping the exception
+in \code{self.retry()} preserves Celery's exponential backoff and
+\code{max\_retries} enforcement.
+
+\begin{lstlisting}[language=Python,
+  caption={Celery configuration block: acks\_late enforcement,
+           prefetch multiplier, result expiry},
+  label={lst:durable-celery-conf}]
+# chapter22/tasks.py  (continued)
+celery_app.conf.update(
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+    # Must also appear here; decorator acks_late alone is
+    # insufficient in some broker/transport configurations.
+    task_acks_late=True,
+    # Prevents one worker reserving N long tasks and starving others.
+    worker_prefetch_multiplier=1,
+    # Bound Redis memory: expire stored results after one hour.
+    result_expires=3600,
+)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:durable-celery-conf} deserve
+explanation.
+\code{worker\_prefetch\_multiplier=1} is the most consequential setting
+for long-running task queues: the default value of~4 allows each worker
+to pre-fetch and reserve four tasks simultaneously; a worker executing a
+ten-minute graph task while holding three reserved tasks prevents those
+three tasks from being picked up by any other worker for the full ten
+minutes, creating queue latency that grows linearly with task duration.
+\code{result\_expires=3600} bounds Redis memory use: without expiry,
+the result backend accumulates one stored result entry per completed task
+indefinitely; at hundreds of tasks per day this grows to gigabytes within
+weeks and is never automatically reclaimed by Redis's eviction policies
+unless a global \code{maxmemory-policy} is configured separately.
+
+The dispatch layer ensures graph runs are durable across worker crashes
+and are retried automatically. For teams operating on LangGraph Platform,
+these three layers---persistence, recovery, and dispatch---are provided
+as managed infrastructure, reducing the full stack to a single API call.
+
+
+%% ------------------------------------------------------------
+\section{Managed Infrastructure Compresses Three Layers to One Call}
+\label{sec:durable-platform}
+%% ------------------------------------------------------------
+
+The design problem for teams using LangGraph Platform is the operational
+overhead of maintaining three independent infrastructure components: a
+Postgres instance for checkpoints, a Redis instance for the Celery broker
+and result backend, and a worker fleet with correct \code{acks\_late}
+configuration. Each component requires capacity planning, connection pool
+tuning, schema migrations, and monitoring. The Platform provisions all
+three as managed services and exposes them through a single API primitive:
+the \emph{background run}. The governing principle is that the infrastructure
+concerns solved in Sections~\ref{sec:durable-postgres}
+through~\ref{sec:durable-celery} do not disappear on Platform---they are
+transferred to the operator---and understanding the self-hosted implementation
+makes the Platform's behaviour and limitations comprehensible rather than
+opaque.
+
+\code{AsyncLangGraphClient} is the Python SDK entry point for the LangGraph
+Platform API. A background run is created by calling
+\code{client.runs.create()} with the \code{thread\_id}, \code{assistant\_id},
+and input dict; the Platform queues the run on its internal worker fleet,
+persists the task durably, and returns a \code{run} object immediately.
+The \code{multitask\_strategy} parameter controls behaviour when a second
+run is submitted for a thread that is already active: \code{"enqueue"}
+queues it behind the current run; \code{"interrupt"} cancels the current
+run and starts the new one; \code{"rollback"} cancels and reverts state
+to the pre-run checkpoint; \code{"reject"} returns an error without
+starting a new run. For long-running sequential workflows where each
+invocation represents a distinct phase, \code{"enqueue"} is correct.
+
+\begin{lstlisting}[language=Python,
+  caption={LangGraph Platform background run creation and status
+           polling via AsyncLangGraphClient},
+  label={lst:durable-platform}]
+# chapter22/platform_runner.py
+from langgraph_sdk import AsyncLangGraphClient
+from chapter22.settings import settings
+
+async def create_background_run(
+    client:       AsyncLangGraphClient,
+    assistant_id: str,
+    thread_id:    str,
+    task:         str,
+) -> str:   # returns run_id
+    run = await client.runs.create(
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        input={"task": task},
+        multitask_strategy="enqueue",
+    )
+    return run["run_id"]
+
+async def poll_run_status(
+    client:    AsyncLangGraphClient,
+    thread_id: str,
+    run_id:    str,
+) -> str:   # "pending"|"running"|"success"|"error"|"timeout"|"interrupted"
+    run = await client.runs.get(thread_id, run_id)
+    return run["status"]
+
+def make_client() -> AsyncLangGraphClient:
+    return AsyncLangGraphClient(
+        url=settings.LANGGRAPH_API_URL,
+        api_key=settings.LANGGRAPH_API_KEY,
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:durable-platform} deserve explanation.
+\code{poll\_run\_status} returns the raw status string rather than mapping
+it to a Celery-compatible enum: the caller---typically a FastAPI status
+endpoint---presents the string to the client unchanged; a mapping layer
+would diverge whenever the Platform adds a new status value
+(e.g.,~\code{"interrupted"} was added after the initial release), requiring
+a code change to handle a state that the caller would otherwise propagate
+correctly by default. \code{make\_client()} is a factory function rather
+than a module-level singleton: \code{AsyncLangGraphClient} holds an
+\code{httpx.AsyncClient} that must be closed after use; a factory makes the
+client lifetime explicit at the call site and avoids the shared-mutable-state
+problem that a module singleton introduces in test environments where multiple
+clients with different credentials must coexist.
+
+\begin{notebox}
+Platform deployments do not require a \code{checkpointer=} argument in
+\code{compile()}. The Platform provisions \code{AsyncPostgresSaver}
+automatically and injects it into the compiled graph at runtime. Passing
+\code{checkpointer=} to \code{compile()} in a Platform deployment is
+silently ignored; the Platform's checkpointer always takes precedence.
+Chapter~23~\S23.1 adds \code{EncryptedSerializer} wrapping a self-hosted
+\code{AsyncPostgresSaver} for deployments where checkpoint data must not
+be readable by the database administrator.
+\end{notebox}
+
+The full self-hosted stack---persistence, recovery, and dispatch---and its
+managed equivalent are now both established. The remaining problem is
+verification: no amount of unit testing with \code{InMemorySaver} can
+confirm that the three layers compose correctly across real process
+boundaries. That requires a test that kills actual processes and inspects
+actual Postgres state between each termination.
+
+
+%% ------------------------------------------------------------
+\section{Correctness Is Proved by Killing the Process, Not Mocking It}
+\label{sec:durable-full}
+%% ------------------------------------------------------------
+
+The design problem is the gap between unit-tested checkpointing behaviour
+and actual process-boundary correctness. A unit test that mocks
+\code{ainvoke} and asserts that \code{find\_resume\_checkpoint} returns
+the expected tuple exercises the query logic in isolation but proves
+nothing about the sequence that matters in production: that the checkpoint
+is flushed to Postgres before the process exits, that a fresh process
+reading the same \code{thread\_id} finds the correct row, and that the
+graph resumes at the correct node rather than at \code{START}. The
+governing principle is that the integration test must exercise an actual
+process boundary---starting a subprocess, running it until it
+self-terminates after writing a milestone, and starting a second subprocess
+on the same \code{thread\_id}---with assertions on Postgres state between
+each invocation.
+
+The \code{DurableWorkflowState} schema carries a \code{stage} field
+written by each node to name the current phase. This field plays a dual
+role: it is the routing signal read by \code{route\_after\_recovery()}
+when selecting the resume node, and it is the assertion target in the
+test harness that confirms the correct milestone was committed before the
+subprocess terminated. The three boolean flags---\code{research\_done},
+\code{draft\_done}, \code{review\_done}---are written by their respective
+nodes and provide a per-field view of execution progress independent of
+the \code{stage} string, making assertion failures unambiguous: a failure
+on \code{draft\_done} while \code{research\_done} is \code{True}
+identifies exactly which phase was not committed.
+
+\begin{lstlisting}[language=Python,
+  caption={DurableWorkflowState and milestone node functions writing
+           stage and boolean flags},
+  label={lst:durable-state-nodes}]
+# chapter22/state.py
+from typing import TypedDict
+
+class DurableWorkflowState(TypedDict):
+    task:           str
+    stage:          str   # "init"|"research"|"draft"|"review"|"done"
+    research_done:  bool
+    draft_done:     bool
+    review_done:    bool
+    final_output:   str
+
+# chapter22/graph.py  (node functions)
+from langchain_core.runnables import RunnableConfig
+from chapter22.state import DurableWorkflowState
+
+async def research_complete(
+    s: DurableWorkflowState, _: RunnableConfig
+) -> dict:
+    return {"research_done": True, "stage": "research"}
+
+async def draft_complete(
+    s: DurableWorkflowState, _: RunnableConfig
+) -> dict:
+    return {"draft_done": True, "stage": "draft"}
+
+async def review_complete(
+    s: DurableWorkflowState, _: RunnableConfig
+) -> dict:
+    return {"review_done": True, "stage": "review"}
+
+async def synthesise_node(
+    s: DurableWorkflowState, _: RunnableConfig
+) -> dict:
+    return {"final_output": f"Done: {s['task']}", "stage": "done"}
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:durable-state-nodes} deserve
+explanation.
+Node function names match the strings in \code{MILESTONE\_NODES}
+exactly---\code{research\_complete}, \code{draft\_complete},
+\code{review\_complete}---because \code{build\_durable\_graph()} passes
+these function names to \code{b.add\_node()}: when Python registers
+\code{b.add\_node("research\_complete",~research\_complete)}, the
+\code{metadata["writes"]} key for that node's checkpoint will be the
+string \code{"research\_complete"}, which matches the frozenset entry;
+any deviation between the registered name and the frozenset entry
+silently prevents recovery from ever finding a milestone.
+\code{DurableWorkflowState} is a \code{TypedDict} rather than a Pydantic
+\code{BaseModel}: checkpoint serialisation by \code{JsonPlusSerializer}
+operates on plain dicts; a \code{TypedDict} round-trips through
+serialisation without requiring \code{.model\_dump()} / \code{model\_validate()},
+which is the correct type for values that live inside the Pregel
+checkpoint store.
+
+\begin{lstlisting}[language=Python,
+  caption={build\_durable\_graph: RecoveryNode factory, conditional
+           edge, and milestone node wiring},
+  label={lst:durable-build-graph}]
+# chapter22/graph.py  (continued)
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from chapter22.recovery import make_recovery_node, route_after_recovery
+
+def build_durable_graph(
+    checkpointer: AsyncPostgresSaver,
+) -> CompiledStateGraph:
+    b = StateGraph(DurableWorkflowState)
+    b.add_node("recovery",          make_recovery_node(checkpointer))
+    b.add_node("research_complete", research_complete)
+    b.add_node("draft_complete",    draft_complete)
+    b.add_node("review_complete",   review_complete)
+    b.add_node("synthesise_node",   synthesise_node)
+
+    b.add_edge(START, "recovery")
+    b.add_conditional_edges(
+        "recovery",
+        route_after_recovery,
+        {
+            "research_complete": "research_complete",
+            "draft_complete":    "draft_complete",
+            "review_complete":   "review_complete",
+            "synthesise_node":   "synthesise_node",
+        },
+    )
+    b.add_edge("research_complete", "draft_complete")
+    b.add_edge("draft_complete",    "review_complete")
+    b.add_edge("review_complete",   "synthesise_node")
+    b.add_edge("synthesise_node",   END)
+    return b.compile(checkpointer=checkpointer)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:durable-build-graph} deserve
+explanation.
+The \code{add\_conditional\_edges} destination dict enumerates all four
+possible return values of \code{route\_after\_recovery} explicitly:
+LangGraph's static analysis validates at \code{compile()} time that every
+string the routing function can return appears as a key in the dict; an
+undeclared return value raises \code{ValueError} at compile time, not at
+runtime, which surfaces routing bugs before the first invocation.
+\code{make\_recovery\_node(checkpointer)} is called at graph-construction
+time, closing over the \code{AsyncPostgresSaver} instance that was opened
+in \code{lifespan\_checkpointer}; this is the same instance used by the
+Pregel scheduler for its own checkpoint writes, ensuring that the
+recovery scan and the graph's checkpoint writes share the same connection
+pool and Postgres transaction semantics.
+
+The subprocess worker installs an asyncio-native \code{SIGTERM} handler
+before starting the graph run. The correct pattern for async processes
+uses \code{loop.add\_signal\_handler()}, which schedules a coroutine on
+the event loop when the OS delivers \code{SIGTERM}: because the callback
+runs inside the loop, it can \code{await} the in-flight \code{aput} call
+that the Pregel scheduler may have issued during the last node's checkpoint
+flush. Without this protection, a \code{SIGTERM} delivered during
+\code{aput} leaves a partial row in Postgres that subsequent reads may
+interpret as a corrupt checkpoint.
+
+\begin{warningbox}
+Never call \code{asyncio.shield()} or schedule a coroutine directly
+inside a synchronous signal handler registered with
+\code{signal.signal()}. Synchronous signal handlers run in the main
+thread between bytecodes---outside the event loop---and cannot schedule
+or \code{await} coroutines. The result is a \code{RuntimeError: no
+running event loop} that terminates the process before the checkpoint
+flush completes. Use \code{loop.add\_signal\_handler()} to register an
+async-compatible shutdown callback.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={worker.py: asyncio-native SIGTERM handler shielding the
+           in-flight checkpoint write; subprocess entry point},
+  label={lst:durable-worker}]
+# chapter22/worker.py
+import argparse, asyncio, os, signal, sys
+
+async def _shutdown(loop: asyncio.AbstractEventLoop) -> None:
+    tasks = [t for t in asyncio.all_tasks(loop)
+             if t is not asyncio.current_task()]
+    for t in tasks:
+        t.cancel()
+    # Shield the gather from outer cancellation so in-flight
+    # checkpoint writes (asyncpg aput) can complete cleanly.
+    await asyncio.shield(
+        asyncio.gather(*tasks, return_exceptions=True)
+    )
+    loop.stop()
+
+async def main(thread_id: str, task: str) -> None:
+    from chapter22.checkpointer import lifespan_checkpointer
+    from chapter22.graph import build_durable_graph
+    from chapter22.state import DurableWorkflowState
+    from chapter22.settings import settings
+
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(
+        signal.SIGTERM,
+        lambda: loop.create_task(_shutdown(loop)),
+    )
+    async with lifespan_checkpointer(settings.POSTGRES_DSN) as cp:
+        graph = build_durable_graph(cp)
+        cfg   = {"configurable": {"thread_id": thread_id}}
+        await graph.ainvoke(
+            DurableWorkflowState(task=task, stage="init",
+                research_done=False, draft_done=False,
+                review_done=False, final_output=""),
+            config=cfg,
+        )
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--thread-id", required=True)
+    p.add_argument("--task", default="Durability test")
+    args = p.parse_args()
+    asyncio.run(main(args.thread_id, args.task))
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:durable-worker} deserve explanation.
+\code{loop.create\_task(\_shutdown(loop))} is used inside the signal
+handler lambda rather than \code{asyncio.ensure\_future()}: in Python~3.10+,
+\code{asyncio.ensure\_future()} is deprecated in favour of
+\code{loop.create\_task()}, and inside a callback registered with
+\code{add\_signal\_handler} the loop is guaranteed to be running, making
+\code{create\_task} the correct and unambiguous call. \code{asyncio.shield()}
+wraps the \code{asyncio.gather()} inside \code{\_shutdown}: after task
+cancellation is requested, the event loop may itself receive a second
+cancellation from an outer scope (e.g., a timeout imposed by the OS or a
+parent process sending \code{SIGKILL} after \code{SIGTERM}); without
+\code{shield()}, that outer cancellation would abort the \code{gather}
+before all tasks have flushed their final writes. The \code{thread\_id}
+is passed as a CLI argument rather than an environment variable: the test
+harness spawns multiple subprocesses with different \code{thread\_id} values
+in the same test run; environment variables inherited across subprocesses
+would require explicit clearing between spawns, whereas CLI arguments
+are per-invocation and have no inheritance.
+
+\begin{lstlisting}[language=Python,
+  caption={Three-subprocess test harness: per-phase milestone assertion
+           via alist() and final completion assertion},
+  label={lst:durable-test}]
+# chapter22/test_three_restarts.py
+import asyncio, subprocess, sys, pytest
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from chapter22.recovery import MILESTONE_NODES
+from chapter22.settings import settings
+
+THREAD_ID = "durability-test-001"
+
+async def assert_milestone(dsn: str, thread_id: str,
+                            expected: str) -> None:
+    async with AsyncPostgresSaver.from_conn_string(dsn) as cp:
+        await cp.setup()
+        async for tup in cp.alist(
+            {"configurable": {"thread_id": thread_id}}
+        ):
+            writes = tup.metadata.get("writes") or {}
+            if MILESTONE_NODES.intersection(writes.keys()):
+                node = next(k for k in writes if k in MILESTONE_NODES)
+                assert node == expected, \
+                    f"Expected {expected!r}, got {node!r}"
+                return
+    pytest.fail(f"No milestone checkpoint found for {thread_id!r}")
+
+def _phase(stop_after_signal: bool = False) -> subprocess.CompletedProcess:
+    cmd = [sys.executable, "chapter22/worker.py",
+           "--thread-id", THREAD_ID, "--task", "Durability test"]
+    proc = subprocess.run(cmd, timeout=120)
+    # 0 = clean exit; -15 = SIGTERM before handler registered.
+    assert proc.returncode in {0, -15}, \
+        f"Unexpected exit code: {proc.returncode}"
+    return proc
+
+@pytest.mark.integration
+def test_three_restarts() -> None:
+    milestones = [
+        "research_complete",
+        "draft_complete",
+        "review_complete",
+    ]
+    for expected in milestones:
+        _phase()
+        asyncio.run(assert_milestone(
+            settings.POSTGRES_DSN, THREAD_ID, expected
+        ))
+    # Fourth run: no interruption; assert full completion.
+    proc = subprocess.run(
+        [sys.executable, "chapter22/worker.py",
+         "--thread-id", THREAD_ID, "--task", "Durability test"],
+        timeout=120,
+    )
+    assert proc.returncode == 0
+    async def _final():
+        async with AsyncPostgresSaver.from_conn_string(
+            settings.POSTGRES_DSN
+        ) as cp:
+            await cp.setup()
+            snap = await cp.aget(
+                {"configurable": {"thread_id": THREAD_ID}}
+            )
+            vals = snap.checkpoint["channel_values"]
+            assert vals["final_output"] != "", \
+                "final_output must be written after full completion"
+            assert vals["stage"] == "done"
+    asyncio.run(_final())
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:durable-test} deserve explanation.
+\code{@pytest.mark.integration} marks the test for selective execution:
+this test requires a live Postgres and Redis instance and sends actual
+\code{SIGTERM} signals; running it in a standard unit-test suite without
+infrastructure would fail or block; the \code{integration} marker allows
+\code{pytest -m "not integration"} to exclude it from CI pipelines that
+run unit tests only. The final assertion uses
+\code{cp.aget(\{"configurable":~\{"thread\_id":~...\}\})} rather than
+\code{alist()}: \code{aget()} returns the single latest
+\code{CheckpointTuple} without iteration, which is the correct call when
+the caller needs only the most recent state and not the full history;
+using \code{alist()} here and taking the first result would be
+equivalent but semantically misleading. \code{assert\_milestone} calls
+\code{cp.setup()} inside the assertion helper because the helper opens
+its own \code{AsyncPostgresSaver} context independent of any running
+worker process; calling \code{setup()} here is safe---it is idempotent---
+and removes the requirement that the schema already exists before the
+assertion runs, which could cause the first assertion call to fail with
+a \code{UndefinedTableError} in a freshly provisioned test database.
+
+The durability stack proved here---\code{AsyncPostgresSaver} checkpointing
+to Postgres, \code{RecoveryNode} resuming from the highest milestone,
+Celery deferring invocations through a durable task queue---provides the
+infrastructure foundation that Chapter~23 builds upon when adding
+encrypted checkpoint serialisation and multi-tenant thread isolation,
+where the correct
