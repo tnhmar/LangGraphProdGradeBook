@@ -1,8 +1,1148 @@
 %% ============================================================
 %%  Chapter 23 --- Observability with Langfuse
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langfuse >= 3.0.0,
+%%                langchain-core >= 0.3.0,
+%%                langgraph >= 0.2.0,
+%%                prometheus-client >= 0.20.0,
+%%                pydantic >= 2.7.0,
+%%                python >= 3.11
 %% ============================================================
 
-\chapterquote{You cannot improve what you cannot observe, and you cannot trust what you cannot trace.}{anon}
+\chapterquote{Invisible cost is not a billing problem. It is a design
+problem that billing makes visible.}{anon}
 
-% TODO: Chapter 23 content
+The production failure this chapter prevents is undetected cost
+accumulation in agentic cycles. An agent that executes thirteen nodes
+across a retrieval-augmented loop returns a correct result, raises no
+exception, and leaves no trace in application logs unless instrumentation
+was deliberately wired before the first deployment. The economic damage
+is not speculative: a single misconfigured routing edge that adds two
+extra LLM calls per session can double daily token spend before any
+engineer notices the invoice. The secondary failure is undifferentiated
+latency---a p99 slowdown that appears in the service dashboard cannot be
+attributed to a retrieval node, a long-running tool call, or a prompt
+that quietly grew by eight hundred tokens after a content-policy change,
+because without per-node traces there is no data to query.
+
+The solution has three complementary layers. The first is
+\emph{semantic tracing}: every LLM generation and every custom helper
+function emits a Langfuse observation that records its input, output,
+token counts, and prompt version, enabling Langfuse to compute
+per-trace cost automatically and to answer ``which prompt version drove
+this spike?''. The second is \emph{structural tracing}: LangGraph's
+callback system is wired so that every node invocation produces a
+Langfuse span without any instrumentation code inside node functions,
+and every invocation carries the thirteen mandatory fields of the cycle
+trace contract established in Chapter~1. The third is \emph{operational
+metrics}: a small set of Prometheus instruments---cycle count, error
+rate, HITL interrupt frequency, node latency---answer fleet-level
+rate questions that a trace viewer is not designed to answer, and a
+version-controlled Grafana dashboard makes those answers immediately
+visible to on-call engineers.
+
+The sections are ordered by dependency. Section~\ref{sec:obs-sdk-primitives}
+establishes the Langfuse SDK primitives so that every later section can
+call them with understood behaviour. Section~\ref{sec:obs-graph-tracing}
+wires the LangGraph callback integration, because the handler must
+exist before any node runs. Section~\ref{sec:obs-cycle-record} maps
+the thirteen mandatory cycle-trace fields onto Langfuse observations,
+because later sections read those fields for cost and audit purposes.
+Section~\ref{sec:obs-cost-tracking} shows how token counts flow from
+the LLM response into Langfuse's cost dashboard.
+Section~\ref{sec:obs-prompt-management} replaces inline prompts with
+versioned registry entries and links each generation to its prompt.
+Section~\ref{sec:obs-memory-audit} routes the memory governance events
+from Chapter~8 into the same Langfuse trace.
+Sections~\ref{sec:obs-prometheus} and~\ref{sec:obs-grafana} add
+the Prometheus layer and the four-panel Grafana dashboard.
+Section~\ref{sec:obs-full-integration} assembles all layers into a
+single runnable instrumented graph.
+
+This chapter introduces seven terms defined in Table~\ref{tab:ch23-terms}.
+
+\begin{table}[ht]
+\centering
+\caption{Observability terms introduced in Chapter~23}
+\label{tab:ch23-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\emph{Observation} &
+  A Langfuse record of a discrete unit of work: a span, a generation,
+  or an event. Observations nest to form a trace tree; the root
+  observation is the trace itself. \\
+\emph{Trace} &
+  The root container in Langfuse that groups all observations produced
+  by a single agent invocation. Identified by a \code{trace\_id} that
+  can be pre-seeded from the caller. \\
+\emph{Semantic tracing} &
+  Tracing the intent and output of a function, usually an LLM call or
+  business helper. Produced by the \code{@observe()} decorator or the
+  \code{start\_as\_current\_observation()} context manager. \\
+\emph{Structural tracing} &
+  Tracing the lifecycle boundary of a LangGraph node. Produced by
+  \code{CallbackHandler} injected via \code{RunnableConfig}; requires
+  no code inside node functions. \\
+\emph{Cycle trace record} &
+  A typed dataclass carrying the thirteen mandatory fields that every
+  node execution must record; defined in Chapter~1~\S1.9 as the
+  system-wide audit contract. \\
+\emph{Usage object} &
+  The dict \code{\{"input": int, "output": int, "total": int,
+  "unit": "TOKENS"\}} that Langfuse reads to compute generation cost
+  automatically from its model-price catalogue. \\
+\emph{Payload hash} &
+  A 16-character hex prefix of a SHA-256 digest over the
+  JSON-serialised node input or output. Stored in place of the full
+  payload to bound Langfuse storage without losing identity. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+src/
+  observability/
+    langfuse_setup.py        # §23.1 — client factory, observe patterns
+    graph_runner.py          # §23.2 — CallbackHandler + RunnableConfig
+    cycle_trace.py           # §23.3 — CycleTraceRecord + attachment
+    cost_tracking.py         # §23.4 — usage extraction + update
+    prompt_registry.py       # §23.5 — versioned prompt fetch
+    memory_audit_bridge.py   # §23.6 — audit event routing
+    prometheus_metrics.py    # §23.7 — Counter + Histogram instruments
+  agent/
+    instrumented_node.py     # §23.9 — complete instrumented node
+    graph_assembly.py        # §23.9 — graph wiring + invoke helper
+deploy/
+  grafana/
+    dashboards/
+      agent_observability.json  # §23.8 — four-panel provisioned dashboard
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{Every Observation Needs an Explicit Owner}
+\label{sec:obs-sdk-primitives}
+%% ------------------------------------------------------------
+
+The temptation when instrumenting an agent for the first time is to
+reach for Python's \code{logging} module, add INFO lines at node entry
+and exit, and treat structured tracing as a later-sprint concern. That
+path fails because log lines have no native concept of parent--child
+relationships, no cost-calculation engine, and no prompt-version
+linkage. By the time the cost problem is undeniable, retrofitting
+structured tracing into a logging-oriented codebase requires changing
+every function signature and adding context propagation where none was
+designed. The governing principle is that every unit of work must have
+an explicit observation owner from day one---a Langfuse span or
+generation object whose lifetime exactly matches the work it describes.
+
+Langfuse's Python SDK (version~3 and later) provides three interoperable
+ways to create observations, each suited to a distinct context. The
+\emph{observe decorator} wraps a function and automatically records its
+arguments, return value, timing, and any unhandled exception.
+The \emph{context manager}, \code{langfuse.start\_as\_current\_observation()},
+opens a span that becomes the active OpenTelemetry context for its
+\code{with} block, automatically parenting all nested observations created
+inside it; the \code{as gen} reference gives the caller a live span object
+on which to call \code{update()} mid-execution. The \emph{manual
+observation}, \code{langfuse.start\_observation()}, creates a span
+without shifting the active context, which is the right choice for
+background jobs and APScheduler tasks that run outside any
+request-scoped context and must not be nested under a non-existent
+parent.
+
+All three approaches are interoperable across async boundaries. The SDK
+uses OpenTelemetry context propagation internally, so a \code{@observe()}
+-decorated function that calls a context-manager block inside it produces
+a correctly parented hierarchy without any manual thread-local management.
+
+The \code{Langfuse} client must be constructed once per process and shared
+everywhere. Its constructor reads credentials from the environment
+variables \code{LANGFUSE\_PUBLIC\_KEY}, \code{LANGFUSE\_SECRET\_KEY}, and
+\code{LANGFUSE\_HOST}, so no secret appears in source code. At process
+exit the SDK registers an \code{atexit} hook automatically, but services
+should also call \code{langfuse.shutdown()} in the application's explicit
+shutdown path so that the background ingestion buffer is flushed before
+the process is replaced rather than after.
+
+\begin{lstlisting}[language=Python,
+  caption={Singleton client factory; three observation patterns},
+  label={lst:obs-sdk-primitives}]
+# src/observability/langfuse_setup.py
+import atexit
+from functools import lru_cache
+from langfuse import Langfuse
+from langfuse.decorators import observe
+
+@lru_cache(maxsize=1)
+def get_langfuse() -> Langfuse:
+    return Langfuse()   # reads LANGFUSE_* env vars automatically
+
+def shutdown_langfuse() -> None:
+    get_langfuse().shutdown()
+
+atexit.register(shutdown_langfuse)
+
+# Pattern A: decorator — zero-touch function instrumentation
+@observe()
+def classify_intent(user_message: str, llm) -> str:
+    return llm.invoke(f"Classify: {user_message}").content
+
+# Pattern B: context manager — mid-execution metadata updates
+def run_retrieval(query: str, docs: list) -> None:
+    lf = get_langfuse()
+    with lf.start_as_current_observation(
+        name    = "retrieval",
+        as_type = "span",
+        input   = {"query": query},
+    ) as span:
+        # ... retrieval work ...
+        span.update(metadata={"doc_count": len(docs)})
+
+# Pattern C: manual observation — background / scheduler context
+def emit_background_event(memory_id: str) -> None:
+    lf  = get_langfuse()
+    obs = lf.start_observation(name="expiry_check", as_type="event")
+    # ... background work ...
+    obs.end(output={"memory_id": memory_id})
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:obs-sdk-primitives} deserve
+explanation. First, \code{get\_langfuse} is wrapped in
+\code{@lru\_cache(maxsize=1)}. The \code{Langfuse} constructor starts a
+background ingestion thread and initialises an OpenTelemetry tracer
+provider; constructing it per-request would create a new thread on every
+invocation, eventually exhausting the thread pool under load. The cache
+ensures exactly one client instance per process regardless of how many
+modules import \code{get\_langfuse}. Second, \code{shutdown\_langfuse}
+is registered with \code{atexit} in the module body, not only in a
+FastAPI lifespan handler. This guarantees the flush fires in test
+processes, CLI scripts, and worker processes where a lifespan handler
+may never be wired. Third, \code{span.update()} is called after the
+retrieval work completes rather than at construction time because only
+then is \code{doc\_count} known. The SDK accumulates updates and
+serialises them as a single payload when the context manager exits, so
+the timing of \code{update()} within the block has no effect on what
+Langfuse receives; the pattern reads naturally as ``enrich the span
+with data produced during the work it describes''.
+
+\begin{warningbox}
+\code{@observe()} captures the decorated function's argument list as the
+observation input. If the function receives a raw \code{AgentState}
+dictionary or a large \code{AIMessage} list, the full object is
+serialised and sent to Langfuse on every call. Wrap expensive arguments
+in a summary or pass the \code{capture\_input=False} flag to the
+decorator to avoid uploading kilobytes of state per node invocation.
+\end{warningbox}
+
+Semantic tracing covers individual functions. The next problem is
+tracing the structural shape of the LangGraph execution itself---the
+sequence of nodes, their durations, and their parent--child
+relationships---without writing any instrumentation code inside node
+bodies.
+
+
+%% ------------------------------------------------------------
+\section{Graph Structure Must Be Traced Outside Node Bodies}
+\label{sec:obs-graph-tracing}
+%% ------------------------------------------------------------
+
+The naive approach to LangGraph observability is to add a Langfuse call
+at the start and end of every node function. This couples observability
+to business logic in a way that is easy to introduce and nearly
+impossible to remove cleanly: every new node must receive the tracing
+boilerplate, every tracing-strategy change requires editing every node,
+and any node that is omitted from the refactor produces silent trace
+gaps. The governing principle is that structural tracing belongs at the
+invocation boundary---between LangGraph and the node function---not
+inside the function itself.
+
+LangGraph threads a \code{RunnableConfig} object through every node
+invocation. The config carries a \code{callbacks} list whose handlers
+are notified at the start and end of each runnable's execution.
+Langfuse provides \code{CallbackHandler}---importable from
+\code{langfuse.langchain}---that implements LangChain's callback
+protocol and emits one Langfuse span per node invocation,
+automatically nesting child observations (embedded LLM calls, tool
+calls) under the correct parent span. The handler is passed to
+\code{graph.invoke()} or \code{graph.stream()} via the \code{callbacks}
+field of \code{RunnableConfig}; it is not a constructor argument to
+\code{StateGraph} and it is not attached to individual nodes.
+
+To bind session identity to every span in the invocation, call
+\code{langfuse.propagate\_attributes()} before the graph runs.
+Langfuse writes these values into the active OpenTelemetry context, and
+every observation created downstream---including those emitted by
+\code{CallbackHandler} for each node---inherits them automatically.
+
+\begin{warningbox}
+Construct a new \code{CallbackHandler} instance per graph invocation,
+never per process. A shared handler instance accumulates open-span
+state; when two concurrent requests share the same instance, their spans
+interleave inside a single Langfuse trace, producing a trace tree that
+is structurally invalid and unreadable. The handler is lightweight: its
+constructor performs no I/O, so creating one per request has no
+meaningful overhead.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Per-invocation \code{CallbackHandler} and attribute
+  propagation via \code{RunnableConfig}},
+  label={lst:obs-graph-tracing}]
+# src/observability/graph_runner.py
+from langchain_core.runnables import RunnableConfig
+from langfuse.langchain import CallbackHandler
+from src.observability.langfuse_setup import get_langfuse
+
+def run_graph_with_tracing(
+    graph,
+    state:      dict,
+    user_id:    str,
+    session_id: str,
+) -> dict:
+    lf      = get_langfuse()
+    handler = CallbackHandler()      # fresh instance per call
+    lf.propagate_attributes(
+        user_id    = user_id,
+        session_id = session_id,
+    )
+    config = RunnableConfig(
+        callbacks = [handler],
+        metadata  = {
+            "user_id":    user_id,
+            "session_id": session_id,
+        },
+    )
+    try:
+        return graph.invoke(state, config=config)
+    finally:
+        lf.shutdown()
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:obs-graph-tracing} deserve explanation.
+First, \code{lf.propagate\_attributes()} is called \emph{before}
+\code{graph.invoke()}, not after. The method writes values into the
+active OpenTelemetry context, which is inherited by every observation
+created during the downstream call. Calling it after \code{graph.invoke()}
+would inject attributes into a context that is already fully unwound,
+leaving every node span with a missing \code{user\_id} and
+\code{session\_id}. Second, \code{metadata} is populated in
+\code{RunnableConfig} even though \code{propagate\_attributes()} already
+handles the Langfuse path. \code{RunnableConfig.metadata} is consumed
+by LangGraph's Studio introspection, LangSmith tracing, and any node
+that calls \code{config.get("metadata", \{\})} to read request-scoped
+values; it must be present for full portability across the LangChain
+tooling stack.
+
+Graph nodes now emit structural spans automatically. The remaining
+problem is that those spans carry whatever metadata an individual developer
+happened to add---which, without a shared contract, produces an
+inconsistent trace corpus where cost queries and latency queries fail on
+nodes that simply forgot a field.
+
+
+%% ------------------------------------------------------------
+\section{Every Node Execution Must Carry a Standard Contract}
+\label{sec:obs-cycle-record}
+%% ------------------------------------------------------------
+
+When engineers instrument nodes independently, each adds the fields they
+consider relevant, and the result is a Langfuse instance where some
+spans carry latency, some carry a model name, and none carry all
+thirteen fields needed to answer the question ``which node, on which
+cycle, for which user, caused this cost spike?''. A style guide is not
+enforced at runtime and degrades under deadline pressure. The governing
+principle is that the span metadata contract is a typed dataclass
+assembled in a single factory function, making compliance automatic
+rather than cultural.
+
+Chapter~1~\S1.9 defined the thirteen-field \code{CycleTraceRecord}
+as the book's system-wide audit contract. The first four fields are
+identity and scoping fields that belong on the trace root:
+\code{trace\_id}, \code{cycle\_id}, \code{session\_id}, and
+\code{user\_id}. The next four are node-execution fields that belong on
+the node span: \code{node\_name}, \code{node\_input\_hash},
+\code{node\_output\_hash}, and \code{started\_at}. The final five
+capture generation performance: \code{ended\_at}, \code{latency\_ms},
+\code{llm\_model}, \code{input\_tokens}, and \code{output\_tokens}.
+
+Payload hashing deserves its own design explanation. Storing the full
+node input and output in Langfuse metadata would bloat every span with
+potentially thousands of tokens of JSON, making the Langfuse UI slow
+and storage costs significant. \code{node\_input\_hash} and
+\code{node\_output\_hash} are 16-character hex prefixes of SHA-256
+digests over the JSON-serialised payload. This is enough to verify
+identity---two identical inputs produce the same hash, enabling
+deduplication queries---without storing the payload itself. When the
+full payload is needed for debugging, it is retrievable from the
+LangGraph checkpoint store via \code{AsyncPostgresSaver.aget()}, which
+was established in Chapter~22~\S22.1.
+
+\begin{lstlisting}[language=Python,
+  caption={\code{CycleTraceRecord} dataclass and span attachment helper},
+  label={lst:obs-cycle-record}]
+# src/observability/cycle_trace.py
+import hashlib, json
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+@dataclass
+class CycleTraceRecord:
+    trace_id:          str
+    cycle_id:          str
+    session_id:        str
+    user_id:           str
+    node_name:         str
+    node_input_hash:   str
+    node_output_hash:  str
+    started_at:        datetime
+    ended_at:          datetime
+    latency_ms:        float
+    llm_model:         str
+    input_tokens:      int
+    output_tokens:     int
+
+def _hash16(obj: Any) -> str:
+    raw = json.dumps(obj, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+def build_cycle_trace(
+    state:     dict,
+    node_name: str,
+    start:     datetime,
+    end:       datetime,
+    model:     str,
+    usage:     dict[str, int],
+) -> CycleTraceRecord:
+    meta = state.get("meta", {})
+    return CycleTraceRecord(
+        trace_id         = meta.get("trace_id", ""),
+        cycle_id         = meta.get("cycle_id", ""),
+        session_id       = meta.get("session_id", ""),
+        user_id          = meta.get("user_id", ""),
+        node_name        = node_name,
+        node_input_hash  = _hash16(state.get("messages", [])),
+        node_output_hash = _hash16(state.get("output", "")),
+        started_at       = start,
+        ended_at         = end,
+        latency_ms       = (end - start).total_seconds() * 1000,
+        llm_model        = model,
+        input_tokens     = usage.get("input_tokens", 0),
+        output_tokens    = usage.get("output_tokens", 0),
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:obs-cycle-record} deserve explanation.
+First, \code{\_hash16} passes \code{default=str} to \code{json.dumps}.
+Real agent state dictionaries contain \code{datetime} objects, Pydantic
+models, and LangChain \code{AIMessage} instances---none of which the
+default JSON encoder handles. Passing \code{default=str} serialises
+them as their string representations, which is lossy for round-trip
+fidelity but entirely correct for the hash's purpose: verifying
+identity, not reconstructing the object. Second, \code{started\_at} and
+\code{ended\_at} are captured by the caller using
+\code{datetime.now(timezone.utc)} at the actual moment of node entry
+and exit, not from Langfuse's server-side timestamps. Langfuse's
+timestamps record when the span payload arrived at the ingestion API,
+which may be seconds or minutes after the node ran if the background
+flush queue is congested under load.
+
+The trace record captures what happened and when. The remaining problem
+is making Langfuse aware of what each generation \emph{cost}, so the
+cost dashboard activates automatically rather than requiring a separate
+accounting pipeline.
+
+
+%% ------------------------------------------------------------
+\section{Cost Must Flow Automatically from the Model Response}
+\label{sec:obs-cost-tracking}
+%% ------------------------------------------------------------
+
+The naive approach to cost tracking is a side-channel database table
+that stores token counts per request, joined with a price list managed
+as a configuration file. This architecture requires two synchronised
+updates every time a model changes its pricing---the price file and the
+accounting query---and the updates can arrive out of order, producing
+a window where costs are under- or over-reported. Langfuse eliminates
+the side channel: if a generation observation carries a \code{usage}
+object in the canonical format and a \code{model} string that matches
+an entry in Langfuse's model-price catalogue, cost is computed and
+aggregated automatically with no additional application code. The
+governing principle is that token counts belong on the generation
+observation in the exact format the platform expects, not in a
+secondary store.
+
+Langfuse's generation span exposes an \code{update()} method that
+accepts a \code{usage} parameter. That parameter must be a dict with
+the keys \code{"input"}, \code{"output"}, \code{"total"}, and
+\code{"unit"}. The value of \code{"unit"} must be the string literal
+\code{"TOKENS"}; any other value is treated as an opaque label and
+bypasses the cost-computation engine entirely---there is no error, just
+a silent gap in the dashboard. The \code{model} parameter must match a
+name in Langfuse's public model catalogue, or a custom entry registered
+via \code{langfuse.create\_model()} for fine-tuned or privately hosted
+models.
+
+LangChain and LiteLLM expose token counts on different response
+attributes. LangChain's \code{AIMessage} carries a \code{usage\_metadata}
+dict with keys \code{"input\_tokens"} and \code{"output\_tokens"}.
+LiteLLM's \code{ModelResponse} carries a \code{usage} object with
+attributes \code{prompt\_tokens} and \code{completion\_tokens}. A
+single extraction function normalises both shapes so that no node
+function needs to branch on the LLM provider.
+
+\begin{lstlisting}[language=Python,
+  caption={Usage extraction from two LLM response shapes; canonical
+  usage object construction; generation span update},
+  label={lst:obs-cost-tracking}]
+# src/observability/cost_tracking.py
+from typing import Any
+
+def extract_usage(response: Any) -> dict[str, int]:
+    # LangChain AIMessage.usage_metadata
+    if hasattr(response, "usage_metadata") and response.usage_metadata:
+        m = response.usage_metadata
+        return {
+            "input_tokens":  m.get("input_tokens", 0) or 0,
+            "output_tokens": m.get("output_tokens", 0) or 0,
+        }
+    # LiteLLM ModelResponse.usage
+    if hasattr(response, "usage") and response.usage:
+        u = response.usage
+        return {
+            "input_tokens":  getattr(u, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(u, "completion_tokens", 0) or 0,
+        }
+    return {"input_tokens": 0, "output_tokens": 0}
+
+def build_usage_object(raw: dict[str, int]) -> dict:
+    total = raw["input_tokens"] + raw["output_tokens"]
+    return {
+        "input":  raw["input_tokens"],
+        "output": raw["output_tokens"],
+        "total":  total,
+        "unit":   "TOKENS",
+    }
+
+def update_generation_span(
+    span, model: str, response: Any
+) -> dict[str, int]:
+    raw = extract_usage(response)
+    span.update(model=model, usage=build_usage_object(raw))
+    return raw
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:obs-cost-tracking} deserve
+explanation. First, both \code{getattr} calls and both \code{dict.get}
+calls use \code{or 0} after the fallback default. LiteLLM's
+\code{usage} fields and LangChain's \code{usage\_metadata} fields are
+optional; when the upstream provider does not return counts (as with
+some streaming responses where the final chunk has not yet arrived)
+the fields may be \code{None} rather than absent, and
+\code{getattr(u, "prompt\_tokens", 0)} on a \code{None}-valued
+attribute returns \code{None}, not \code{0}. The \code{or 0}
+guard ensures that downstream arithmetic never receives \code{None}.
+Second, \code{update\_generation\_span} returns the raw token dict.
+This allows the same call to satisfy both the Langfuse span and the
+\code{build\_cycle\_trace} factory from Section~\ref{sec:obs-cycle-record}
+without calling \code{extract\_usage} twice. Third, \code{build\_usage\_object}
+is a pure function separate from the span-update logic. This makes it
+testable in isolation: a unit test can assert that a given raw dict
+produces the correct \code{"TOKENS"} object without requiring a live
+Langfuse client.
+
+Token counts reach Langfuse automatically. The remaining problem is
+that raw token counts do not identify \emph{which prompt version}
+drove a cost change, because a prompt edit that doubles average output
+length is indistinguishable from a routing change that doubled call
+frequency unless the prompt's identity is recorded on the generation
+observation.
+
+
+%% ------------------------------------------------------------
+\section{Prompts Must Be Versioned Before They Reach the Model}
+\label{sec:obs-prompt-management}
+%% ------------------------------------------------------------
+
+A prompt stored as an inline Python f-string has no version, no
+deployment history, and no linkage to the generation that used it.
+When output quality degrades after an informal edit, the only
+diagnostic tool is \code{git blame}---which works only if the change
+was committed, cannot identify which production generations used the
+bad version, and offers no rollback that does not require a deployment.
+The governing principle is that prompts are configuration, not code:
+they must be stored in a registry, fetched at runtime by label, and
+attached to every generation observation so Langfuse can aggregate
+performance by prompt version without any additional application logic.
+
+Langfuse's prompt registry stores named, versioned templates.
+\code{langfuse.get\_prompt(name, label="production")} fetches the
+template currently tagged as production, caches it locally with a
+configurable TTL (default 60 seconds), and returns a
+\code{TextPromptClient} or \code{ChatPromptClient} object.
+\code{prompt.compile(**variables)} substitutes placeholders and returns
+the final string. \code{prompt.get\_langchain\_prompt()} returns a
+LangChain \code{ChatPromptTemplate} whose variable syntax is normalised
+from Langfuse's single-brace format to LangChain's double-brace format.
+
+\begin{warningbox}
+Langfuse template variables use single braces: \code{\{variable\}}.
+LangChain's \code{ChatPromptTemplate} uses double braces for its own
+variables. Always call \code{prompt.get\_langchain\_prompt()} when the
+result will be used with a LangChain chain; using \code{compile()} and
+passing the raw string will leave un-substituted placeholder text in the
+message that reaches the model---silently and without any error from
+LangChain.
+\end{warningbox}
+
+Attaching the prompt object to the generation is the step most
+developers omit. The attachment is a single \code{update()} keyword
+argument---\code{span.update(prompt=prompt\_client\_object)}---and once
+present, the Langfuse UI can filter all generations by prompt name and
+version, plot latency and cost per version side by side, and display a
+diff between any two versions. Without the attachment the prompt data
+exists in Langfuse's registry but the per-generation linkage is absent,
+and the cost dashboard shows only ``no associated prompt'' for every
+affected generation.
+
+\begin{lstlisting}[language=Python,
+  caption={Production-labelled prompt fetch with 5-minute cache;
+  LangChain-compatible variant; span attachment helper},
+  label={lst:obs-prompt-management}]
+# src/observability/prompt_registry.py
+from langfuse import Langfuse
+from src.observability.langfuse_setup import get_langfuse
+
+def get_production_prompt(
+    name:      str,
+    variables: dict,
+):
+    lf     = get_langfuse()
+    prompt = lf.get_prompt(
+        name,
+        label             = "production",
+        cache_ttl_seconds = 300,
+    )
+    compiled: str = prompt.compile(**variables)
+    return compiled, prompt   # caller uses prompt for span attachment
+
+def get_langchain_prompt(name: str):
+    lf     = get_langfuse()
+    prompt = lf.get_prompt(
+        name,
+        label             = "production",
+        cache_ttl_seconds = 300,
+    )
+    return prompt.get_langchain_prompt(), prompt
+
+def attach_prompt(span, prompt) -> None:
+    span.update(prompt=prompt)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:obs-prompt-management} deserve
+explanation. First, \code{cache\_ttl\_seconds=300} overrides the
+60-second default. The default is calibrated for development, where
+prompt edits should be visible quickly. In production, a 60-second
+window means an incident-response prompt rollback may not reach all
+running instances for up to a minute; 300 seconds provides a
+predictable, documentable window without requiring per-instance
+cache-invalidation signals. Second, both \code{get\_production\_prompt}
+and \code{get\_langchain\_prompt} return a \code{(compiled, prompt)}
+pair rather than only the compiled string. A function that returns only
+the string forces the caller to issue a second \code{get\_prompt()} call
+to obtain the object needed for \code{attach\_prompt}, producing an
+extra cache lookup or an extra API call during every node execution.
+
+Prompt versions are now linked to every generation. The remaining problem
+is a different class of observation: the memory governance events from
+Chapter~8, which must appear in the same Langfuse trace as the agent
+session that triggered them rather than as disconnected top-level traces.
+
+
+%% ------------------------------------------------------------
+\section{Audit Events Must Flow Into the Active Trace}
+\label{sec:obs-memory-audit}
+%% ------------------------------------------------------------
+
+When memory write and retrieval operations are emitted as top-level
+Langfuse traces rather than as observations nested under the current
+agent session, the Langfuse UI shows a fragmented picture: session
+traces with no memory context, and memory traces with no session
+context. Correlating them requires exporting both datasets and joining
+on \code{session\_id}---a manual operation that should never be
+necessary. The governing principle is that memory audit events are
+observations in the same trace as the agent invocation that caused them,
+not records in a parallel trace.
+
+Chapter~8~\S8.12 defined three audit dataclasses and their Langfuse
+emitter functions: \code{WriteAuditRecord} carries the outcome of a
+governed memory write; \code{RetrievalAuditRecord} carries the outcome
+of a narrowed memory retrieval; \code{ExpiryAuditRecord} carries the
+outcome of a scheduled deletion. Those classes exist in
+\code{src.agent.memory.audit} and must not be redefined here.
+Redefining them would create two schemas for the same concept that can
+drift apart silently when Chapter~8's module is updated.
+
+The bridge module in this chapter adds only the context-threading logic
+that Chapter~8 did not yet need: how to obtain the active Langfuse
+trace ID from the OpenTelemetry context and pass it to the emitter
+functions so they nest their observations under the right parent.
+\code{langfuse.get\_current\_trace\_id()} returns the trace ID of the
+observation currently active in the calling thread's context; inside a
+\code{graph.invoke()} call where \code{propagate\_attributes()} was
+called beforehand, this returns the session's root trace ID.
+
+\begin{notebox}
+\code{ExpiryAuditRecord} events are emitted by the APScheduler background
+job defined in Chapter~8~\S8.8, which runs in a separate thread outside
+any request-scoped OpenTelemetry context. Calling
+\code{get\_current\_trace\_id()} in that thread returns an empty string.
+These events must be emitted as standalone observations with no parent
+trace; passing an empty string as \code{trace\_id} to the Langfuse API
+creates an orphaned observation that cannot be located through normal
+session queries in some Langfuse versions.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={Audit bridge: trace-ID injection for session context;
+  background-safe standalone emission for expiry events},
+  label={lst:obs-memory-audit}]
+# src/observability/memory_audit_bridge.py
+from src.agent.memory.audit import (
+    ExpiryAuditRecord,
+    RetrievalAuditRecord,
+    WriteAuditRecord,
+    emit_expiry_audit,
+    emit_retrieval_audit,
+    emit_write_audit,
+)
+from src.observability.langfuse_setup import get_langfuse
+
+def emit_write_event(record: WriteAuditRecord) -> None:
+    lf       = get_langfuse()
+    trace_id = lf.get_current_trace_id()
+    emit_write_audit(record=record, lf=lf, trace_id=trace_id)
+
+def emit_retrieval_event(record: RetrievalAuditRecord) -> None:
+    lf       = get_langfuse()
+    trace_id = lf.get_current_trace_id()
+    emit_retrieval_audit(record=record, lf=lf, trace_id=trace_id)
+
+def emit_expiry_event(record: ExpiryAuditRecord) -> None:
+    lf = get_langfuse()
+    # No trace_id: APScheduler thread has no active span.
+    emit_expiry_audit(record=record, lf=lf)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:obs-memory-audit} deserve explanation.
+First, the three functions call \code{get\_langfuse()} independently
+rather than accepting a \code{Langfuse} argument. This would normally
+violate explicit dependency injection, but the \code{@lru\_cache}
+singleton in \code{langfuse\_setup} guarantees that all three calls
+return the same instance, so there is no resource overhead. More
+importantly, passing the client as an argument would expose the
+Langfuse dependency to every memory node function, coupling the memory
+subsystem to the observability subsystem. The bridge module is the
+only place that knows about both; calling the singleton keeps that
+coupling localised there. Second, \code{emit\_expiry\_event} omits the
+\code{get\_current\_trace\_id()} call entirely rather than calling it
+and discarding an empty string. In the APScheduler thread context,
+\code{get\_current\_trace\_id()} may return an empty string
+\emph{or} the stale trace ID of the last request that happened to run
+on the same OS thread before the scheduler task was scheduled---a
+non-deterministic value. Omitting the call prevents accidentally
+parenting an expiry event under a completely unrelated session trace.
+
+Session events and memory events now appear in one trace. The remaining
+problem is the class of question that a trace viewer is not designed to
+answer: what is the error rate of the \code{tool\_call\_node} right now,
+across all sessions, over the last five minutes?
+
+
+%% ------------------------------------------------------------
+\section{Operational Questions Require Their Own Instruments}
+\label{sec:obs-prometheus}
+%% ------------------------------------------------------------
+
+Langfuse is a trace viewer and cost analyser, not a time-series
+database. Its query interface is not built to answer ``what is the
+p99 latency for \code{retrieval\_node} between 14:00 and 15:00 across
+all users?'' in sub-second latency. Routing that question to Prometheus
+---a purpose-built time-series database with PromQL designed for rate
+and quantile calculations---keeps each system operating within its
+design envelope. The governing principle is that trace observations
+answer ``what happened in this session'' while Prometheus metrics answer
+``what is the fleet doing right now''.
+
+This chapter uses \code{prometheus\_client.Counter} and
+\code{prometheus\_client.Histogram} only, matching the constraint of
+the official Python client library. No custom aggregation class, no
+\code{Gauge} for values that reset on process restart (those produce
+misleading spikes after a redeploy), and no \code{user\_id} label
+(label cardinality grows with the user population, eventually making
+Prometheus scrape latency unacceptable). The label set for all four
+instruments is exactly \code{node\_name}, whose cardinality is bounded
+by the number of nodes in the graph.
+
+Four instruments cover the operational questions that matter.
+\code{agent\_cycle\_total} counts node executions and supports
+per-node throughput queries. \code{agent\_cycle\_error\_total} counts
+unhandled exceptions and, divided by \code{agent\_cycle\_total}, gives
+the per-node error rate. \code{agent\_node\_latency\_seconds} is a
+histogram calibrated to LLM operation latencies, enabling p99
+computation via \code{histogram\_quantile}. \code{agent\_hitl\_interrupt\_total}
+counts calls to LangGraph's \code{interrupt()} primitive---introduced
+in Chapter~21 as the mechanism by which a node pauses execution for
+human review; an elevated rate signals that the review queue is growing
+faster than it is being processed.
+
+\begin{lstlisting}[language=Python,
+  caption={Four Prometheus instruments and the \code{instrument\_node}
+  decorator},
+  label={lst:obs-prometheus}]
+# src/observability/prometheus_metrics.py
+import time
+from functools import wraps
+from typing import Callable, TypeVar
+from prometheus_client import Counter, Histogram, start_http_server
+
+CYCLE_COUNT = Counter(
+    "agent_cycle_total",
+    "Total node executions",
+    ["node_name"],
+)
+ERROR_COUNT = Counter(
+    "agent_cycle_error_total",
+    "Unhandled exceptions per node",
+    ["node_name"],
+)
+NODE_LATENCY = Histogram(
+    "agent_node_latency_seconds",
+    "Node wall-clock latency in seconds",
+    ["node_name"],
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+HITL_COUNT = Counter(
+    "agent_hitl_interrupt_total",
+    "LangGraph interrupt() calls per node",
+    ["node_name"],
+)
+
+F = TypeVar("F", bound=Callable)
+
+def instrument_node(node_name: str) -> Callable[[F], F]:
+    def decorator(fn: F) -> F:
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            CYCLE_COUNT.labels(node_name).inc()
+            t0 = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                ERROR_COUNT.labels(node_name).inc()
+                raise
+            finally:
+                NODE_LATENCY.labels(node_name).observe(
+                    time.perf_counter() - t0
+                )
+        return wrapper  # type: ignore[return-value]
+    return decorator
+
+def start_metrics_server(port: int = 8001) -> None:
+    start_http_server(port)
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:obs-prometheus} deserve explanation.
+First, the \code{NODE\_LATENCY} histogram's highest finite bucket is
+10 seconds. LLM calls backed by large models can take 5--8 seconds
+under load; a histogram with a highest finite bucket of 2.5 seconds
+would place all slow calls in the \code{+Inf} overflow bucket, making
+\code{histogram\_quantile(0.99,~...)} return \code{+Inf} rather than a
+real latency value and rendering the p99 panel useless during the exact
+incidents it is meant to diagnose. Second, \code{@wraps(fn)} preserves
+the wrapped function's \code{\_\_name\_\_} and \code{\_\_doc\_\_}.
+LangGraph introspects the function name to produce node labels in its
+Studio UI and in error messages; without \code{@wraps}, every
+instrumented node appears as ``wrapper'' in those tools. Third,
+\code{ERROR\_COUNT} is incremented inside the \code{except} block
+before a bare \code{raise}. The increment occurs at the exact moment
+an exception escapes the node, and the original exception propagates
+unmodified so LangGraph's own error handling and retry logic operates
+on the real exception type.
+
+\begin{tipbox}
+Register \code{start\_metrics\_server} in the application's startup
+event handler---FastAPI's \code{lifespan} context or an
+\code{@app.on\_event("startup")} hook---rather than at module import
+time. Importing \code{prometheus\_metrics} during a test run would
+start an HTTP server on port 8001, causing port-conflict failures on CI
+runners that execute test workers in parallel.
+\end{tipbox}
+
+Prometheus now captures rate, error, and latency data. The remaining
+problem is presenting that data in a reproducible form that supports
+real-time monitoring and threshold-based alerting without requiring
+on-call engineers to write PromQL from scratch when they open the
+dashboard during an incident.
+
+
+%% ------------------------------------------------------------
+\section{Dashboards Are Code, Not Click-Ops}
+\label{sec:obs-grafana}
+%% ------------------------------------------------------------
+
+A Grafana dashboard built through the UI is not reproducible. It lives
+in the Grafana database, is not version-controlled, cannot be reviewed
+in a pull request, and is silently lost when the Grafana instance is
+replaced without a volume backup. The governing principle is that the
+dashboard is a JSON file committed to the repository and provisioned
+via Grafana's file-based provisioning system---mounted as a Kubernetes
+ConfigMap or a Docker Compose bind mount---so it is deployed with the
+application, reviewed like code, and recoverable from source control.
+
+The dashboard declares a single Prometheus datasource identified by UID.
+Grafana's provisioning system resolves datasources by UID, not by
+name; hardcoding the name ``Prometheus'' works only if the provisioned
+datasource carries that exact name in every deployment environment, which
+is not guaranteed. The UID is stable across Grafana upgrades and
+datasource renames and is the correct anchor for cross-environment
+reproducibility.
+
+Four panels map directly onto the four instruments from
+Section~\ref{sec:obs-prometheus}. Each description below specifies
+the panel title, the PromQL query, the visualisation type, and the
+alert condition precisely enough to reproduce the panel from the JSON
+specification without a screenshot.
+
+\textbf{Panel~1 --- Cycle Rate by Node.} Title: ``Cycle Rate (req/s)''.
+Query: \code{rate(agent\_cycle\_total\{job="agent"\}[5m])} with
+\code{by~(node\_name)} grouping. Visualisation: time-series, one
+series per node, 30-second dashboard refresh. No alert threshold; this
+panel provides the denominator for error-rate calculations and a
+capacity-planning baseline.
+
+\textbf{Panel~2 --- Per-Node Error Rate.} Title: ``Error Rate
+(errors/cycle)''. Query:
+\begin{verbatim}
+  rate(agent_cycle_error_total{job="agent"}[5m])
+/ rate(agent_cycle_total{job="agent"}[5m])
+\end{verbatim}
+with \code{by~(node\_name)} grouping. Visualisation: time-series.
+Alert condition: value \code{> 0.05} (5\,\% error rate) for two
+consecutive 60-second evaluation windows, routing to PagerDuty.
+
+\textbf{Panel~3 --- HITL Interrupt Frequency.} Title: ``HITL
+Interrupts/min''. Query:
+\code{rate(agent\_hitl\_interrupt\_total\{job="agent"\}[1m]) * 60}
+with \code{by~(node\_name)} grouping. Visualisation: time-series.
+Alert condition: value \code{> 10} per minute sustained for five
+consecutive evaluation windows, routing to Slack. An elevated rate is
+a scaling signal, not a correctness signal: it means the human review
+queue is growing faster than reviewers can drain it.
+
+\textbf{Panel~4 --- p99 Node Latency.} Title: ``p99 Latency (s)''.
+Query:
+\begin{verbatim}
+  histogram_quantile(
+    0.99,
+    rate(agent_node_latency_seconds_bucket{job="agent"}[5m])
+  )
+\end{verbatim}
+with \code{by~(node\_name)} grouping. Visualisation: time-series.
+Alert condition: value \code{> 2.5} seconds for three consecutive
+60-second evaluation windows, routing to PagerDuty.
+
+\begin{notebox}
+The \code{job="agent"} label selector in all four queries assumes that
+the Prometheus scrape configuration assigns \code{job: agent} to the
+scrape target for the agent process. Without the selector, queries
+aggregate across every scraped service on the same Prometheus instance,
+producing meaningless combined metrics when the deployment includes
+other instrumented services. Chapter~26 provides the complete scrape
+configuration and the Kubernetes ConfigMap that provisions this
+dashboard.
+\end{notebox}
+
+Operational visibility is now covered by both Langfuse traces and
+Prometheus dashboards. The final problem is assembling all layers into
+a single agent whose instrumentation composes without coupling any
+layer's concerns into the node functions it observes.
+
+
+%% ------------------------------------------------------------
+\section{Instrumentation Layers Must Compose Without Coupling}
+\label{sec:obs-full-integration}
+%% ------------------------------------------------------------
+
+The risk of assembling multiple instrumentation layers is that each
+new layer adds code to every node function until the instrumentation
+surface exceeds the business logic. A node that opens a Langfuse
+context manager, fetches a versioned prompt, calls an LLM, extracts
+token counts, builds a cycle record, attaches a usage object, and
+increments a Prometheus counter is executing six cross-cutting concerns
+before any domain work begins. The governing principle is that
+instrumentation must compose from the outside in: the Prometheus
+decorator covers the node boundary, the callback handler covers the
+graph boundary, and the context manager covers the LLM generation
+boundary---each layer at its own level of abstraction, none reaching
+into the others.
+
+The composition works as follows. \code{@instrument\_node} from
+Section~\ref{sec:obs-prometheus} wraps the node function at the
+outermost boundary, recording the full node wall-clock latency that
+LangGraph observes. Inside the node, an
+\code{lf.start\_as\_current\_observation(as\_type="generation")}
+block wraps only the LLM call, so the generation observation captures
+model latency alone. The prompt is fetched from the registry
+(Section~\ref{sec:obs-prompt-management}) and attached to the
+generation. Token counts are extracted via \code{update\_generation\_span}
+(Section~\ref{sec:obs-cost-tracking}) and passed to
+\code{build\_cycle\_trace} (Section~\ref{sec:obs-cycle-record}).
+The \code{CallbackHandler} from Section~\ref{sec:obs-graph-tracing}
+operates entirely outside the node and requires no code changes inside
+it. None of these concerns requires another to be present.
+
+\begin{lstlisting}[language=Python,
+  caption={A fully instrumented LangGraph node; all layers applied
+  without coupling},
+  label={lst:obs-instrumented-node}]
+# src/agent/instrumented_node.py
+from datetime import datetime, timezone
+from langfuse import Langfuse
+from src.observability.cost_tracking import update_generation_span
+from src.observability.cycle_trace import build_cycle_trace
+from src.observability.langfuse_setup import get_langfuse
+from src.observability.prometheus_metrics import instrument_node
+from src.observability.prompt_registry import (
+    attach_prompt, get_production_prompt,
+)
+
+@instrument_node("llm_node")
+def llm_node(state: dict) -> dict:
+    lf    = get_langfuse()
+    start = datetime.now(timezone.utc)
+    model = state["meta"]["llm_model"]
+    compiled, prompt = get_production_prompt(
+        "agent_system_prompt",
+        variables={"user_id": state["meta"].get("user_id", "")},
+    )
+    with lf.start_as_current_observation(
+        name    = "llm_generation",
+        as_type = "generation",
+        input   = {"prompt_preview": compiled[:200]},
+    ) as gen:
+        response = state["llm"].invoke(compiled)
+        raw      = update_generation_span(gen, model, response)
+        attach_prompt(gen, prompt)
+    end    = datetime.now(timezone.utc)
+    record = build_cycle_trace(
+        state=state, node_name="llm_node",
+        start=start, end=end,
+        model=model, usage=raw,
+    )
+    return {
+        **state,
+        "output": response.content,
+        "meta":   {**state["meta"], "last_cycle_trace": record},
+    }
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:obs-instrumented-node} deserve
+explanation. First, the \code{with~lf.start\_as\_current\_observation(...)}
+block wraps only the \code{state["llm"].invoke()} call, not the
+prompt fetch or cycle-record construction. The generation observation's
+latency field should reflect model response time; inflating it with
+prompt-registry cache lookups and JSON hashing would overstate model
+latency and understate infrastructure overhead, distorting the cost
+dashboard's per-generation analysis. Second, \code{attach\_prompt} is
+called \emph{inside} the context-manager block, after \code{response}
+is available, but this is equivalent to calling it at construction time
+because the SDK accumulates \code{update()} calls and serialises them
+as one payload when the block exits. The placement after the LLM call
+is intentional: it reads as ``the prompt object is part of the
+generation record''---which semantically it is---rather than as a
+setup step that must precede the model call. Third, \code{@instrument\_node}
+is the outermost decorator, wrapping the full node including prompt
+fetch and record construction. This ensures the Prometheus histogram
+measures total node wall-clock time as seen by LangGraph, which is the
+latency that governs SLA calculations, not only the model call duration.
+
+\begin{lstlisting}[language=Python,
+  caption={Graph assembly: all instrumentation layers wired;
+  per-invocation \code{invoke} helper},
+  label={lst:obs-graph-assembly}]
+# src/agent/graph_assembly.py
+import atexit
+from dataclasses import dataclass, field
+from langchain_core.runnables import RunnableConfig
+from langfuse.langchain import CallbackHandler
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from src.agent.instrumented_node import llm_node
+from src.observability.langfuse_setup import get_langfuse
+from src.observability.prometheus_metrics import start_metrics_server
+
+@dataclass
+class ObservabilityConfig:
+    prom_port: int = 8001
+
+def build_instrumented_graph(
+    obs: ObservabilityConfig,
+) -> CompiledStateGraph:
+    start_metrics_server(obs.prom_port)
+    builder = StateGraph(dict)
+    builder.add_node("llm_node", llm_node)
+    builder.add_edge(START, "llm_node")
+    builder.add_edge("llm_node", END)
+    return builder.compile()
+
+def invoke(
+    graph:      CompiledStateGraph,
+    state:      dict,
+    user_id:    str,
+    session_id: str,
+) -> dict:
+    lf      = get_langfuse()
+    handler = CallbackHandler()
+    lf.propagate_attributes(user_id=user_id, session_id=session_id)
+    config = RunnableConfig(
+        callbacks = [handler],
+        metadata  = {"user_id": user_id, "session_id": session_id},
+    )
+    try:
+        return graph.invoke(state, config=config)
+    finally:
+        lf.shutdown()
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:obs-graph-assembly} deserve
+explanation. First, \code{ObservabilityConfig} is a plain
+\code{@dataclass} with a single \code{prom\_port} field. The Langfuse
+credentials are consumed from environment variables inside
+\code{get\_langfuse()}, so the config object has no secrets to
+validate and no Pydantic model is warranted; adding one would introduce
+validation overhead for a one-field object that cannot fail in any
+interesting way. Second, \code{lf.shutdown()} is called in the
+\code{finally} block of \code{invoke()} rather than only in the
+\code{atexit} hook. In long-running API servers, \code{atexit} fires
+once at process termination---potentially hours after the last
+request---leaving a window where traces buffered in memory are not yet
+visible in Langfuse. Calling \code{shutdown()} in \code{finally}
+flushes the buffer synchronously after each request, ensuring the
+trace appears before the HTTP response is returned. For
+high-throughput async services where per-request flushing is too
+expensive, the \code{atexit} hook alone is sufficient because the
+background ingestion thread processes the queue continuously and
+\code{shutdown()} in that context would block the event loop.
+
+Chapter~24 builds the evaluation harness that imports
+\code{build\_instrumented\_graph}, replays saved Langfuse traces as
+test fixtures, and asserts that quality metrics do not regress across
+prompt version changes---relying on the prompt linkage established in
+Section~\ref{sec:obs-prompt-management} to identify exactly which
+prompt version each recorded generation used.
