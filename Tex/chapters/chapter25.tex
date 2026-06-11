@@ -1,8 +1,186 @@
 %% ============================================================
-%%  Chapter 25 --- Evaluation with Langfuse, RAGAS & DeepEval
+%%  Chapter 25 --- Evaluation with Langfuse, RAGAS and DeepEval
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langfuse >= 4.0.0,
+%%                ragas >= 0.2.0,
+%%                deepeval >= 0.21.0,
+%%                litellm >= 1.40.0,
+%%                langchain >= 0.3.0,
+%%                langchain-openai >= 0.2.0,
+%%                pytest >= 8.0.0,
+%%                asyncpg >= 0.29.0,
+%%                pydantic >= 2.7.0,
+%%                python >= 3.11
 %% ============================================================
 
-\chapterquote{A system without success criteria has no way to fail correctly.}{anon}
+\chapterquote{a system that cannot measure its own correctness
+cannot know when it stops being correct.}{anon}
 
-% TODO: Chapter 25 content
+The production failure this chapter prevents is silent quality
+regression. An agent that answered faithfully last week may answer
+with hallucinated citations this week because a retrieval-configuration
+change quietly reduced the context window, or because a model update
+shifted token-probability distributions in a way that no exception,
+no latency spike, and no error counter can detect. The economic damage
+is not hypothetical: a customer-facing RAG agent that fabricates a
+regulatory deadline returns a correct HTTP~200 with a well-formed JSON
+body, passes every existing monitor, and damages the relationship with
+every user who acted on the invented date---all without producing a
+single alert. The secondary failure is subtler: the Chapter~24 security
+defences were built to withstand adversarial inputs, but nothing yet
+verifies that they still hold after the Presidio model is updated, the
+Guardrails validator configuration drifts, or a new prompt template
+inadvertently removes the \code{<external>} wrapping established in
+Section~\ref{sec:sec-injection}. Without a machine-checkable suite,
+both failures are invisible until a user reports them.
+
+The solution has four complementary layers. The first is a
+\emph{success criteria layer}: machine-checkable thresholds are
+committed as a versioned dataclass before any evaluation code is
+written, making quality requirements reviewable in pull requests
+rather than implicit in someone's memory of what ``good enough'' meant
+at launch. The second is an \emph{online scoring layer}: a lightweight
+LLM-as-judge fires asynchronously on every production trace, attaching
+faithfulness and relevancy scores to Langfuse without adding latency
+to the user's request; this layer catches distribution shift that no
+fixed test set covers. The third is an \emph{offline evaluation layer}:
+RAGAS and DeepEval run against a version-pinned Langfuse golden dataset
+in CI, making four statistically grounded metrics a hard prerequisite
+for merging any change that touches the retrieval pipeline, the prompt
+templates, or the security configuration. The fourth is a
+\emph{CI~gate layer}: a GitHub Actions workflow enforces that the
+offline scores meet the committed thresholds before a pull request can
+be merged, turning the success-criteria dataclass into a structural
+enforcement mechanism rather than a document.
+
+The sections are ordered by the dependency each one introduces.
+Section~\ref{sec:eval-criteria} establishes the success-criteria
+dataclass first, because every later section's thresholds are imported
+from it rather than redeclared. Section~\ref{sec:eval-dataset} builds
+the Langfuse golden dataset, because both the online layer
+(Section~\ref{sec:eval-online}) and the offline runner
+(Section~\ref{sec:eval-runner}) need a versioned item store to operate
+against. Section~\ref{sec:eval-online} wires the online judge, which
+produces live scores on the same traces the golden items are promoted
+from. Sections~\ref{sec:eval-ragas} and~\ref{sec:eval-deepeval} build
+the two offline metric suites, which operate against the same
+\code{RunResult} objects produced by the eval runner.
+Section~\ref{sec:eval-ci} assembles the CI gate that enforces the
+thresholds on every pull request. Section~\ref{sec:eval-integration}
+composes all layers into a single runnable end-to-end script.
+
+This chapter introduces seven terms defined in
+Table~\ref{tab:ch25-terms}.
+
+\begin{table}[ht]
+\centering
+\caption{Evaluation terms introduced in Chapter~25}
+\label{tab:ch25-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\emph{MetricCriterion} &
+  A frozen dataclass recording one machine-checkable quality threshold:
+  the metric name, the numeric threshold, a rationale string of at least
+  50~characters, and the framework that enforces it. \\
+\emph{Golden dataset} &
+  A Langfuse dataset whose items carry a \code{query}, a
+  \code{retrieved\_contexts} list, and an \code{expected\_output}
+  answer; the single source of truth for all offline evaluation runs. \\
+\emph{Online scoring} &
+  Evaluation that runs asynchronously on every production trace
+  immediately after the agent responds, attaching numeric scores to the
+  Langfuse trace without blocking the user's request. \\
+\emph{Offline evaluation} &
+  Evaluation that runs in CI against a version-pinned golden dataset,
+  using embedding models and multiple LLM judge calls that would be
+  too expensive to run in the request path. \\
+\emph{SingleTurnSample} &
+  A RAGAS dataclass with fields \code{user\_input}, \code{response},
+  \code{retrieved\_contexts}, and \code{reference}; the unit of
+  evaluation for all four RAGAS metrics. \\
+\emph{RunResult} &
+  A plain dataclass produced by the eval runner for each golden item;
+  carries \code{query}, \code{answer}, \code{contexts},
+  \code{ground\_truth}, \code{item\_id}, and \code{trace\_id}. Acts as
+  the decoupling boundary between agent execution and metric
+  computation. \\
+\emph{CI gate} &
+  A GitHub Actions job that runs the offline eval suite and fails the
+  pull request if any RAGAS score falls below the threshold declared in
+  \code{SUCCESS\_CRITERIA}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+src/
+  eval/
+    success_criteria.py    # §25.1 — MetricCriterion, SUCCESS_CRITERIA,
+                           #         THRESHOLDS
+    dataset_manager.py     # §25.2 — ensure_dataset, upsert_golden_item,
+                           #         fetch_dataset_at_version
+    online_judge.py        # §25.3 — ensure_score_configs,
+                           #         run_online_judge,
+                           #         attach_online_judge_to_node
+    ragas_suite.py         # §25.4 — build_ragas_dataset,
+                           #         run_ragas_suite, assert_thresholds
+    deepeval_models.py     # §25.5 — LiteLLMDeepEvalModel
+    eval_runner.py         # §25.7 — RunResult, run_item, run_all_items,
+                           #         results_to_ragas_input
+tests/
+  eval/
+    test_deepeval.py       # §25.5 — parametrised faithfulness and
+                           #         relevancy test cases
+scripts/
+  get_dataset_version.py   # §25.6 — writes latest version to
+                           #         $GITHUB_OUTPUT
+  run_eval.py              # §25.6 — CI gate CLI, Markdown score table
+  run_full_eval.py         # §25.7 — end-to-end integration script
+.github/
+  workflows/
+    eval_gate.yml          # §25.6 — two-job PR merge gate
+requirements-eval.txt      # §25.7 — isolated eval dependency set
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{Quality Requirements Must Exist Before Quality Is Measured}
+\label{sec:eval-criteria}
+%% ------------------------------------------------------------
+
+The design problem is anchoring bias. A team that writes evaluation
+code first and then asks ``did we pass?'' will unconsciously tune
+thresholds to match the system's current performance, because the
+current performance is the only reference point available when the
+threshold is chosen. This is not a cultural failure; it is a
+structural one---the information needed to set a threshold
+independently of the system's behaviour does not exist after the
+system has already been run. The naive approach is to document
+thresholds in a README after the first eval run, which produces
+thresholds that describe the past rather than require anything of the
+future. The governing principle is that success criteria are committed
+in a file with no dependencies on any evaluation framework, reviewed
+in a pull request that contains no evaluation results, and only
+after that review does any evaluation code import from them.
+
+The \emph{MetricCriterion} dataclass enforces one constraint that
+makes this principle structural rather than cultural: the
+\code{rationale} field requires at least 50~characters via
+\code{\_\_post\_init\_\_}. This mirrors the \code{threat\_model\_notes}
+minimum from Chapter~24~\S24.1. A vacuous rationale such as
+``seems reasonable'' is 16~characters; the minimum forces the author
+to write at least one sentence explaining \emph{why} a specific
+threshold was chosen rather than a neighbouring value. The four
+criteria cover the dimensions along which Chapter~24's retrieval
+architecture can fail: faithfulness (answers must not hallucinate),
+answer relevancy (answers must address the question), context
+precision (the retriever must not flood the context window with noise),
+and context recall (the retriever must not omit key evidence).
+
+The \code{THRESHOLDS} dict is derived from \code{SUCCESS\_CRITERIA}
+by a single comprehension, which makes it structurally impossible for
+the two to diverge. Every downstream component--
