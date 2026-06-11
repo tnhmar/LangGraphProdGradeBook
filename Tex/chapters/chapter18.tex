@@ -1,8 +1,775 @@
 %% ============================================================
-%%  Chapter 18 --- ANP & Decentralized Agent Identity
+%%  Chapter 18 --- ANP & Decentralised Agent Identity
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: agent-connect==0.3.4,
+%%                didcomm-messaging[askar] >= 0.1.0,
+%%                cryptography >= 42.0,
+%%                base58 >= 2.1.1,
+%%                python-jose[cryptography] >= 3.3.0,
+%%                pydantic >= 2.7.0,
+%%                pydantic-settings >= 2.3.0,
+%%                httpx >= 0.27.0,
+%%                fastapi >= 0.111.0,
+%%                langgraph >= 0.2.0
 %% ============================================================
 
-\chapterquote{Identity without verification is just a claim.}{anon}
+\chapterquote{A network you cannot prove is a network you cannot trust.}{anon}
 
-% TODO: Chapter 18 content
+The production failure this chapter prevents is invisible impersonation at
+the boundary of organisations. Chapter~17 built a working A2A integration
+between agents that share a deployment environment, but it assumed the
+caller already knows the remote agent's URL and can pre-share a signing
+key. That assumption collapses the moment a second organisation wants to
+consume your agent, or you want to consume theirs. Without a publicly
+verifiable identity document, a caller has no proof that the server
+answering at a given URL is the agent it claims to be; any party who can
+intercept or redirect traffic can substitute their own endpoint and harvest
+delegated credentials silently and indefinitely. The cost is not a security
+audit finding --- it is the impossibility of participating in an open agent
+network where you do not control every node.
+
+The solution has four layers. The first is a \emph{cryptographic identity
+layer}: each agent publishes a W3C DID Document at a well-known URL,
+binding a domain name to a public key in a machine-fetchable, versioned
+record. The second is a \emph{transport security layer}: messages are
+wrapped in DIDComm v2 authenticated-encryption envelopes, so
+confidentiality and sender authenticity are properties of the payload
+itself rather than of the TLS connection carrying it. The third is a
+\emph{capability attestation layer}: a trusted platform operator issues a
+Verifiable Credential listing the skills an agent is authorised to execute
+on behalf of its organisation, independent of any single call. The fourth
+is an \emph{authenticated HTTP layer}: the ANP \code{agent-connect}
+library signs every HTTP request with the sender's DID, coupling transport
+and identity at the connection level.
+
+The sections are ordered by dependency. Section~\ref{sec:anp-did}
+establishes cryptographic identity first, because every subsequent layer
+either embeds or resolves a DID. Section~\ref{sec:anp-didcomm} builds the
+message envelope next, because the Verifiable Credential introduced in
+Section~\ref{sec:anp-vc} travels inside that envelope and cannot be taught
+before the envelope exists. Section~\ref{sec:anp-auth} introduces
+DID-authenticated HTTP, because the capstone in
+Section~\ref{sec:anp-handshake} needs it to call the remote agent after the
+envelope is constructed. Section~\ref{sec:anp-handshake} assembles all
+four layers; it introduces no new concepts, only composition.
+
+\begin{notebox}
+This chapter addresses an ecosystem-level protocol for cross-organisational
+agent identity and communication. It is not required when all agents share
+the same organisation, trust boundary, or internal API gateway. Teams
+running intra-org LangGraph graphs should return here when their agents
+must interoperate with agents operated by a third party they do not control.
+\end{notebox}
+
+This chapter introduces seven terms defined in Table~\ref{tab:ch18-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~18}
+\label{tab:ch18-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{did:wba} &
+  The \emph{Web-Based Agent} DID method used by ANP\@; extends
+  \code{did:web} by requiring an \code{AgentDescriptionService} entry
+  that links the DID Document to an \code{AgentCard}. \\
+DID Document &
+  A W3C-specified JSON document served at
+  \code{/.well-known/did.json}; binds a domain name to one or more
+  public keys and declares typed service endpoints. \\
+DIDComm v2 &
+  A messaging protocol that wraps arbitrary payloads in JWE envelopes,
+  providing both confidentiality and sender authentication without a
+  pre-shared secret. \\
+Authcrypt &
+  A DIDComm pack mode that encrypts for the recipient and authenticates
+  the sender's DID\@; the only mode suitable for agent-to-agent calls
+  where the recipient must verify origin. \\
+Verifiable Credential &
+  A W3C-specified signed JWT whose \code{credentialSubject} asserts
+  claims about an entity; used here to attest which
+  \code{AgentSkill.id} values an agent is authorised to execute. \\
+\code{DIDWbaAuthHeader} &
+  An \code{agent-connect} class that generates a challenge-response
+  \code{Authorization} header signed with the sender's Ed25519 key. \\
+\code{PackagingService} &
+  The \code{didcomm-messaging} class that packs and unpacks DIDComm v2
+  envelopes using a pluggable \code{DIDResolver} and
+  \code{SecretsManager}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+chapter18/
+  did_wba.py                 # §18.1 — DID document generation + route
+  didcomm_envelope.py        # §18.2 — DIDComm v2 pack / unpack
+  verifiable_credentials.py  # §18.3 — VC issue + verify
+  anp_auth.py                # §18.4 — DIDWbaAuth adapter + card resolve
+  cross_org_handshake.py     # §18.5 — full cross-org orchestrator
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{Cryptographic Identity Must Be Publicly Verifiable}
+\label{sec:anp-did}
+%% ------------------------------------------------------------
+
+The design problem is identity without proof: an agent that identifies
+itself only by a URL gives the caller nothing to verify beyond the TLS
+certificate for that domain, which proves domain ownership but says nothing
+about the specific service running there. The naive approach is to
+document the agent's public key in a README or a shared configuration
+file, which is both unversioned and unfetchable by a generic client at
+runtime. The governing principle is that cryptographic identity must be
+self-describing and machine-fetchable: the DID Document is a structured,
+publication-signed record that any caller can retrieve from a well-known
+URL without prior arrangement.
+
+\emph{DID} stands for Decentralised Identifier. A \code{did:wba} DID
+takes the form \code{did:wba:\{host\}}, which resolves to
+\code{https://\{host\}/.well-known/did.json}. The \code{:wba} (Web-Based
+Agent) method is the one ANP mandates, and it differs from the older
+\code{did:web} in one important respect: it requires a \code{service}
+entry of type \code{"AgentDescriptionService"} whose
+\code{serviceEndpoint} points to the agent's \code{AgentCard} URL.
+Chapter~17~\S17.2 introduced \code{AgentCard} as the capability contract
+served at \code{/.well-known/agent.json}; the DID Document at
+\code{/.well-known/did.json} is a sibling document at the same host.
+The card declares what the agent can do; the DID Document proves who the
+agent cryptographically is. The DID Document's \code{AgentDescriptionService}
+entry closes the loop between them.
+
+The key type is \code{Ed25519VerificationKey2020}, with the public key
+encoded as a \code{base58btc} multibase string bearing the \code{"z"}
+prefix mandated by the Multibase specification. The private key is
+generated once at process startup, stored in the runtime secret store, and
+never written to the document. The \code{/.well-known/did.json} route is
+unauthenticated for the same reason \code{/.well-known/agent.json} is in
+Chapter~17~\S17.2: a bootstrap paradox prevents protecting a document with
+credentials that the document itself is needed to obtain.
+
+\begin{warningbox}
+Do not add an authentication dependency to \code{/.well-known/did.json}.
+A caller who cannot fetch the DID Document before authenticating is unable
+to obtain the public key needed to verify any credential the agent presents.
+Both well-known endpoints must be unconditionally public.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={\texttt{did:wba} document construction and well-known route},
+  label={lst:anp-did}]
+# chapter18/did_wba.py
+import base58
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding, PublicFormat,
+)
+from fastapi import APIRouter
+
+router = APIRouter()
+_DID_DOCUMENT: dict = {}   # populated at startup via init_did()
+
+def generate_agent_keypair() -> tuple[bytes, str]:
+    """Returns (raw_private_key_bytes, public_key_multibase)."""
+    priv = Ed25519PrivateKey.generate()
+    pub  = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return priv.private_bytes_raw(), "z" + base58.b58encode(pub).decode()
+
+def build_did_wba_document(
+    host: str,
+    public_key_multibase: str,
+    agent_card_url: str,
+) -> dict:
+    did    = f"did:wba:{host}"
+    key_id = f"{did}#key-1"
+    return {
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/suites/ed25519-2020/v1",
+        ],
+        "id": did,
+        "verificationMethod": [{
+            "id": key_id,  "type": "Ed25519VerificationKey2020",
+            "controller": did,
+            "publicKeyMultibase": public_key_multibase,
+        }],
+        "authentication":  [key_id],
+        "assertionMethod": [key_id],
+        "service": [{
+            "id": f"{did}#agent-description",
+            "type": "AgentDescriptionService",
+            "serviceEndpoint": agent_card_url,
+        }],
+    }
+
+@router.get("/.well-known/did.json")
+async def get_did_document() -> dict:
+    return _DID_DOCUMENT
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:anp-did} deserve explanation.
+The multibase string begins with \code{"z"}, the registered
+\code{base58btc} prefix; using raw Base64 or hex encoding would produce
+a key that many DID resolvers silently reject before attempting signature
+verification, because the prefix is part of the encoded key type, not
+decoration. Both \code{"authentication"} and \code{"assertionMethod"} use
+a reference to the key ID string rather than embedding the full key object
+inline; the W3C DID Core spec calls this a \emph{referenced} verification
+method, and it avoids the deserialization ambiguity that would arise if the
+two embedded copies diverged after a key rotation. The \code{\_DID\_DOCUMENT}
+module global is populated once at startup by calling
+\code{init\_did(host, agent\_card\_url)} rather than being regenerated on
+each request, because key generation is not idempotent and the public key
+in the document must remain stable for the lifetime of the process.
+
+With a stable, publicly fetchable DID Document in place, the next question
+is how to use the private key it references to send a message that the
+recipient can verify without a pre-shared secret.
+
+
+%% ------------------------------------------------------------
+\section{Message Confidentiality and Sender Identity Are Separate Guarantees}
+\label{sec:anp-didcomm}
+%% ------------------------------------------------------------
+
+The design problem is conflating transport security with application-level
+identity: TLS provides confidentiality between two endpoints and proves
+domain ownership, but it says nothing about whether the application-level
+sender is who they claim to be. The naive approach is to rely on TLS and
+add an \code{Authorization} header, which proves that the connection is
+encrypted and that the caller knows a secret --- but not that the secret
+belongs to the DID the caller claims to hold. The governing principle is
+that confidentiality and sender authentication must be properties of the
+message payload itself, so they survive proxy hops, message queues, or
+store-and-forward transports between the two agents.
+
+DIDComm v2 achieves both with \emph{authcrypt}: a JWE envelope that is
+encrypted for a specific recipient DID and authenticated by the sender's
+DID\@. The \code{didcomm-messaging} library (installed as
+\code{pip install "didcomm-messaging[askar]"}) implements this through
+\code{PackagingService}, which is constructed with a \code{DIDResolver}
+and a \code{SecretsManager}. The \code{DIDResolver} is the extension
+point that tells the library where to fetch DID Documents; for
+\code{did:wba}, this means fetching
+\code{https://\{host\}/.well-known/did.json}, exactly the endpoint
+Section~\ref{sec:anp-did} established. A custom \code{WBAResolver}
+subclass handles this fetch; it is registered in a \code{PrefixResolver}
+keyed by the \code{"did:wba:"} prefix so the library dispatches to the
+right resolver without inspecting the full DID.
+
+\begin{warningbox}
+Install \code{didcomm-messaging} with the \code{[askar]} extra:
+\code{pip install "didcomm-messaging[askar]"}. The base package installs
+only a stub \code{CryptoService} that accepts pack calls and omits
+encryption silently. Packing a message without \code{aries-askar}
+produces a plaintext JWE lookalike that any observer can read in full.
+\end{warningbox}
+
+The message body passed to \code{PackagingService.pack()} is arbitrary
+bytes. For cross-org A2A calls, the convention adopted in
+Section~\ref{sec:anp-handshake} is to pack a JSON object containing both
+the \code{SendMessageRequest} payload and a \code{vc\_jwt} field. This
+keeps the Verifiable Credential inside the encrypted envelope rather than
+in an HTTP header, making it invisible to network observers and
+non-strippable by a proxy.
+
+\begin{lstlisting}[language=Python,
+  caption={DIDComm v2 authcrypt pack and unpack via \texttt{PackagingService}},
+  label={lst:anp-didcomm}]
+# chapter18/didcomm_envelope.py
+import json
+import httpx
+from aries_askar import Key, KeyAlg
+from didcomm_messaging.crypto.askar import AskarCryptoService, AskarSecretKey
+from didcomm_messaging.crypto.basic import InMemorySecretsManager
+from didcomm_messaging.didcomm import PackagingService
+from didcomm_messaging.resolver import DIDResolver, PrefixResolver
+
+class WBAResolver(DIDResolver):
+    async def resolve_with_metadata(
+        self, did: str,
+    ) -> tuple[dict, dict]:
+        host = did.removeprefix("did:wba:")
+        url  = f"https://{host}/.well-known/did.json"
+        async with httpx.AsyncClient() as http:
+            resp = await http.get(url, timeout=5.0)
+        resp.raise_for_status()
+        return resp.json(), {}
+
+def build_packaging_service(sender_did: str) -> PackagingService:
+    ed_key  = Key.generate(KeyAlg.ED25519)
+    x_key   = Key.generate(KeyAlg.X25519)
+    secrets = InMemorySecretsManager()
+    secrets.add_secret(AskarSecretKey(ed_key, f"{sender_did}#key-1"))
+    secrets.add_secret(
+        AskarSecretKey(x_key, f"{sender_did}#key-agreement-1"))
+    resolver = PrefixResolver({"did:wba:": WBAResolver()})
+    return PackagingService(resolver, AskarCryptoService(), secrets)
+
+async def pack_a2a_request(
+    packer: PackagingService,
+    body: dict,
+    sender_did: str,
+    to_did: str,
+) -> bytes:
+    msg = json.dumps(body).encode()
+    return await packer.pack(msg, to=[to_did], frm=sender_did)
+
+async def unpack_a2a_request(
+    packer: PackagingService,
+    packed: bytes,
+) -> tuple[dict, str]:
+    result  = await packer.unpack(packed)
+    sender  = result.metadata.sender_kid.split("#")[0]
+    return json.loads(result.message), sender
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:anp-didcomm} deserve explanation.
+\code{build\_packaging\_service} is synchronous: \code{Key.generate()} and
+\code{InMemorySecretsManager.add\_secret()} are both synchronous in
+\code{aries-askar}; wrapping them in \code{async def} would add an
+\code{asyncio} frame for no reason and, more importantly, would make it
+legal to call the function before an event loop exists at process startup.
+Two key types are registered --- an \code{ED25519} key for signing and an
+\code{X25519} key for key agreement --- because DIDComm v2 authcrypt
+performs an Elliptic-Curve Diffie-Hellman key exchange over X25519 for
+encryption and uses Ed25519 for the envelope signature; omitting the
+X25519 key causes a runtime failure at pack time, not at construction time,
+which is a particularly hard failure to diagnose. \code{result.metadata.sender\_kid}
+is the full verification method URL (e.g.\
+\code{did:wba:example.com\#key-1}); extracting the DID alone with
+\code{split("\#")[0]} produces the form expected by the Verifiable
+Credential verifier in the next section, which compares issuer DIDs rather
+than key fragment URLs.
+
+A packed message proves who sent it. What it cannot prove is whether that
+sender has been authorised by a trusted third party to call a specific
+skill --- which is exactly what a Verifiable Credential exists to attest.
+
+
+%% ------------------------------------------------------------
+\section{Long-Lived Authority Requires a Third-Party Attestation}
+\label{sec:anp-vc}
+%% ------------------------------------------------------------
+
+The design problem is the limit of self-assertion: an agent can sign
+messages with its own private key to prove it controls a DID, but it
+cannot use that same key to prove that a trusted authority has sanctioned
+its actions. The naive approach is to embed capability claims directly in
+the delegation token the parent mints per-call (Chapter~17~\S17.4), but
+that token's authority derives entirely from the parent --- if the parent
+has no external authorisation, neither does its token. The governing
+principle is separation of issuance from use: a \emph{Verifiable
+Credential} is issued once by an authority independent of both caller and
+callee, and its claims survive across many delegated calls without being
+re-issued.
+
+The delegation token introduced in Chapter~17~\S17.4 and the Verifiable
+Credential answer different questions and have different lifetimes. The
+delegation token is minted per-call by the parent agent at call time, has
+a five-minute TTL, and scopes a single task invocation. The VC is issued
+once by a platform operator, carries a 90-day TTL, and attests the
+agent's durable organisational permission to execute a class of skills.
+Both are needed: the delegation token bounds one call; the VC proves the
+agent making that call has standing to make it at all.
+
+A Verifiable Credential in the W3C Data Model v2.0 JWT profile is a JWT
+whose \code{vc} claim contains a \code{credentialSubject} with
+attestation fields. For this chapter the key attestation is
+\code{permittedSkills}: a list of \code{AgentSkill.id} strings the issuer
+vouches the subject agent may execute. The credential's \code{issuer}
+field is the platform operator's own \code{did:wba}; the recipient checks
+the JWT signature and then verifies the issuer DID against a
+\code{TRUSTED\_ISSUERS} set loaded from configuration rather than
+hardcoded.
+
+\begin{notebox}
+A Pydantic v2 model whose field must serialise as \code{"@context"}
+requires \code{Field(alias="@context")} and
+\code{ConfigDict(populate\_by\_name=True)}. Without
+\code{populate\_by\_name=True}, constructing the model by keyword
+argument (\code{context=[...]}) raises a \code{ValidationError}, because
+Pydantic v2 treats the alias as the only valid constructor key unless
+this flag is set. Without the alias, \code{model\_dump(by\_alias=True)}
+emits \code{"context"} instead of \code{"@context"}, producing a JWT
+that any VC processor will reject as non-compliant.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={VC issuance and skill-scoped verification with \texttt{python-jose}},
+  label={lst:anp-vc}]
+# chapter18/verifiable_credentials.py
+import time
+from uuid import uuid4
+from pydantic import BaseModel, ConfigDict, Field
+from jose import JWTError, jwt
+from jose.constants import ALGORITHMS
+
+class CapabilitySubject(BaseModel):
+    id:              str
+    permittedSkills: list[str]
+    issuedFor:       str
+
+class AgentCapabilityCredential(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    context: list[str] = Field(
+        default=["https://www.w3.org/ns/credentials/v2"],
+        alias="@context",
+    )
+    id:                str = Field(default_factory=lambda: f"urn:uuid:{uuid4()}")
+    type:              list[str] = ["VerifiableCredential",
+                                    "AgentCapabilityCredential"]
+    issuer:            str
+    issuanceDate:      str
+    expirationDate:    str
+    credentialSubject: CapabilitySubject
+
+def issue_capability_vc(
+    credential: AgentCapabilityCredential,
+    private_key: str,
+    kid: str,
+) -> str:
+    now    = int(time.time())
+    claims = {
+        "iss": credential.issuer,
+        "sub": credential.credentialSubject.id,
+        "iat": now,
+        "exp": now + 60 * 60 * 24 * 90,
+        "vc":  credential.model_dump(by_alias=True),
+    }
+    return jwt.encode(claims, private_key,
+        algorithm=ALGORITHMS.RS256, headers={"kid": kid, "typ": "JWT"})
+
+def verify_capability_vc(
+    vc_jwt: str,
+    jwks_url: str,
+    trusted_issuers: frozenset[str],
+    required_skill: str,
+) -> AgentCapabilityCredential:
+    import httpx
+    header = jwt.get_unverified_header(vc_jwt)
+    jwks   = httpx.get(jwks_url, timeout=5).json()
+    key    = next(k for k in jwks["keys"] if k["kid"] == header["kid"])
+    decoded = jwt.decode(vc_jwt, key, algorithms=[ALGORITHMS.RS256])
+    if decoded["iss"] not in trusted_issuers:
+        raise JWTError(f"issuer {decoded['iss']!r} not in trusted set")
+    skills  = decoded["vc"]["credentialSubject"]["permittedSkills"]
+    if required_skill not in skills:
+        raise JWTError(f"skill {required_skill!r} not permitted")
+    return AgentCapabilityCredential(**decoded["vc"])
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:anp-vc} deserve explanation.
+The \code{exp} claim is set to 90 days from \emph{call time} inside
+\code{issue\_capability\_vc} rather than being accepted as a parameter;
+this makes the 90-day policy a fact visible in the issuance code, not a
+runtime parameter that a misconfigured caller could set to zero or to a
+far-future date. The issuer trust check precedes the skill check
+deliberately: if the issuer is unknown, the skill claim is irrelevant
+regardless of its value, and the error message should identify the actual
+failure rather than suggesting a skill-authorisation problem when the root
+cause is an unrecognised issuer. \code{model\_dump(by\_alias=True)} is
+required when serialising \code{AgentCapabilityCredential} into JWT
+claims: without it the \code{"@context"} key appears as \code{"context"}
+in the JWT payload, producing a credential that any W3C VC processor will
+reject before reaching signature validation.
+
+A Verifiable Credential establishes long-lived, third-party-attested
+authority. What remains is coupling that authority to the HTTP transport
+so the connection itself is signed by the same DID that the credential
+names.
+
+
+%% ------------------------------------------------------------
+\section{Every HTTP Request Should Carry Its Own Proof of Identity}
+\label{sec:anp-auth}
+%% ------------------------------------------------------------
+
+The design problem is identity laundering at the transport level: if the
+HTTP connection carries no proof of the caller's DID, any service holding
+a valid token can call the remote agent while claiming any identity it
+likes in an application-level header. The naive approach is to put the DID
+in a custom header and trust the caller to be honest, which is an
+assertion rather than a proof. The governing principle is that the
+\code{Authorization} header must contain a cryptographic challenge
+response that only the holder of the private key matching the DID
+Document's \code{verificationMethod} could have produced.
+
+\code{DIDWbaAuthHeader} from \code{agent-connect} implements this flow.
+Given a DID and the corresponding private key bytes, it generates a
+signed challenge string and returns an \code{Authorization} header value
+that the recipient can verify by fetching the caller's
+\code{/.well-known/did.json} and checking the signature against the
+\code{Ed25519VerificationKey2020} entry. The \code{DIDWbaAuth} class in
+this section wraps \code{DIDWbaAuthHeader} as an \code{httpx.Auth}
+subclass so the signed header is regenerated on every request, including
+automatic retries, without any caller-side retry-awareness.
+
+\begin{warningbox}
+Pin \code{agent-connect==0.3.4} explicitly. The package is pre-1.0 as of
+June 2026 and provides no semantic-versioning stability guarantees. The
+\code{DIDWbaAuthHeader} constructor signature and the module path
+\code{agent\_connect.authentication.did\_wba} may change in any patch
+release without a deprecation notice.
+\end{warningbox}
+
+Resolving a remote agent's \code{AgentCard} follows directly from the DID
+Document. The document's \code{service} array contains an entry of type
+\code{"AgentDescriptionService"} whose \code{serviceEndpoint} is the
+\code{AgentCard} URL established in Chapter~17~\S17.2. Fetching that URL
+and validating the response with \code{AgentCard.model\_validate()} is the
+complete resolution chain: DID $\rightarrow$ DID Document $\rightarrow$
+\code{AgentDescriptionService} $\rightarrow$ \code{AgentCard}. There is no
+SDK-provided \code{resolve()} method in \code{agent-connect~0.3.4}; the
+resolution is explicit HTTP traversal.
+
+\begin{lstlisting}[language=Python,
+  caption={\texttt{DIDWbaAuth} adapter and manual \texttt{AgentCard} resolution},
+  label={lst:anp-auth}]
+# chapter18/anp_auth.py
+from typing import Generator
+import httpx
+from agent_connect.authentication.did_wba import DIDWbaAuthHeader
+from a2a.types import AgentCard
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class ANPAgentConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="ANP_")
+    did:         str     # e.g. "did:wba:agents.example.com"
+    private_key: str     # Ed25519 raw bytes as hex string — from env
+
+class DIDWbaAuth(httpx.Auth):
+    """httpx.Auth adapter; regenerates the signed header on every request."""
+    def __init__(self, config: ANPAgentConfig) -> None:
+        self._config = config
+
+    def auth_flow(
+        self, request: httpx.Request,
+    ) -> Generator[httpx.Request, httpx.Response, None]:
+        header_val = DIDWbaAuthHeader(
+            self._config.did,
+            bytes.fromhex(self._config.private_key),
+        ).get_header(str(request.url))
+        request.headers["Authorization"] = header_val
+        yield request
+
+async def resolve_agent_card(target_did: str) -> AgentCard:
+    """DID -> DID Document -> AgentDescriptionService -> AgentCard."""
+    host    = target_did.removeprefix("did:wba:")
+    did_url = f"https://{host}/.well-known/did.json"
+    async with httpx.AsyncClient() as http:
+        did_doc = (await http.get(did_url, timeout=5.0)).json()
+        svc = next(
+            s for s in did_doc.get("service", [])
+            if s["type"] == "AgentDescriptionService"
+        )
+        card_resp = await http.get(svc["serviceEndpoint"], timeout=5.0)
+    return AgentCard.model_validate(card_resp.json())
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:anp-auth} deserve explanation.
+\code{DIDWbaAuth} is an \code{httpx.Auth} subclass rather than a helper
+function that patches a header manually; \code{httpx} calls
+\code{auth\_flow} on every request it dispatches, including retries and
+redirects, which means the signed challenge is always fresh without any
+retry-aware code at the call site. \code{ANPAgentConfig.private\_key}
+stores the key as a hex string rather than a PEM block because
+\code{DIDWbaAuthHeader} expects raw key bytes, and hex strings round-trip
+through environment variables and \code{.env} files without the newline
+and whitespace fragility of PEM. \code{resolve\_agent\_card} reuses a
+single \code{httpx.AsyncClient} across both the DID Document fetch and the
+\code{AgentCard} fetch; this is not a performance micro-optimisation --- it
+ensures that a transient DNS failure or network partition affects both
+requests equally, so the function either fully resolves or fails cleanly
+rather than returning a partially resolved state where the card URL was
+found but the card was not.
+
+All four layers are now individually testable. The capstone composes them
+into a LangGraph orchestrator that proves identity, seals the payload,
+attests capability, and signs the connection --- four independent
+guarantees, four independent failure modes, one coherent system.
+
+
+%% ------------------------------------------------------------
+\section{Security Layers Must Remain Independent to Remain Testable}
+\label{sec:anp-handshake}
+%% ------------------------------------------------------------
+
+The design problem is layer collapse during assembly: when four security
+mechanisms are inlined into a single function, each one becomes
+untestable in isolation and partial failures become impossible to
+classify. The naive approach is to write a monolithic
+\code{send\_cross\_org()} that packs the envelope, attaches the VC, signs
+the request, and dispatches in one block --- and then debug the whole
+composite end-to-end. The governing principle is that assembly must not
+collapse layers: the LangGraph graph separates resolution, packing, and
+dispatch into distinct nodes, each of which can fail independently and
+produce a structured, actionable error.
+
+Three independent security layers answer three different questions, and all
+three must be present for a production cross-org call. The DIDComm
+envelope asks: \emph{is this message confidential and from a verified
+sender?} The Verifiable Credential asks: \emph{is this agent
+organisationally authorised to request this skill?} The
+\code{DIDWbaAuth} HTTP header asks: \emph{is this HTTP connection signed
+by the DID that owns the session?} These questions are logically
+independent: a message can be correctly encrypted but arrive from an
+unauthorised agent; an authorised agent can present a valid VC but fail
+the connection-level DID challenge. Collapsing them makes failure
+attribution impossible.
+
+The orchestrator holds both security artefacts in \code{CrossOrgState}:
+\code{vc\_jwt} (issued once at process startup by the platform operator)
+and \code{agent\_card} (resolved from the target DID at startup via
+\code{resolve\_agent\_card()}). Resolving both at startup rather than
+per-call is the same fail-fast pattern used for \code{A2ACardResolver} in
+Chapter~17~\S17.6: if the remote agent is unreachable or its card is
+malformed, the graph fails before the first real task rather than mid-task.
+
+\begin{lstlisting}[language=Python,
+  caption={Graph state, resolve node, and request builder},
+  label={lst:anp-handshake-nodes}]
+# chapter18/cross_org_handshake.py  (part 1)
+from uuid import uuid4
+from typing import TypedDict
+from a2a.types import AgentCard, Message, Role, SendMessageRequest, TextPart
+from langgraph.graph import StateGraph, START, END
+from chapter18.anp_auth import ANPAgentConfig, DIDWbaAuth, resolve_agent_card
+from chapter18.didcomm_envelope import (
+    build_packaging_service, pack_a2a_request, unpack_a2a_request,
+)
+
+class CrossOrgState(TypedDict):
+    input_text:  str
+    result:      str
+    agent_card:  AgentCard | None
+    vc_jwt:      str
+    last_error:  Exception | None
+
+def _build_request(text: str) -> SendMessageRequest:
+    return SendMessageRequest(
+        message=Message(
+            messageId=uuid4().hex,
+            kind="message",
+            role=Role.user,
+            parts=[TextPart(kind="text", text=text)],
+        )
+    )
+
+def make_resolve_node(target_did: str):
+    async def resolve_node(state: CrossOrgState) -> CrossOrgState:
+        try:
+            card = await resolve_agent_card(target_did)
+            return {**state, "agent_card": card, "last_error": None}
+        except Exception as exc:
+            return {**state, "last_error": exc}
+    return resolve_node
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Delegate node, routing, and graph compilation},
+  label={lst:anp-handshake-delegate}]
+# chapter18/cross_org_handshake.py  (part 2)
+import httpx
+
+def make_delegate_node(config: ANPAgentConfig, sender_did: str, target_did: str):
+    async def delegate_node(state: CrossOrgState) -> CrossOrgState:
+        try:
+            packer = build_packaging_service(sender_did)
+            body   = {
+                "payload": _build_request(state["input_text"]).model_dump(),
+                "vc_jwt":  state["vc_jwt"],
+            }
+            packed = await pack_a2a_request(
+                packer, body, sender_did, target_did,
+            )
+            task_url = str(state["agent_card"].url)
+            async with httpx.AsyncClient(auth=DIDWbaAuth(config)) as http:
+                resp = await http.post(
+                    task_url,
+                    content=packed,
+                    headers={
+                        "Content-Type":
+                            "application/didcomm-encrypted+json",
+                    },
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                result_body, _ = await unpack_a2a_request(
+                    packer, resp.content,
+                )
+            return {**state, "result": result_body.get("text", ""),
+                    "last_error": None}
+        except Exception as exc:
+            return {**state, "last_error": exc}
+    return delegate_node
+
+def _route(state: CrossOrgState) -> str:
+    return "log_failure" if state["last_error"] else "delegate"
+
+def build_graph(
+    config: ANPAgentConfig,
+    sender_did: str,
+    target_did: str,
+):
+    async def log_failure(state: CrossOrgState) -> CrossOrgState:
+        return state
+
+    builder = StateGraph(CrossOrgState)
+    builder.add_node("resolve",
+        make_resolve_node(target_did))
+    builder.add_node("delegate",
+        make_delegate_node(config, sender_did, target_did))
+    builder.add_node("log_failure", log_failure)
+    builder.add_edge(START, "resolve")
+    builder.add_conditional_edges(
+        "resolve", _route,
+        {"delegate": "delegate", "log_failure": "log_failure"},
+    )
+    builder.add_edge("delegate", END)
+    builder.add_edge("log_failure", END)
+    return builder.compile()
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:anp-handshake-nodes}
+and~\ref{lst:anp-handshake-delegate} deserve explanation.
+Both nodes are constructed via factory functions (\code{make\_resolve\_node},
+\code{make\_delegate\_node}) that close over their configuration parameters
+rather than reading them from \code{CrossOrgState}; this keeps
+\code{CrossOrgState} free of infrastructure fields --- the state carries
+business data, not deployment configuration, which is the same boundary
+Chapter~17~\S17.6 maintained between \code{OrchestratorState} fields and
+the environment. \code{build\_packaging\_service} is called inside
+\code{delegate\_node} on every invocation rather than once at graph
+construction time, because \code{PackagingService} holds an
+\code{InMemorySecretsManager} whose key entries are associated with the
+sender's DID URL; sharing a single instance across concurrent graph
+invocations would allow one invocation's key state to be observed by
+another. The \code{Content-Type} header is set to
+\code{"application/didcomm-encrypted+json"}, the MIME type registered for
+DIDComm v2 JWE envelopes; without it, HTTP intermediaries that perform
+content inspection will attempt to decode the binary envelope as UTF-8
+JSON and corrupt the ciphertext before it reaches the recipient.
+
+\begin{notebox}
+For intra-org deployments, remove \code{make\_resolve\_node} (the URL is
+known at configuration time), skip \code{pack\_a2a\_request} entirely,
+and replace \code{DIDWbaAuth} with \code{ScopedBearerAuth} from
+Chapter~17~\S17.4. The graph collapses to the three-file orchestrator
+from Chapter~17~\S17.6 with no other changes. The four layers in this
+chapter are additive and independent: each one can be present or absent
+without affecting the others.
+\end{notebox}
+
+The architecture established here makes a cross-org agent call as
+verifiable as an in-process one. Chapter~19 takes the next step inward:
+where this chapter asked how to call a remote agent discovered through its
+DID, the next chapter asks how a parent orchestrator decides \emph{which}
+of many known agents to call, how it decomposes a complex task across them
+dynamically, and what happens when the decomposition plan must change while
+work is already in flight.
