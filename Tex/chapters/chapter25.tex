@@ -1,17 +1,930 @@
 %% ============================================================
-%%  Chapter 25 --- Evaluation with Langfuse, RAGAS and DeepEval
+%%  CHAPTER 25 — Continuous Quality Without Guessing
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
-%%  Dependencies: langfuse >= 4.0.0,
-%%                ragas >= 0.2.0,
-%%                deepeval >= 0.21.0,
-%%                litellm >= 1.40.0,
-%%                langchain >= 0.3.0,
-%%                langchain-openai >= 0.2.0,
-%%                pytest >= 8.0.0,
-%%                asyncpg >= 0.29.0,
-%%                pydantic >= 2.7.0,
-%%                python >= 3.11
 %% ============================================================
 
-\chapterquote{a system that cannot measure its own correctness
-cannot know when it stops being correct.}{anon}
+\chapter{Continuous Quality Without Guessing}
+\label{chap:eval}
+
+An agent that passes all unit tests in CI can still silently degrade in
+production the moment a new LLM version ships, the retriever's index is
+rebuilt with different chunking, or the user population drifts toward a
+subdomain the golden set never represented.  The failure mode is invisible:
+no exception is raised, no latency spike appears in the dashboards built in
+Chapter~\ref{chap:observability}, and the agent continues returning
+responses --- responses that are subtly less faithful, less relevant, or
+less grounded than they were last week.  Without a measurement loop that
+runs both continuously on live traffic \emph{and} in deterministic CI runs,
+quality degradation is discovered only through user complaints.
+
+The solution has four layers.  The first is a \emph{golden dataset} --- a
+version-controlled collection of (input, expected output, metadata) triples
+stored in Langfuse that acts as the single source of truth for all
+evaluation.  The second is \emph{online evaluation}: lightweight
+LLM-as-judge scoring attached fire-and-forget to every production trace,
+providing continuous signal that catches distribution shift without blocking
+the user's response.  The third is \emph{offline evaluation}: RAGAS and
+DeepEval metrics computed in CI against the golden dataset, providing
+statistically meaningful pass/fail gates on every pull request.  The fourth
+is a \emph{CI harness} that wires all three layers together, pins the
+dataset to a version-stamped snapshot so parallel PRs are comparable, and
+enforces machine-readable success criteria that prevent metric inflation
+from creeping thresholds.
+
+The sections are ordered by dependency.  \S\ref{sec:golden-dataset}
+establishes the dataset structure because every later section reads from it.
+\S\ref{sec:online-eval} builds online judging because it produces additional
+trace scores that enrich the dataset items promoted from production.
+\S\ref{sec:ragas-metrics} and \S\ref{sec:deepeval-metrics} build the offline
+suites that consume the same dataset.  \S\ref{sec:success-criteria} defines
+the immutable threshold contract before \S\ref{sec:ci-harness} assembles the
+harness that enforces it, so the harness never hard-codes a number.
+
+\begin{table}[ht]
+\centering
+\caption{Domain terms introduced in Chapter~\ref{chap:eval}}
+\label{tab:eval-terms}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{P{0.24\linewidth} P{0.70\linewidth}}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+Golden dataset
+  & A version-controlled collection of labelled (input, expected\,output)
+    pairs used as the reference population for all offline evaluation. \\
+Online evaluation
+  & Metric computation performed on live production traces, asynchronously,
+    without blocking the user's response path. \\
+Offline evaluation
+  & Metric computation performed in CI against a pinned golden dataset
+    snapshot; provides deterministic pass/fail gates. \\
+LLM-as-judge
+  & A separate LLM invocation --- distinct from the agent's model --- that
+    scores a response against a rubric, returning a numeric value and
+    a natural-language rationale. \\
+Faithfulness
+  & The fraction of factual claims in a generated answer that are directly
+    supported by the retrieved contexts; measures hallucination risk. \\
+Answer Relevancy
+  & A metric that reverse-generates hypothetical questions from an answer
+    and measures their embedding cosine similarity to the original query;
+    measures off-topic or evasive responses. \\
+Context Precision
+  & The fraction of retrieved chunks that are actually useful for producing
+    the reference answer; measures retriever over-fetching. \\
+Context Recall
+  & The fraction of reference-answer statements that are attributable to
+    at least one retrieved chunk; measures retriever under-fetching. \\
+Success criteria
+  & A machine-readable, version-controlled mapping from metric name to
+    minimum passing threshold; the single authoritative source CI reads. \\
+Score config
+  & A Langfuse server-side object that registers a metric name, data type,
+    and rubric description so scores appear labelled in the UI. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{sourcelayout}
+\dirtree{%
+  .1 src/.\
+  .2 eval/.\
+  .3 dataset\_manager.py \DTcomment{\S\ref{sec:golden-dataset}}.\
+  .3 online\_judge.py \DTcomment{\S\ref{sec:online-eval}}.\
+  .3 ragas\_suite.py \DTcomment{\S\ref{sec:ragas-metrics}}.\
+  .3 deepeval\_suite.py \DTcomment{\S\ref{sec:deepeval-metrics}}.\
+  .3 success\_criteria.py \DTcomment{\S\ref{sec:success-criteria}}.\
+  .3 run\_eval.py \DTcomment{\S\ref{sec:ci-harness}}.\
+  .2 tests/.\
+  .3 test\_eval\_ci.py \DTcomment{\S\ref{sec:ci-harness}}.\
+  .1 .github/workflows/.\
+  .2 eval.yml \DTcomment{\S\ref{sec:ci-harness}}.\
+}
+\end{sourcelayout}
+
+
+%%------------------------------------------------------------
+\section{The Dataset Is the Single Source of Truth}
+\label{sec:golden-dataset}
+%%------------------------------------------------------------
+
+The design problem is reproducibility: if two engineers run the evaluation
+suite on the same commit and get different scores, the metric is meaningless
+as a gate.  The naive approach of storing golden cases in a JSON file
+committed to the repository makes this worse, not better --- the file drifts
+independently of the live traces it was supposed to represent, there is no
+audit trail of who added or removed items, and a PR that renames a field
+silently breaks every future run.  The principle the solution follows is
+that the golden dataset must be a \emph{server-side, versioned artefact}
+whose items carry provenance metadata and whose state at any point in time
+is reachable by a deterministic identifier that CI can pin.
+
+Langfuse datasets fulfil this contract.  An \emph{item} is a triple
+composed of an \code{input} dict, an \code{expected\_output} dict, and a
+\code{metadata} dict.  The server validates item shape against
+\code{input\_schema} and \code{expected\_output\_schema} JSON Schema objects
+supplied when the dataset is created, rejecting malformed uploads at
+write-time rather than at eval-time.  Every mutation --- \code{upsert\_item},
+archive, delete --- increments an implicit version tracked by the server's
+\code{updatedAt} timestamp; CI pins to a specific snapshot by passing that
+ISO-8601 string to \code{get\_dataset} as the \code{version} argument.  The
+default call returns the latest state, so local development always sees
+current data while CI sees a frozen snapshot.
+
+Items arrive from two sources whose provenance must be distinguished.
+\emph{Production-promoted} items are created when a human operator labels a
+live trace as correct in the Langfuse UI: the trace's input and the
+operator's confirmed output become an item with
+\code{metadata["source"] = "production"}.  \emph{Synthetic} items are
+generated by an LLM to cover adversarial cases, rare domains, or edge
+inputs the production population never includes; they carry
+\code{metadata["source"] = "synthetic"}.  The distinction matters for
+selective runs: a deployment that only touches the security guardrails layer
+can run evaluation against \code{domain="security"} items only, cutting
+CI cost by an order of magnitude while preserving signal relevance.
+
+\begin{warningbox}
+Langfuse SDK v4 uses \code{get\_client()} --- a singleton backed by the
+OpenTelemetry foundation --- instead of the \code{Langfuse()} constructor
+used in SDK v2 and v3.  Calling \code{Langfuse()} in v4 raises a
+deprecation warning and will fail in a future minor.  All code in this
+chapter uses \code{get\_client()} exclusively.
+\end{warningbox}
+
+The \code{ensure\_dataset} helper is intentionally idempotent.  Calling it
+twice on a dataset that already exists must not raise an error.
+The Langfuse server returns the existing dataset unchanged when
+\code{create\_dataset} is called with a name that already exists, so the
+function is safe to invoke on every CI startup without a prior existence
+check.
+
+\begin{lstlisting}[language=Python, caption={Dataset manager: schema
+    enforcement\, idempotent creation\, and version-pinned fetch},
+    label={lst:dataset-manager}]
+# src/eval/dataset_manager.py
+from __future__ import annotations
+from langfuse import get_client
+
+DATASET_NAME = "evaluation/agent-golden-v1"
+
+GOLDEN_INPUT_SCHEMA: dict = {
+    "type": "object",
+    "required": ["query", "retrieved_contexts"],
+    "properties": {
+        "query":               {"type": "string"},
+        "retrieved_contexts":  {
+            "type": "array", "items": {"type": "string"}
+        },
+    },
+}
+GOLDEN_OUTPUT_SCHEMA: dict = {
+    "type": "object",
+    "required": ["answer"],
+    "properties": {"answer": {"type": "string"}},
+}
+
+def ensure_dataset() -> None:
+    get_client().create_dataset(
+        name=DATASET_NAME,
+        input_schema=GOLDEN_INPUT_SCHEMA,
+        expected_output_schema=GOLDEN_OUTPUT_SCHEMA,
+    )
+
+def upsert_golden_item(
+    item_id: str, query: str, contexts: list[str],
+    expected_answer: str, metadata: dict,
+) -> None:
+    get_client().get_dataset(DATASET_NAME).upsert_item(
+        id=item_id,
+        input={"query": query, "retrieved_contexts": contexts},
+        expected_output={"answer": expected_answer},
+        metadata=metadata,
+    )
+
+def fetch_dataset_at_version(version_ts: str) -> list[dict]:
+    ds = get_client().get_dataset(DATASET_NAME, version=version_ts)
+    return [
+        {"id": it.id, "input": it.input,
+         "expected_output": it.expected_output, "metadata": it.metadata}
+        for it in ds.items
+    ]
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:dataset-manager} deserve explanation.
+First, \code{DATASET\_NAME} uses the \texttt{folder/name} format
+(\code{evaluation/agent-golden-v1}) rather than a flat name; Langfuse
+displays the folder prefix as a namespace in the UI, preventing name
+collisions when multiple projects share a server.  Second, the
+\code{version\_ts} parameter to \code{fetch\_dataset\_at\_version} is an
+ISO-8601 string --- it is the value stored in the CI workflow's
+\code{EVAL\_DATASET\_VERSION} secret, not a sequential integer, which means
+rolling back to any historical state requires only updating that secret
+rather than rewriting history.  Third, \code{upsert\_item} is used instead
+of a create/update conditional because \code{upsert\_item} is idempotent on
+\code{id}: a re-promoted trace does not produce a duplicate item but instead
+updates the existing one in place.
+
+The dataset structure and versioning contract are now established.  The next
+problem is measuring quality on live traces without touching the user's
+response path.
+
+%%------------------------------------------------------------
+\section{Judgment Must Not Block the User}
+\label{sec:online-eval}
+%%------------------------------------------------------------
+
+The design problem is latency asymmetry: an LLM-as-judge call takes
+100--800\,ms, which is a large fraction of the agent's total response time
+budget.  Inserting the judge into the graph's critical path --- as a
+post-processing node that runs before the response is returned --- inflates
+p95 latency by the full judge call duration for every user request.  The
+naive approach, calling the judge synchronously, is unjustifiable because
+the judge score is not needed to produce the response; it is observability
+data.  The principle is that observability must be fire-and-forget: enqueue
+the work as a non-blocking \code{asyncio} task and return the user's answer
+immediately.
+
+Score attachment in Langfuse SDK v4 follows a single path:
+\code{get\_client().create\_score(trace\_id=..., name=..., value=...,
+data\_type=..., comment=...)}.  The \code{data\_type} argument is a plain
+string, either \code{"NUMERIC"} or \code{"CATEGORICAL"} --- it is not an
+imported enum.  An optional \code{observation\_id} narrows the score to a
+specific span rather than the trace root; for online faithfulness and
+relevancy the trace root is the correct granularity because both metrics
+characterise the full response, not any individual retrieval or generation
+step.
+
+Before scores can be created they must be registered as \emph{score
+configs} on the Langfuse server.  A score config records the metric's name,
+data type, and rubric description so the UI can display labelled scores with
+their definitions inline.  In SDK v4 the correct API path is
+\code{get\_client().api.score\_configs.create(request=...)} using the
+\code{CreateScoreConfigRequest} model.  There is no top-level convenience
+method: the underlying REST client is accessed through
+\code{get\_client().api}.
+
+\begin{notebox}
+The judge model must be \emph{different} from the agent's own model.
+Using the same model as both author and critic produces optimistic
+self-grading: the judge internalises the same biases that caused the
+response and rates it higher than an independent evaluator would.
+A fast, cheap model in a different model family --- \code{claude-haiku-4.5}
+when the agent uses \code{gemini-3.1-pro}, or vice versa --- provides
+genuine independence while keeping judge latency low.
+\end{notebox}
+
+The judge model is injected through \code{RunnableConfig.configurable}
+rather than hard-coded.  Chapter~\ref{chap:config} introduced
+\code{RunnableConfig.configurable} as the mechanism for per-invocation
+parameter overrides without modifying source; reading the judge model from
+it means the test suite can swap to a deterministic mock without altering
+the production code path.
+
+\begin{lstlisting}[language=Python, caption={Online judge: fire-and-forget
+    scoring attached to every production trace},
+    label={lst:online-judge}]
+# src/eval/online_judge.py
+from __future__ import annotations
+import asyncio, json
+from langfuse import get_client
+from langfuse.api import CreateScoreConfigRequest
+import litellm
+
+FAITHFULNESS_RUBRIC = (
+    "Score 0.0-1.0. 1.0 = every factual claim in the answer is "
+    "directly supported by at least one retrieved context. "
+    "0.0 = answer introduces facts absent from all contexts."
+)
+RELEVANCY_RUBRIC = (
+    "Score 0.0-1.0. 1.0 = answer directly and completely addresses "
+    "the question. Penalise irrelevant content or evasion."
+)
+
+def ensure_score_configs() -> None:
+    lf = get_client()
+    for name, rubric in [
+        ("faithfulness_online", FAITHFULNESS_RUBRIC),
+        ("answer_relevancy_online", RELEVANCY_RUBRIC),
+    ]:
+        lf.api.score_configs.create(
+            request=CreateScoreConfigRequest(
+                name=name, data_type="NUMERIC", description=rubric,
+            )
+        )
+
+async def _judge(query, answer, contexts, judge_model) -> dict:
+    prompt = (
+        f"Query: {query}\nContexts: {contexts}\nAnswer: {answer}\n"
+        "Return JSON: {\"faithfulness\": <0-1>, "
+        "\"answer_relevancy\": <0-1>, "
+        "\"faithfulness_reason\": \"...\", "
+        "\"relevancy_reason\": \"...\"}"
+    )
+    resp = await litellm.acompletion(
+        model=judge_model,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+    )
+    return json.loads(resp.choices[0].message.content)
+
+async def run_online_judge(
+    trace_id: str, query: str, answer: str,
+    contexts: list[str], judge_model: str,
+) -> None:
+    scores = await _judge(query, answer, contexts, judge_model)
+    lf = get_client()
+    lf.create_score(trace_id=trace_id, name="faithfulness_online",
+        value=scores["faithfulness"], data_type="NUMERIC",
+        comment=scores["faithfulness_reason"])
+    lf.create_score(trace_id=trace_id, name="answer_relevancy_online",
+        value=scores["answer_relevancy"], data_type="NUMERIC",
+        comment=scores["relevancy_reason"])
+
+def attach_online_judge_to_node(
+    trace_id: str, query: str, answer: str,
+    contexts: list[str], judge_model: str,
+) -> None:
+    asyncio.create_task(
+        run_online_judge(trace_id, query, answer, contexts, judge_model)
+    )
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:online-judge} deserve explanation.
+First, \code{response\_format=\{"type": "json\_object"\}} is passed to
+\code{acompletion}; this is LiteLLM's unified way of requesting structured
+JSON output from any model that supports it, eliminating the need to parse
+prose from the judge response.  Second, both scores are attached in the same
+\code{run\_online\_judge} coroutine rather than two separate tasks; if the
+judge call fails, neither score is partially written, keeping the trace's
+score set consistent.  Third, \code{attach\_online\_judge\_to\_node}
+receives a \code{judge\_model} string rather than building it internally,
+which means the CI harness in \S\ref{sec:ci-harness} can call it with the
+same model used for offline metrics, making online and offline scores
+directly comparable on CI-run traces.
+
+\begin{warningbox}
+\code{asyncio.create\_task} only works inside a running event loop.
+If \code{attach\_online\_judge\_to\_node} is ever called from a synchronous
+context --- for example a LangGraph node executed without \code{await} ---
+it will raise \code{RuntimeError: no running event loop}.  Use
+\code{asyncio.ensure\_future} with an explicit loop reference, or confirm
+the graph is invoked via \code{ainvoke}, not \code{invoke}.
+\end{warningbox}
+
+Online scores now accumulate on every production trace.  The next problem
+is computing the statistically richer offline metrics --- faithfulness,
+relevancy, context precision, and context recall --- in a way that is
+reproducible, configurable, and aware of its own timeout boundaries.
+
+%%------------------------------------------------------------
+\section{Retrieval Quality Has Four Distinct Failure Modes}
+\label{sec:ragas-metrics}
+%%------------------------------------------------------------
+
+The design problem is that ``quality'' is not a single dimension.  A
+retriever that over-fetches --- returning fifty chunks when three are
+relevant --- scores high on recall but wastes tokens and degrades
+faithfulness because the model must ignore irrelevant material.  A
+generator that hedges excessively scores high on faithfulness but low on
+answer relevancy because it refuses to commit to a direct answer.  The
+naive approach of tracking a single aggregate quality score conflates these
+independent failure modes and makes it impossible to diagnose which layer
+--- retriever or generator --- regressed.  The principle is that each
+metric must measure one failure mode in one layer, with no overlap.
+
+RAGAS v0.2 provides four metrics that partition the failure space cleanly.
+\emph{Faithfulness} measures whether the generator invents facts not present
+in the retrieved contexts; it requires \code{user\_input}, \code{response},
+and \code{retrieved\_contexts} but not a reference answer, because it checks
+the response against the contexts, not against ground truth.
+\emph{AnswerRelevancy} measures whether the response addresses the question;
+it reverse-generates hypothetical questions from the answer, measures their
+embedding similarity to the original query, and requires only
+\code{user\_input} and \code{response}.  \emph{ContextPrecision} measures
+what fraction of retrieved chunks were actually needed; it requires a
+reference answer because it must determine which chunks are useful for
+producing the ground truth.  \emph{ContextRecall} measures whether every
+claim in the reference answer can be attributed to at least one retrieved
+chunk; it requires \code{retrieved\_contexts} and \code{reference}.
+
+\begin{notebox}
+RAGAS field names are \code{user\_input}, \code{response},
+\code{retrieved\_contexts}, and \code{reference} --- not \code{query},
+\code{answer}, \code{contexts}, or \code{ground\_truth}.  Using the wrong
+names produces silent \code{None} fields in \code{SingleTurnSample} which
+RAGAS treats as missing, skipping the metric entirely without raising an
+exception.  Map all incoming data explicitly.
+\end{notebox}
+
+RAGAS uses its own LLM client for judge calls by default.  Allowing this
+means the judge bypasses the LiteLLM retry-and-fallback layer established
+in Chapter~\ref{chap:litellm}, opening a second unmonitored token spend path
+and a different error-handling surface.  Injecting a
+\code{LangchainLLMWrapper} around the same \code{ChatLiteLLM} instance used
+by the agent closes both gaps: all RAGAS judge calls flow through the same
+provider, inherit the same retry policy, and appear in the same Langfuse
+trace tree.
+
+The \code{RunConfig} timeout deserves explicit attention.  RAGAS's default
+timeout is thirty seconds.  A judge call to a provider under load --- common
+in CI environments running parallel matrix jobs --- can easily exceed that
+limit, causing RAGAS to silently return \code{nan} for the affected metric
+rather than raising an exception.  Setting \code{timeout=120} with
+\code{max\_retries=3} and \code{max\_wait=60} covers the realistic tail
+latency of any supported provider.
+
+\begin{lstlisting}[language=Python, caption={RAGAS suite: four metrics\,
+    injected LLM\, and explicit run config},
+    label={lst:ragas-suite}]
+# src/eval/ragas_suite.py
+from __future__ import annotations
+from ragas import EvaluationDataset, evaluate, RunConfig
+from ragas.dataset_schema import SingleTurnSample
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.metrics import (
+    Faithfulness, AnswerRelevancy,
+    ContextPrecision, ContextRecall,
+)
+
+DEFAULT_RUN_CONFIG = RunConfig(timeout=120, max_retries=3, max_wait=60)
+
+def build_ragas_dataset(items: list[dict]) -> EvaluationDataset:
+    samples = [
+        SingleTurnSample(
+            user_input=it["input"]["query"],
+            response=it["run_output"]["answer"],
+            retrieved_contexts=it["run_output"].get(
+                "retrieved_contexts", []),
+            reference=it["expected_output"].get("answer"),
+        )
+        for it in items
+    ]
+    return EvaluationDataset(samples=samples)
+
+def run_ragas_suite(
+    dataset: EvaluationDataset,
+    llm: LangchainLLMWrapper,
+    embeddings: LangchainEmbeddingsWrapper,
+    run_config: RunConfig = DEFAULT_RUN_CONFIG,
+) -> dict[str, float]:
+    metrics = [
+        Faithfulness(llm=llm),
+        AnswerRelevancy(llm=llm, embeddings=embeddings),
+        ContextPrecision(llm=llm),
+        ContextRecall(llm=llm),
+    ]
+    result = evaluate(
+        dataset=dataset, metrics=metrics,
+        llm=llm, embeddings=embeddings,
+        run_config=run_config,
+    )
+    return {k: float(v) for k, v in result.items()
+            if v is not None and str(v) != "nan"}
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:ragas-suite} deserve explanation.
+First, the \code{llm} argument is passed \emph{both} at the metric
+constructor level and at the \code{evaluate()} call level; this is
+intentional --- some RAGAS metric implementations read the LLM from the
+metric object while others fall back to the evaluate-level argument, and
+passing both ensures consistent coverage regardless of which internal path a
+given metric version takes.  Second, the \code{dict} comprehension at the
+end filters out \code{None} and \code{"nan"} values explicitly; a caller
+that receives \code{nan} and treats it as a float will silently pass a
+threshold check, which is worse than surfacing the missing metric as an
+absent key.  Third, \code{run\_output} is a nested key rather than a flat
+field because the CI harness in \S\ref{sec:ci-harness} stores the full agent
+response dict --- including retrieved contexts --- alongside the golden item,
+enabling the CI harness to supply both \code{response} and
+\code{retrieved\_contexts} without a second agent invocation.
+
+RAGAS measures retrieval and generation quality in aggregate across the
+dataset.  The next section adds a complementary framework that measures
+quality at the level of individual test cases, enabling item-level failure
+reports rather than dataset-level mean scores.
+
+%%------------------------------------------------------------
+\section{Item-Level Failures Reveal What Means Cannot}
+\label{sec:deepeval-metrics}
+%%------------------------------------------------------------
+
+The design problem is that dataset-level mean scores obscure the
+distribution of failures.  A faithfulness mean of 0.83 across fifty items
+is consistent with forty-eight perfect items and two complete hallucinations,
+which is a very different risk profile from fifty items each scoring 0.83.
+The naive approach of accepting a passing mean score as evidence of quality
+misses the tail: the two hallucinating items may correspond to the agent's
+most common query pattern.  The principle is that every evaluation framework
+must be capable of surfacing which specific items failed and why, so
+engineers can trace failures back to the golden dataset item, the trace, and
+the retriever invocation that produced them.
+
+DeepEval operates at the test-case level: each \code{LLMTestCase} maps to a
+single golden item, and each metric's \code{measure()} call assigns a score
+and a \code{reason} string to that specific case.  This means a failing CI
+run produces a per-item report --- item ID, metric name, score, reason ---
+that is actionable without additional querying.
+
+\begin{notebox}
+DeepEval's \code{FaithfulnessMetric}, \code{AnswerRelevancyMetric}, and
+\code{GEval} accept a \code{model} argument that is either an OpenAI model
+name string (for OpenAI-compatible providers) or a subclass of
+\code{DeepEvalBaseLLM}.  Passing a bare non-OpenAI model string such as
+\code{"claude-haiku-4.5"} will raise a \code{ValueError} at runtime because
+DeepEval cannot resolve it to a client.  For non-OpenAI models, implement a
+thin \code{DeepEvalBaseLLM} wrapper that delegates to \code{litellm.completion},
+or expose the model through a LiteLLM OpenAI-compatible proxy and pass the
+resulting OpenAI-format model string.
+\end{notebox}
+
+\code{GEval} is DeepEval's configurable rubric-based metric.  It evaluates
+a test case against a natural-language criteria string, producing a 0--1
+score and a reason.  This makes it the right choice for domain-specific
+quality dimensions that RAGAS does not cover --- for example, whether a
+legal-domain response correctly cites its jurisdictional scope, or whether a
+medical response includes the appropriate hedging language.
+
+\begin{lstlisting}[language=Python, caption={DeepEval suite: per-item
+    scoring with built-in and rubric-based metrics},
+    label={lst:deepeval-suite}]
+# src/eval/deepeval_suite.py
+from __future__ import annotations
+from dataclasses import dataclass
+from deepeval import assert_test
+from deepeval.test_case import LLMTestCase
+from deepeval.metrics import (
+    FaithfulnessMetric, AnswerRelevancyMetric, GEval,
+)
+from deepeval.test_case import LLMTestCaseParams
+
+@dataclass
+class ItemResult:
+    item_id: str
+    metric:  str
+    score:   float
+    reason:  str
+    passed:  bool
+
+def build_test_case(item: dict) -> LLMTestCase:
+    return LLMTestCase(
+        input=item["input"]["query"],
+        actual_output=item["run_output"]["answer"],
+        expected_output=item["expected_output"].get("answer", ""),
+        retrieval_context=item["run_output"].get(
+            "retrieved_contexts", []),
+    )
+
+def run_deepeval_suite(
+    items: list[dict],
+    judge_model: str,
+    faithfulness_threshold: float,
+    relevancy_threshold:    float,
+) -> list[ItemResult]:
+    metrics = [
+        FaithfulnessMetric(
+            threshold=faithfulness_threshold, model=judge_model),
+        AnswerRelevancyMetric(
+            threshold=relevancy_threshold,    model=judge_model),
+        GEval(
+            name="citation_coverage",
+            criteria=(
+                "Does the answer cite or reference the specific "
+                "source material used from the retrieved contexts?"
+            ),
+            evaluation_params=[
+                LLMTestCaseParams.INPUT,
+                LLMTestCaseParams.ACTUAL_OUTPUT,
+                LLMTestCaseParams.RETRIEVAL_CONTEXT,
+            ],
+            threshold=0.70, model=judge_model,
+        ),
+    ]
+    results: list[ItemResult] = []
+    for item in items:
+        tc = build_test_case(item)
+        for metric in metrics:
+            metric.measure(tc)
+            results.append(ItemResult(
+                item_id=item["id"],
+                metric=metric.name,
+                score=metric.score,
+                reason=metric.reason,
+                passed=metric.is_successful(),
+            ))
+    return results
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:deepeval-suite} deserve explanation.
+First, thresholds are passed in as arguments rather than embedded in the
+metric constructors, because the \code{SuccessCriteria} dataclass in
+\S\ref{sec:success-criteria} is the single owner of all threshold values;
+duplicating them here would create the drift the success-criteria design is
+specifically built to prevent.  Second, \code{ItemResult} is a plain
+\code{dataclass} rather than a dict so that downstream code --- the CI
+harness and any reporting step --- can access \code{.passed} with a boolean
+expression rather than a string key lookup, reducing the chance of a
+key-name typo silently treating a failure as a pass.  Third, \code{GEval}
+with \code{evaluation\_params} is used for citation coverage rather than a
+bespoke metric implementation: \code{evaluation\_params} constrains the
+judge's attention to only the specified fields of the test case, preventing
+the judge from using the \code{expected\_output} field as a shortcut and
+producing inflated scores.
+
+Item-level results are now available.  Before the harness can aggregate
+them into a pass/fail decision, it needs a machine-readable definition of
+what ``passing'' means --- one that is version-controlled, immutable after
+declaration, and readable by CI without parsing prose.
+
+%%------------------------------------------------------------
+\section{Thresholds Must Be Declared, Not Inferred}
+\label{sec:success-criteria}
+%%------------------------------------------------------------
+
+The design problem is threshold drift: without an explicit, version-
+controlled definition of what constitutes a passing score, thresholds tend
+to migrate toward whatever the system currently achieves.  The engineer
+running CI notices a score of 0.79 against a 0.80 threshold, adjusts the
+threshold to 0.78 ``temporarily'', commits, and forgets.  Six months later
+the thresholds have been lowered four times and no longer reflect product
+quality requirements.  The naive approach of embedding thresholds as magic
+numbers inside test files or environment variables makes them invisible in
+code review.  The principle is that all thresholds live in a single,
+reviewed, immutable module that is the only file CI reads for pass/fail
+decisions.
+
+The implementation uses a \code{@dataclass(frozen=True)}: frozen prevents
+post-construction mutation, and \code{\_\_post\_init\_\_} validates that every
+threshold is in the valid range at construction time.  Freezing means that
+any attempt to update a threshold after the object is created raises a
+\code{FrozenInstanceError} immediately, making accidental runtime drift
+impossible.
+
+\begin{lstlisting}[language=Python, caption={Success criteria: a frozen\,
+    validated threshold contract},
+    label={lst:success-criteria}]
+# src/eval/success_criteria.py
+from __future__ import annotations
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class SuccessCriteria:
+    # RAGAS metrics (dataset-level means)
+    faithfulness_min:       float = 0.85
+    answer_relevancy_min:   float = 0.80
+    context_precision_min:  float = 0.75
+    context_recall_min:     float = 0.80
+    # DeepEval per-item pass rates
+    deepeval_pass_rate_min: float = 0.90
+    # Online judge (alert threshold; not a CI gate)
+    online_faithfulness_alert: float = 0.70
+
+    def __post_init__(self) -> None:
+        for field, val in self.__dataclass_fields__.items():
+            v = getattr(self, field)
+            if not (0.0 <= v <= 1.0):
+                raise ValueError(
+                    f"Threshold {field}={v} must be in [0, 1]"
+                )
+
+    def ragas_passes(self, scores: dict[str, float]) -> bool:
+        checks = {
+            "faithfulness":      self.faithfulness_min,
+            "answer_relevancy":  self.answer_relevancy_min,
+            "context_precision": self.context_precision_min,
+            "context_recall":    self.context_recall_min,
+        }
+        return all(
+            scores.get(k, 0.0) >= v for k, v in checks.items()
+        )
+
+    def deepeval_passes(self, results: list) -> bool:
+        if not results:
+            return False
+        passed = sum(1 for r in results if r.passed)
+        return (passed / len(results)) >= self.deepeval_pass_rate_min
+
+THRESHOLDS = SuccessCriteria()
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:success-criteria} deserve explanation.
+First, \code{deepeval\_pass\_rate\_min} is a pass-rate fraction rather than
+a per-metric threshold, because DeepEval operates at item level: what matters
+for a CI gate is that no more than a specified fraction of items fail across
+all metrics, not that every metric achieves a certain mean.  Second,
+\code{online\_faithfulness\_alert} is defined in \code{SuccessCriteria} but
+is explicitly labelled as an alert threshold, not a CI gate; this places it
+under the same version control and code-review discipline as CI thresholds
+while making its different role explicit in the field name.  Third,
+\code{THRESHOLDS = SuccessCriteria()} creates a module-level singleton that
+every other module imports directly; this ensures that all consumers see the
+same values and that a change to any threshold triggers a visible diff on
+\code{src/eval/success\_criteria.py} in every pull request that touches it.
+
+With the threshold contract defined, the harness can now assemble the four
+layers into a single reproducible CI run.
+
+%%------------------------------------------------------------
+\section{A Harness Is Not a Test File}
+\label{sec:ci-harness}
+%%------------------------------------------------------------
+
+The design problem is that evaluation is not unit testing.  A unit test is
+deterministic, sub-second, and testing a function's contract.  An evaluation
+run is probabilistic, multi-minute, and measuring a statistical distribution
+of outputs across a population of inputs.  Treating evaluation as a pytest
+test file --- one \code{assert} per item, failing the first assertion ---
+produces a misleading CI report: a single failing item halts the run,
+preventing the collection of data from the remaining items, and the engineer
+cannot tell whether the run would have achieved 95\,\% pass rate or 20\,\%.
+The principle is that the harness must \emph{collect all results before
+making a pass/fail decision}, which requires a separate runner layer that
+aggregates before asserting.
+
+The harness has three responsibilities: pin the dataset to a version-stamped
+snapshot, invoke the agent on every item concurrently (bounded by a semaphore
+to avoid exhausting provider rate limits), and compute RAGAS and DeepEval
+scores on the collected outputs before consulting \code{THRESHOLDS} for the
+final decision.  The pytest integration is thin: a single test function calls
+the harness and asserts on its boolean return value, so the full item-level
+report is available regardless of whether the test passes or fails.
+
+\begin{lstlisting}[language=Python, caption={Evaluation runner: concurrent
+    agent invocation with bounded parallelism},
+    label={lst:eval-runner}]
+# src/eval/run_eval.py
+from __future__ import annotations
+import asyncio
+from src.eval.dataset_manager import fetch_dataset_at_version
+from src.eval.ragas_suite import build_ragas_dataset, run_ragas_suite
+from src.eval.deepeval_suite import run_deepeval_suite
+from src.eval.success_criteria import THRESHOLDS
+
+MAX_CONCURRENT = 8
+
+async def _run_item(agent, item: dict, sem: asyncio.Semaphore) -> dict:
+    async with sem:
+        result = await agent.ainvoke(item["input"])
+        return {**item, "run_output": result}
+
+async def run_all_items(
+    agent, version_ts: str
+) -> tuple[bool, dict]:
+    items  = fetch_dataset_at_version(version_ts)
+    sem    = asyncio.Semaphore(MAX_CONCURRENT)
+    tasks  = [_run_item(agent, it, sem) for it in items]
+    run_results: list[dict | BaseException] = await asyncio.gather(
+        *tasks, return_exceptions=True
+    )
+    ok_items = [r for r in run_results
+                if not isinstance(r, BaseException)]
+    failed   = len(run_results) - len(ok_items)
+    if failed > 0:
+        print(f"[eval] {failed} items raised exceptions; skipped.")
+
+    ragas_ds      = build_ragas_dataset(ok_items)
+    ragas_scores  = run_ragas_suite(ragas_ds, ...)
+
+    deepeval_res  = run_deepeval_suite(
+        ok_items,
+        judge_model=...,
+        faithfulness_threshold=THRESHOLDS.faithfulness_min,
+        relevancy_threshold=THRESHOLDS.answer_relevancy_min,
+    )
+
+    passed = (THRESHOLDS.ragas_passes(ragas_scores)
+              and THRESHOLDS.deepeval_passes(deepeval_res))
+    report = {"ragas": ragas_scores, "deepeval": deepeval_res,
+              "passed": passed, "skipped_items": failed}
+    return passed, report
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:eval-runner} deserve explanation.
+First, \code{asyncio.gather(..., return\_exceptions=True)} returns
+\code{BaseException} objects mixed into the result list rather than raising
+on the first failure; the type annotation \code{list[dict | BaseException]}
+and the subsequent filter make the mixed-type contract explicit rather than
+masking it.  An item that raises --- because the agent returned an
+unexpected schema or the provider timed out --- is logged and skipped rather
+than aborting the run, because the purpose of the harness is to collect
+data, and a partially complete run is more useful than no run.  Second,
+\code{MAX\_CONCURRENT = 8} is a module-level constant rather than an
+environment variable because it protects against provider rate limits and
+is a property of the evaluation workload, not the deployment environment;
+changing it requires a code review, not a secret rotation.  Third, the
+\code{...} placeholders for \code{llm}, \code{embeddings}, and
+\code{judge\_model} signal that those dependencies are injected at the call
+site --- the \code{run\_all\_items} function does not construct them
+internally, so the CI workflow can swap to a cheaper model without modifying
+source.
+
+\begin{lstlisting}[language=Python, caption={pytest integration: a single
+    test that collects before asserting},
+    label={lst:test-eval-ci}]
+# src/tests/test_eval_ci.py
+import asyncio, os, pytest
+from src.eval.run_eval import run_all_items
+from src.agent.graph import build_agent          # project-specific
+from langchain_community.chat_models import ChatLiteLLM
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+VERSION_TS = os.environ["EVAL_DATASET_VERSION"]
+
+@pytest.mark.asyncio
+async def test_eval_suite_passes():
+    agent      = build_agent()
+    passed, report = await run_all_items(agent, VERSION_TS)
+    # Always print the report so it appears in CI logs regardless
+    print(report)
+    assert passed, (
+        f"Evaluation suite failed.\n"
+        f"RAGAS scores: {report['ragas']}\n"
+        f"DeepEval pass rate: "
+        f"{sum(r.passed for r in report['deepeval'])}"
+        f"/{len(report['deepeval'])}\n"
+        f"Skipped items: {report['skipped_items']}"
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:test-eval-ci} deserve explanation.  First,
+\code{print(report)} runs unconditionally before the \code{assert}: pytest
+captures stdout by default and includes it in the failure report, so the
+full metric breakdown appears in the CI log even when the assertion fails
+--- the engineer does not need to re-run the suite to see which metrics
+missed their thresholds.  Second, \code{VERSION\_TS} is read from an
+environment variable rather than inlined; the GitHub Actions workflow sets
+this variable at job-start using a stored secret, so updating the pinned
+snapshot requires only rotating the secret, not modifying the test file and
+triggering an unrelated code review.
+
+\begin{lstlisting}[language=yaml, caption={GitHub Actions workflow: dataset
+    version pinning and cache-keyed artefact storage},
+    label={lst:eval-workflow}]
+# .github/workflows/eval.yml
+name: Evaluation Suite
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *"   # nightly against latest dataset version
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+
+      - name: Restore RAGAS metric cache
+        uses: actions/cache@v4
+        with:
+          path: .ragas-cache
+          key: ragas-${{ hashFiles('src/eval/success_criteria.py') }}-\
+${{ secrets.EVAL_DATASET_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -e ".[eval]"
+
+      - name: Run evaluation suite
+        env:
+          EVAL_DATASET_VERSION: ${{ secrets.EVAL_DATASET_VERSION }}
+          LANGFUSE_PUBLIC_KEY:   ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY:   ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL:     ${{ secrets.LANGFUSE_BASE_URL }}
+          OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
+        run: pytest src/tests/test_eval_ci.py -v --tb=short
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:eval-workflow} deserve explanation.
+First, the cache key combines a hash of \code{success\_criteria.py} with
+the dataset version secret: changing either the thresholds or the dataset
+snapshot invalidates the cache and forces a fresh metric computation,
+preventing a scenario where a threshold is lowered and stale cached results
+that no longer reflect the new threshold are treated as valid.  Second, the
+workflow triggers on both pull requests and a nightly schedule; the scheduled
+run uses \code{secrets.EVAL\_DATASET\_VERSION} without pinning, which means
+it evaluates against the latest dataset state and catches silent regressions
+from LLM provider updates that do not touch any code.
+
+\begin{tipbox}
+Store RAGAS metric results as a job artefact alongside the evaluation report
+JSON.  GitHub Actions retains artefacts for 90 days by default; a team that
+reviews quality weekly can compare consecutive runs without re-running the
+suite, and anomaly detection over the artefact history can flag metric
+trends before they reach the CI gate threshold.
+\end{tipbox}
+
+The evaluation infrastructure built in this chapter closes the quality loop:
+golden items are curated in Langfuse, online judges fire silently on every
+production trace, offline RAGAS and DeepEval suites gate every pull request,
+and the success-criteria contract prevents threshold drift.  The remaining
+open question is what happens when a test item reveals a failure that
+requires changing the agent's retrieval strategy --- a change that affects
+the entire system simultaneously rather than a single node.  Chapter~\ref{chap:advanced-rag}
+examines how to restructure the retrieval graph so that strategy changes are
+localised to a swappable subgraph rather than scattered across every node
+that touches a retriever.
