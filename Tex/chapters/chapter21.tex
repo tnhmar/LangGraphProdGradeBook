@@ -1,8 +1,1106 @@
 %% ============================================================
 %%  Chapter 21 --- Human-in-the-Loop
 %%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  Dependencies: langgraph >= 0.2.0,
+%%                langchain-core >= 0.3.0,
+%%                pydantic >= 2.7.0,
+%%                fastapi >= 0.115.0,
+%%                sse-starlette >= 2.1.0
 %% ============================================================
 
-\chapterquote{An agent that cannot pause for a human cannot be trusted by one.}{anon}
+\chapterquote{Automation earns trust action by action. The gate is not
+a failure of confidence. It is the mechanism by which confidence is
+built.}{anon}
 
-% TODO: Chapter 21 content
+The production failure this chapter prevents is an irreversible automated
+action taken without human awareness. The parallel research graph of
+Chapter~20 dispatches retrieval workers and synthesises an answer entirely
+without pausing. That design is correct when the graph's output is a
+document. It becomes a liability when the graph's output is an action: an
+email sent to a client, a database record modified, a deployment triggered,
+a purchase authorised. At the moment the graph reaches the action node it
+has no mechanism to ask whether this particular action, with this particular
+payload, is one a human would approve. The cost of the missing gate is not a
+degraded result---it is an unrecoverable real-world event that no subsequent
+checkpoint can undo. Deferring the gate until ``the agent misbehaves in
+production'' inverts the correct engineering posture: the gate must exist
+before the first real action runs, not after the first real mistake.
+
+The solution has five layers. The first is an \emph{idempotency layer}:
+every action node is designed to produce the same outcome whether it runs
+once or ten times, because the Pregel scheduler may re-enter a node from
+the top after a checkpoint restore, an interrupt, or a resume. The second
+is a \emph{pause layer}: the \code{interrupt()} primitive, called inside a
+node body after computing the action payload but before executing it, raises
+a special exception that the runtime catches, serialises into the checkpoint,
+and surfaces to the caller as an \code{Interrupt} event. The third is a
+\emph{resume layer}: the caller injects a human decision back into the paused
+thread by passing \code{Command(resume=value)} as the input to a second
+\code{ainvoke} call on the same thread; the runtime re-enters the node,
+reaches \code{interrupt()} again, and this time returns the stored decision
+immediately without pausing. The fourth is a \emph{state-edit layer}: before
+resuming, a human reviewer may call \code{graph.aupdate\_state()} to modify
+the checkpoint's state at the breakpoint---correcting a payload, adjusting a
+parameter, or overriding a field---without rerunning any nodes. The fifth is
+a \emph{time-travel layer}: \code{get\_state\_history()} exposes the full
+ordered checkpoint sequence so any past snapshot can be replayed, creating a
+corrected execution branch from a prior point without mutating the original
+run.
+
+The sections are ordered by the dependency each layer has on the one before
+it. Section~\ref{sec:hitl-idempotent} establishes idempotency first because
+a node that is not idempotent cannot be safely interrupted or
+resumed---re-entry will duplicate its side effects regardless of how
+correctly the pause and resume mechanics work.
+Section~\ref{sec:hitl-interrupt} introduces \code{interrupt()} after
+idempotency is established, because the correct placement of the call---after
+computing the payload, before executing the side effect---only makes sense
+once the re-entry invariant is understood.
+Section~\ref{sec:hitl-resume} shows \code{Command(resume=value)} after the
+pause mechanics are established, because the resume contract---a new
+\code{ainvoke} call, not a callback---requires understanding what
+\code{interrupt()} serialised into the checkpoint.
+Section~\ref{sec:hitl-edit} adds \code{aupdate\_state()} after resume because
+state editing is a pre-resume operation whose result must be used as the
+config for the subsequent \code{ainvoke} call.
+Section~\ref{sec:hitl-timetravel} introduces time-travel after editing
+because the \code{get\_state\_history()} iterator and the \code{as\_node}
+metadata written by \code{aupdate\_state()} are prerequisites for finding the
+correct replay snapshot.
+Section~\ref{sec:hitl-policy} introduces \code{PolicyConfig} after all five
+mechanics are established, because the policy is a configuration layer over
+them---it does not change how they work, only whether a given node invokes
+the pause path.
+Section~\ref{sec:hitl-api} wires everything into a FastAPI surface.
+Section~\ref{sec:hitl-full} provides the integration tests.
+
+This chapter introduces eight terms defined in Table~\ref{tab:ch21-terms}.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in Chapter~21}
+\label{tab:ch21-terms}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\code{interrupt()} &
+  \code{from langgraph.types import interrupt}; a synchronous function
+  callable from both sync and async node bodies; raises
+  \code{GraphInterrupt} on first call, causing Pregel to serialise the
+  \code{value} argument into the current checkpoint and return an
+  \code{Interrupt} event to the caller; on resume, returns the value
+  stored by \code{Command(resume=...)} instead of raising. \\
+\code{Command(resume=...)} &
+  \code{from langgraph.types import Command}; when passed as the
+  \emph{input} argument to \code{graph.ainvoke()} or
+  \code{graph.astream()} on a paused thread, instructs the runtime to
+  re-enter the interrupted node and return the \code{resume} value from
+  the \code{interrupt()} call; routing is determined by
+  \code{StateSnapshot.next}, not by \code{goto}. \\
+\code{ActionRecord} &
+  A \code{TypedDict} with fields \code{action\_id:~str},
+  \code{node\_name:~str}, \code{payload:~dict}, and
+  \code{status:~str}~(\code{"pending"} | \code{"approved"} |
+  \code{"rejected"} | \code{"executed"}); one record per action node
+  invocation, keyed by deterministic \code{action\_id} in
+  \code{pending\_actions}. \\
+\code{action\_id} &
+  A 12-character hex prefix of
+  \code{sha256(json.dumps(\{"node":~name,~"payload":~p\},
+  sort\_keys=True))}; stable across re-runs of the same node with the
+  same input; used as the merge key in the \code{\_merge\_actions}
+  reducer to prevent duplicate records under re-entry. \\
+\code{\_merge\_actions} reducer &
+  Declared as \code{Annotated[list[ActionRecord],~\_merge\_actions]};
+  performs a right-wins merge by \code{action\_id}: an incoming record
+  with a known \code{action\_id} replaces the existing entry; a record
+  with an unknown \code{action\_id} is appended; prevents duplicate
+  \code{ActionRecord} entries on re-run. \\
+\code{aupdate\_state()} &
+  \code{await graph.aupdate\_state(config,~values,~as\_node=...)}
+  merges \code{values} into the checkpoint via each field's declared
+  reducer, as if a node had returned those values; returns a new
+  \code{RunnableConfig} with an updated \code{checkpoint\_id} that
+  must be used for the subsequent resume call. \\
+\code{get\_state\_history()} &
+  \code{graph.get\_state\_history(config)} returns an
+  \code{Iterator[StateSnapshot]} in reverse chronological order
+  (newest first); each \code{StateSnapshot} carries \code{.config}
+  (with \code{checkpoint\_id}), \code{.values}, \code{.next}, and
+  \code{.metadata} (containing \code{"writes"}, \code{"source"},
+  \code{"step"}). \\
+\code{PolicyConfig} &
+  A Pydantic \code{BaseModel} that extends Chapter~14~\S14.3's runtime
+  configuration model with \code{approval\_gates:~list[ApprovalGate]}
+  and \code{auto\_approve\_all:~bool}; passed via
+  \code{RunnableConfig["configurable"]["policy"]}; consulted by action
+  nodes to decide whether to call \code{interrupt()}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+\begin{verbatim}
+chapter21/
+  state.py          # §21.1 — ApprovalState, ActionRecord,
+                    #          _merge_actions, make_action_id
+  action_node.py    # §21.2 — action_node with interrupt()
+                    #          and idempotency guard
+  runner.py         # §21.3, §21.4 — start_run, resume_run,
+                    #                 edit_and_resume
+  time_travel.py    # §21.5 — find_last_pre_edit_snapshot,
+                    #          replay_from_snapshot
+  policy.py         # §21.6 — ApprovalGate, PolicyConfig
+  graph.py          # §21.8 — build_approval_graph,
+                    #          synthesise_node
+  api.py            # §21.7 — FastAPI app, SSE endpoint,
+                    #          resume endpoint
+  test_hitl.py      # §21.8 — three scenario tests
+\end{verbatim}
+
+
+%% ------------------------------------------------------------
+\section{A Node That Can Be Interrupted Must Tolerate Re-entry}
+\label{sec:hitl-idempotent}
+%% ------------------------------------------------------------
+
+The design problem is side-effect duplication under re-entry. The Pregel
+scheduler checkpoints graph state \emph{before} calling a node function,
+not after. When a node is interrupted---or when the process restarts after
+a crash, or when a human's resume call re-enters the graph---the runtime
+calls the node function again from the top with the pre-interrupt state as
+its argument. Any external write that happens before the \code{interrupt()}
+call---a database insert, an HTTP POST, a file write---executes again on
+re-entry. A node that inserts a database record unconditionally on every
+call will insert two records: one before the interrupt, one on resume. The
+governing principle is that every action node must check whether its
+intended side effect has already been committed before attempting to commit
+it again.
+
+The check-before-write pattern requires a stable key to look up. A key
+generated with \code{uuid4()} inside the node body changes on every call:
+the first invocation creates key~A, the second invocation creates
+key~B, and the lookup of key~A finds nothing, so the second invocation
+executes again unconditionally. The \emph{action\_id} must instead be
+derived deterministically from the node's input---the name of the node
+and the content of its payload---so that the same inputs always produce
+the same key. A \code{sha256} hash of the JSON-serialised payload with
+\code{sort\_keys=True} produces a 12-character hex prefix that is stable
+across runs, resistant to field-order variation, and short enough to store
+in every \code{ActionRecord}.
+
+The \emph{pending\_actions} field that accumulates \code{ActionRecord}
+entries across the graph's lifetime requires a reducer that merges by
+\code{action\_id} rather than appending unconditionally. Without such a
+reducer, a re-entered node that writes an updated \code{ActionRecord}
+(changing \code{status} from \code{"pending"} to \code{"executed"}) would
+append a second record rather than replacing the first, leaving two
+records for the same logical action in the field---one stale, one
+current---with no defined ordering between them.
+
+\begin{lstlisting}[language=Python,
+  caption={State schema, by-ID reducer, and deterministic action
+           identifier},
+  label={lst:hitl-state}]
+# chapter21/state.py
+import hashlib, json
+from typing import Annotated, TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+class ActionRecord(TypedDict):
+    action_id:  str   # sha256(node + json(payload))[:12]
+    node_name:  str
+    payload:    dict
+    status:     str   # "pending"|"approved"|"rejected"|"executed"
+
+def _merge_actions(
+    left:  list[ActionRecord],
+    right: list[ActionRecord],
+) -> list[ActionRecord]:
+    index = {r["action_id"]: r for r in left}
+    for r in right:
+        index[r["action_id"]] = r   # replace or insert
+    return list(index.values())
+
+class ApprovalState(TypedDict):
+    task:            str
+    messages:        Annotated[list[BaseMessage], add_messages]
+    pending_actions: Annotated[list[ActionRecord], _merge_actions]
+    approved_count:  int
+    final_output:    str
+
+def make_action_id(node_name: str, payload: dict) -> str:
+    raw = json.dumps(
+        {"node": node_name, "payload": payload}, sort_keys=True
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()[:12]
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:hitl-state} deserve explanation.
+\code{ActionRecord} is a \code{TypedDict} rather than a Pydantic
+\code{BaseModel} because it is a coordination record whose instances
+are plain dicts at runtime; the \code{\_merge\_actions} reducer
+operates directly on dict keys without needing \code{.model\_dump()},
+and constructing instances with dict-literal syntax throughout the module
+keeps the code uniform. The \code{\_merge\_actions} function is defined
+before \code{ApprovalState} in the module because Python evaluates the
+class body immediately: the \code{Annotated} expression references
+\code{\_merge\_actions} by name, so the function must exist at class-
+definition time or the module raises a \code{NameError} on import.
+\code{make\_action\_id} uses \code{sort\_keys=True} on \code{json.dumps}
+because Python dicts preserve insertion order, meaning the same logical
+payload constructed from different code paths may produce different key
+orderings and therefore different hashes; sorting eliminates that entire
+class of non-determinism silently.
+
+The idempotency contract is established. The remaining problem is the
+pause mechanism itself: how to halt a node at a precise point, serialise
+a structured payload for the human reviewer, and guarantee that the
+external action does not execute until the reviewer responds.
+
+
+%% ------------------------------------------------------------
+\section{Execution Pauses at the Interrupt, Not at the Edge}
+\label{sec:hitl-interrupt}
+%% ------------------------------------------------------------
+
+The design problem is the gap between when a routing decision is made and
+when the action it implies is executed. The naive approach---pausing at a
+graph edge using \code{interrupt\_before=["action\_node"]} at
+\code{compile()} time---stops execution before the node runs and exposes
+raw \code{ApprovalState} to the caller. That state contains the task
+description but not the computed action payload, which the node would have
+constructed from the task. The reviewer is asked to approve an abstract
+intent rather than a concrete proposed action, forcing the approval
+interface to reconstruct the payload independently---a duplication of
+business logic between the graph and the interface. The governing principle
+is that the node itself must compute the payload, present it to the
+reviewer, and then pause; the pause lives inside the node body, not at
+an edge.
+
+\code{interrupt(value)} is a synchronous function callable from both sync
+and async nodes. When the runtime encounters it for the first time, it
+raises \code{GraphInterrupt}---a special exception caught by the Pregel
+scheduler, never by user code. The scheduler serialises \code{value} into
+the current checkpoint alongside the pre-node state, then returns control
+to the caller: \code{graph.ainvoke()} returns the last committed state
+dict, and \code{graph.astream()} with \code{stream\_mode="updates"} yields
+a chunk whose \code{"\_\_interrupt\_\_"} key holds a tuple of \code{Interrupt}
+objects. The node's return value is never written to state on this
+path---the interrupt fires before the \code{return} statement executes, and
+the Pregel runtime discards the partially-executed frame.
+
+On the resume path, the runtime re-calls the node function from the top
+with the same pre-interrupt state. The node re-executes all code before
+\code{interrupt()}: the idempotency check passes (nothing is committed
+yet), the payload is rebuilt from the same deterministic inputs, and the
+call reaches \code{interrupt(value)} again. This time the scheduler
+detects a stored resume value in the checkpoint and returns it immediately
+without pausing. The return value of \code{interrupt()} on resume is
+whatever was passed as \code{Command(resume=...)} by the caller---in the
+following listing, the string \code{"approved"} or \code{"rejected"}.
+
+\begin{warningbox}
+Everything written to external systems \emph{before} \code{interrupt()}
+in the node body may have already executed on the first pass; the
+idempotency check from Section~\ref{sec:hitl-idempotent} must guard
+every such write. Everything written to local variables \emph{after}
+\code{interrupt()} will execute again on resume because the node
+re-runs from the top. The correct structure is: build payload, check
+idempotency, call \code{interrupt()}, then perform the external action
+only after the resume value is returned.
+\end{warningbox}
+
+\begin{lstlisting}[language=Python,
+  caption={Action node: idempotency guard, computed payload, inline
+           interrupt, and post-resume branches},
+  label={lst:hitl-action}]
+# chapter21/action_node.py
+from langgraph.types import interrupt
+from langchain_core.runnables import RunnableConfig
+from chapter21.state import ApprovalState, ActionRecord, make_action_id
+from chapter21.policy import PolicyConfig
+
+async def action_node(state: ApprovalState,
+                      config: RunnableConfig) -> dict:
+    payload = {"tool": "send_email",
+               "to":   "team@example.com",
+               "body": f"Report for: {state['task']}"}
+    action_id = make_action_id("action_node", payload)
+
+    for rec in state["pending_actions"]:
+        if rec["action_id"] == action_id \
+                and rec["status"] == "executed":
+            return {}   # idempotency: already committed
+
+    record: ActionRecord = {
+        "action_id": action_id, "node_name": "action_node",
+        "payload": payload,     "status":    "pending",
+    }
+    configurable = config.get("configurable") or {}
+    policy: PolicyConfig = configurable.get("policy", PolicyConfig())
+
+    if policy.requires_approval("action_node"):
+        human_decision: str = interrupt(record)
+    else:
+        human_decision = "approved"
+
+    if human_decision == "approved":
+        done: ActionRecord = {**record, "status": "executed"}  # type: ignore[assignment]
+        return {"pending_actions": [done],
+                "approved_count":  state["approved_count"] + 1}
+    rejected: ActionRecord = {**record, "status": "rejected"}  # type: ignore[assignment]
+    return {"pending_actions": [rejected]}
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:hitl-action} deserve explanation.
+\code{record} is constructed as a plain dict literal annotated with
+\code{ActionRecord} rather than a positional constructor call: \code{TypedDict}
+types are plain dicts at runtime and do not support keyword-argument
+construction like Pydantic models do; the literal form makes field names
+visible at the construction site without requiring a post-hoc variable
+assignment. The \code{type:~ignore[assignment]} comment on the status-
+override lines is required because mypy cannot prove that a dict-spread
+with a string override still satisfies the \code{TypedDict} contract at the
+type-checking level, even though it is correct at runtime; a Pydantic model
+would not require this comment, but the coordination-record character of
+\code{ActionRecord} makes the \code{TypedDict} choice correct here
+as discussed in Section~\ref{sec:hitl-idempotent}. The idempotency return
+is an empty \code{dict} rather than an exception: an empty dict is a valid
+node return that writes nothing to state, which is the correct outcome when
+the action has already been committed; raising would trigger any registered
+\code{RetryPolicy}, compounding the problem rather than resolving it.
+
+The node is now pausable and idempotent. The remaining problem is the resume
+contract: how the caller injects the human's decision back into the paused
+thread and what distinguishes a correct resume call from one that silently
+starts a new run from \code{START}.
+
+
+%% ------------------------------------------------------------
+\section{Resume Is a New Call, Not a Callback}
+\label{sec:hitl-resume}
+%% ------------------------------------------------------------
+
+The design problem is the mismatch between the mental model of resuming a
+paused coroutine and the actual mechanics of resuming a paused LangGraph
+thread. A coroutine resumes at the \code{await} point that suspended it;
+a LangGraph thread resumes by calling \code{graph.ainvoke()} a second time.
+These look similar but differ in a critical way: passing a state dict as the
+input to the second \code{ainvoke()} call silently discards the checkpoint
+and starts a brand-new run from \code{START} on the same \code{thread\_id},
+overwriting all prior state. There is no error and no warning. The governing
+principle is that a resumed run's input must be \code{Command(resume=value)},
+not a state dict; the config must carry the same \code{thread\_id} as the
+original call; and the thread's pause state must be verified before
+attempting to resume.
+
+\code{Command(resume=value)} carries no \code{goto} field on a resume call.
+The Pregel scheduler reads \code{StateSnapshot.next} from the checkpoint to
+determine which node to re-enter; specifying \code{goto} on a resume
+\code{Command} does not override this and its presence only misleads readers
+into thinking routing is configurable at resume time when it is not. The
+\code{value} passed to \code{resume} becomes the return value of
+\code{interrupt()} inside the node; its type must match whatever the node
+expects, because there is no schema validation between the caller and the
+node at resume time---a type mismatch is a silent runtime bug discovered only
+when the node's branch logic produces an unexpected result.
+
+\begin{notebox}
+\code{graph.get\_state(config).next} returns a tuple of node names that
+will run on the next step. An empty tuple means the thread has either
+completed or never been started. Attempting to resume a thread whose
+\code{.next} is empty raises \code{GraphBubbleUp} at runtime; verifying
+\code{.next} before calling \code{ainvoke(Command(resume=...))} converts a
+confusing internal error into a caller-controlled precondition check with a
+meaningful error message.
+\end{notebox}
+
+\begin{lstlisting}[language=Python,
+  caption={Thread helpers: construct config, start a run, verify pause
+           state, resume with decision},
+  label={lst:hitl-runner}]
+# chapter21/runner.py
+from langgraph.types import Command
+from langgraph.graph.state import CompiledStateGraph
+from langchain_core.runnables import RunnableConfig
+from chapter21.state import ApprovalState
+from chapter21.policy import PolicyConfig
+
+def _thread_config(thread_id: str,
+                   policy: PolicyConfig) -> RunnableConfig:
+    return {"configurable": {"thread_id": thread_id,
+                             "policy":    policy}}
+
+async def start_run(task: str, thread_id: str,
+                    graph: CompiledStateGraph,
+                    policy: PolicyConfig) -> dict:
+    return await graph.ainvoke(
+        ApprovalState(task=task, messages=[], pending_actions=[],
+                      approved_count=0, final_output=""),
+        config=_thread_config(thread_id, policy),
+    )
+
+async def resume_run(decision: str, thread_id: str,
+                     graph: CompiledStateGraph,
+                     policy: PolicyConfig) -> dict:
+    config = _thread_config(thread_id, policy)
+    if not graph.get_state(config).next:
+        raise RuntimeError(
+            f"Thread '{thread_id}' is not paused; cannot resume."
+        )
+    return await graph.ainvoke(
+        Command(resume=decision), config=config,
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:hitl-runner} deserve explanation.
+\code{\_thread\_config()} is a private helper rather than an inline dict
+at each call site because the \code{policy} object must appear in
+\code{configurable} on \emph{every} call---including the resume
+call---and omitting it on the resume call means \code{action\_node} falls
+back to a gate-free \code{PolicyConfig()}, silently executing without the
+intended approval check on re-entry. \code{start\_run} returns the result
+of \code{ainvoke} directly without testing whether the graph paused or
+completed: the caller uses \code{graph.get\_state(config).next} to
+distinguish the two outcomes, and encoding that distinction in
+\code{start\_run}'s return type would require a sentinel value whose
+semantics are less clear than the \code{StateSnapshot.next} field already
+provided by the LangGraph API.
+
+A decision that approves or rejects the action with the payload exactly as
+computed is the common case. A human reviewer will often want to change the
+payload before approving---correcting a recipient, adjusting a body,
+overriding a parameter---without rerunning the node that computed it. The
+next problem is how to modify graph state at the breakpoint without
+re-executing any node.
+
+
+%% ------------------------------------------------------------
+\section{State at the Breakpoint Can Be Edited Before Resuming}
+\label{sec:hitl-edit}
+%% ------------------------------------------------------------
+
+The design problem is the gap between what the node computed and what the
+human reviewer actually wants to execute. The node constructed an
+\code{ActionRecord} with a specific payload and stored it in
+\code{pending\_actions} through the \code{\_merge\_actions} reducer. If
+the reviewer wants to change the payload, there is no mechanism to do so
+through the resume path alone: \code{Command(resume=value)} injects a
+decision string, not a revised action record. The naive workaround---adding
+an \code{edited\_payload} field to \code{ApprovalState} and having the
+node read it on re-entry---pollutes the state schema with a coordination
+artefact and requires the reviewer to write to a different field from the
+one the execution step reads. The governing principle is that the reviewer
+edits the state field that the execution step reads, using the same reducer
+path that a node return would use.
+
+\code{graph.aupdate\_state(config,~values,~as\_node=None)} writes \code{values}
+into the checkpoint by applying each field's declared reducer, exactly as if
+the named node had returned those values. For \code{pending\_actions},
+passing \code{\{"pending\_actions":~[edited\_record]\}} where
+\code{edited\_record} carries the same \code{action\_id} as the original
+triggers the \code{\_merge\_actions} reducer's replacement path: the
+existing record is replaced by the edited one. The call returns a new
+\code{RunnableConfig} whose \code{configurable["checkpoint\_id"]} points to
+the post-edit checkpoint. The subsequent resume call must use this returned
+config---not the original---or it resumes from the pre-edit state silently
+and the edit is lost without any error.
+
+\begin{warningbox}
+\code{aupdate\_state} returns a \code{RunnableConfig}. Discarding this
+return value and calling \code{ainvoke(Command(resume=...),
+config=original\_config)} silently resumes from the checkpoint that existed
+before the edit. There is no API to retrieve the post-edit config after the
+fact without scanning \code{get\_state\_history()}. Always assign the
+return value and pass it to every subsequent call for this thread.
+\end{warningbox}
+
+The \code{as\_node} parameter names the node credited for the write in the
+checkpoint's \code{metadata["writes"]} dict. Passing
+\code{as\_node="\_\_human\_edit\_\_"} makes human modifications
+distinguishable from node writes when iterating \code{get\_state\_history()}:
+a snapshot whose \code{metadata["writes"]} contains the key
+\code{"\_\_human\_edit\_\_"} was produced by a reviewer, not by automated
+execution. This metadata distinction is the foundation of the time-travel
+filtering in Section~\ref{sec:hitl-timetravel}.
+
+\begin{lstlisting}[language=Python,
+  caption={Edit state at the breakpoint then resume from the post-edit
+           checkpoint},
+  label={lst:hitl-edit}]
+# chapter21/runner.py  (continued)
+from chapter21.state import ActionRecord
+
+async def edit_and_resume(thread_id: str,
+                          edited_action: ActionRecord,
+                          decision: str,
+                          graph: CompiledStateGraph,
+                          policy: PolicyConfig) -> dict:
+    config = _thread_config(thread_id, policy)
+    if not graph.get_state(config).next:
+        raise RuntimeError(
+            f"Thread '{thread_id}' is not paused; cannot edit."
+        )
+    # aupdate_state applies _merge_actions: same action_id = replace.
+    new_config = await graph.aupdate_state(
+        config,
+        {"pending_actions": [edited_action]},
+        as_node="__human_edit__",
+    )
+    # new_config carries the post-edit checkpoint_id.
+    # Resuming with original config silently ignores the edit.
+    return await graph.ainvoke(
+        Command(resume=decision), config=new_config,
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:hitl-edit} deserve explanation.
+\code{edit\_and\_resume} requires \code{edited\_action} to carry the same
+\code{action\_id} as the record currently in \code{pending\_actions};
+passing a record with a different \code{action\_id} appends a second record
+via the \code{\_merge\_actions} reducer, leaving both the original and the
+edited record in the field, after which the action node's idempotency check
+finds the first matching record with \code{status~=~"executed"} on the next
+run and silently ignores the edit entirely. The pause guard is repeated in
+\code{edit\_and\_resume} rather than extracted to a shared helper because
+the error message here uses the word ``edit'', not ``resume'': the
+distinction matters when reading logs from a concurrent system where both
+functions may be called on overlapping threads and the error context must
+identify the call site without requiring a stack trace.
+
+The reviewer can now pause, examine, and modify state at a breakpoint. The
+remaining temporal problem is larger: what if the reviewer wants not to
+modify the current breakpoint but to go back to a prior execution
+point---before a previous action was taken, before a previous edit was
+applied---and re-run forward from there?
+
+
+%% ------------------------------------------------------------
+\section{Every Checkpoint Is a Potential Starting Point}
+\label{sec:hitl-timetravel}
+%% ------------------------------------------------------------
+
+The design problem is the irreversibility of a committed execution branch.
+Once a node has run and the checkpoint has been written, the graph's
+execution history is a linear sequence of state snapshots. If a reviewer
+decides---after a completed run, or midway through a long run---that the
+graph should have taken a different path at an earlier point, the only
+mechanism available under a linear history model is to restart from scratch
+with modified inputs. That is not always acceptable: a run that required
+several expensive LLM calls and three human approvals should not need to be
+replayed from the beginning to correct a decision made at step two. The
+governing principle is that any checkpoint in the execution history is a
+valid starting point for a new branch; replaying from a past checkpoint
+produces a new execution lineage without modifying the original.
+
+\code{graph.get\_state\_history(config)} returns an
+\code{Iterator[StateSnapshot]} in reverse chronological order: the most
+recent snapshot is yielded first. Each \code{StateSnapshot} carries a
+\code{.config} field whose \code{configurable["checkpoint\_id"]}
+identifies the exact checkpoint, a \code{.values} field containing the full
+state at that point, a \code{.next} tuple naming the nodes that would run
+next, and a \code{.metadata} dict. The \code{metadata["writes"]} key is a
+dict mapping node-or-sentinel names to the values they returned; checking
+whether \code{"\_\_human\_edit\_\_"} is in \code{metadata["writes"]}
+locates checkpoints written by \code{aupdate\_state(...,
+as\_node="\_\_human\_edit\_\_")}, making the human-edit history queryable
+without additional instrumentation.
+
+Replaying from a past snapshot is a single
+\code{graph.ainvoke(None,~config=snapshot.config)} call. Passing \code{None}
+as input means ``use the state already stored at this checkpoint''; the
+graph advances forward from \code{snapshot.next}, creating a new checkpoint
+sequence branching from \code{snapshot.config["configurable"]["checkpoint\_id"]}.
+The original checkpoint chain is not modified. Both the original run and the
+replay branch are visible in subsequent \code{get\_state\_history()} calls,
+making the full decision history auditable.
+
+\begin{lstlisting}[language=Python,
+  caption={History iterator, pre-edit snapshot filter, and branch replay},
+  label={lst:hitl-timetravel}]
+# chapter21/time_travel.py
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.checkpoint.base import StateSnapshot
+from langchain_core.runnables import RunnableConfig
+
+def find_last_pre_edit_snapshot(
+    graph: CompiledStateGraph, thread_id: str,
+) -> StateSnapshot | None:
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id}
+    }
+    # Yields newest-first; return first snapshot with no human-edit write.
+    for snapshot in graph.get_state_history(config):
+        writes = snapshot.metadata.get("writes") or {}
+        if "__human_edit__" not in writes:
+            return snapshot
+    return None
+
+async def replay_from_snapshot(
+    graph:    CompiledStateGraph,
+    snapshot: StateSnapshot,
+) -> dict:
+    # None input: use state already stored at this checkpoint.
+    # snapshot.config already carries the correct thread_id.
+    return await graph.ainvoke(None, config=snapshot.config)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:hitl-timetravel} deserve explanation.
+\code{find\_last\_pre\_edit\_snapshot} iterates newest-first and returns
+the \emph{first} snapshot without a human-edit write, which is the most
+recent checkpoint that precedes any reviewer intervention; returning the
+oldest pre-edit snapshot would force a replay from the very beginning of
+the run, discarding all approved actions, whereas the most recent pre-edit
+snapshot replays only the minimum necessary portion of the run.
+\code{replay\_from\_snapshot} does not accept a \code{thread\_id}
+argument because \code{snapshot.config} already embeds the correct
+\code{thread\_id}: constructing a new config with a different
+\code{thread\_id} would branch the replay onto a different thread, producing
+two divergent histories under different identifiers instead of two branches
+on the same thread where both are visible to a single
+\code{get\_state\_history(config)} call.
+
+The time-travel mechanics are now established. The remaining problem is
+that the decision of whether a given node invokes the pause path is
+currently hardcoded in \code{action\_node} as a \code{PolicyConfig} lookup.
+That lookup will be identical in every action node across the system, and
+the \code{PolicyConfig} object itself must be defined before it can be
+passed into the graph.
+
+
+%% ------------------------------------------------------------
+\section{Approval Rules Belong in Configuration, Not in Code}
+\label{sec:hitl-policy}
+%% ------------------------------------------------------------
+
+The design problem is hardcoded gate logic scattered across node
+implementations. If every action node implements its own approval
+condition---checking a feature flag, reading an environment variable,
+testing a field in state---then adding a new action requires writing new
+gate logic, changing the approval threshold for an existing action requires
+finding and editing its node, and disabling all gates for automated tests
+requires modifying code rather than changing a parameter. The governing
+principle is that the set of nodes requiring human approval, and the
+conditions under which approval is required, should be expressed in a
+single declarative configuration object injected through
+\code{RunnableConfig["configurable"]["policy"]}.
+
+Chapter~14~\S14.3 introduced \code{PolicyConfig} as the book's runtime
+configuration model for graph execution parameters. The \code{approval\_gates}
+field added here follows the same injection pattern: the object is
+constructed by the caller, placed in
+\code{RunnableConfig["configurable"]["policy"]}, and read by each node
+that may need to pause. \code{requires\_approval(node\_name)} encapsulates
+the gate lookup so nodes never iterate \code{approval\_gates} directly; the
+method returns \code{False} by default when no gate is registered for the
+named node, making auto-approval the correct default for nodes whose
+callers have not opted in to human review.
+
+\begin{notebox}
+\code{PolicyConfig} declares
+\code{model\_config~=~ConfigDict(extra="allow")} so that Chapter~14's
+existing fields coexist with the new \code{approval\_gates} field without
+requiring callers to redeclare every prior field. \code{extra="allow"} means
+Pydantic accepts any additional keyword arguments at construction time,
+preserving backward compatibility as new fields are added across chapters.
+\end{notebox}
+
+The \code{ApprovalGate.timeout\_seconds} field specifies how many seconds
+a thread may remain paused at an interrupt before the system should act
+automatically. LangGraph's \code{interrupt()} primitive has no native
+timeout; this field is a schema fact that a production deployment enforces
+externally---a scheduled task scans for threads where
+\code{snapshot.next~!=~()} and where the checkpoint's creation timestamp
+exceeds the gate's \code{timeout\_seconds}, then calls
+\code{resume\_run(decision="auto\_rejected",~...)} on those threads.
+Chapter~22~\S22.4 implements that enforcement pattern.
+
+\begin{lstlisting}[language=Python,
+  caption={Approval gate model and policy lookup method},
+  label={lst:hitl-policy}]
+# chapter21/policy.py
+from pydantic import BaseModel, Field, ConfigDict
+
+class ApprovalGate(BaseModel):
+    node_name:        str
+    require_approval: bool       = True
+    timeout_seconds:  int | None = 300
+
+class PolicyConfig(BaseModel):
+    """Extends Chapter 14 S14.3 PolicyConfig with approval gates."""
+    model_config = ConfigDict(extra="allow")
+
+    approval_gates:   list[ApprovalGate] = Field(default_factory=list)
+    auto_approve_all: bool               = False
+
+    def requires_approval(self, node_name: str) -> bool:
+        if self.auto_approve_all:
+            return False
+        for gate in self.approval_gates:
+            if gate.node_name == node_name:
+                return gate.require_approval
+        return False   # no gate registered: auto-approved
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:hitl-policy} deserve explanation.
+\code{auto\_approve\_all} defaults to \code{False} rather than \code{True}:
+a permissive default would mean a system deployed without an explicit policy
+configuration silently bypasses all human review, which is the production
+failure mode the chapter opens by naming; an operator who wants no gates must
+set \code{auto\_approve\_all=True} explicitly, making the choice auditable in
+configuration rather than implicit in code. \code{requires\_approval} returns
+\code{False} when no gate is registered for a node name, not \code{True}: the
+correct posture is opt-in gates, not opt-out; requiring every new node to
+declare an \code{ApprovalGate} would produce a deployment failure the first
+time a new node is added without a corresponding gate, whereas an
+auto-approved-by-default node is safe until explicitly gated and any
+oversight is a deliberate product decision rather than a configuration
+accident.
+
+The approval policy is declarative and injectable. The remaining problem is
+the interface: the graph runs asynchronously on a server, the reviewer is
+in a browser, and the interrupt event must travel from the server to the
+reviewer in real time---and the reviewer's decision must travel
+back---without polling.
+
+
+%% ------------------------------------------------------------
+\section{The Interface Streams Interrupt Events and Receives Decisions}
+\label{sec:hitl-api}
+%% ------------------------------------------------------------
+
+The design problem is the latency between when the graph pauses and when
+the human reviewer learns that a decision is needed. A polling architecture
+requires the frontend to query the server repeatedly; between polls the
+reviewer is unaware the graph is waiting. The correct primitive for server-
+to-client event push over HTTP is \emph{Server-Sent Events} (SSE): a long-
+lived HTTP response whose body the server writes incrementally as events
+occur. The client holds a single connection open, and the server writes an
+interrupt event the moment \code{graph.astream()} yields the
+\code{"\_\_interrupt\_\_"} chunk. The governing principle is that the
+interrupt event must reach the reviewer at the moment the graph pauses,
+not at the next poll interval.
+
+\code{graph.astream(input,~config,~stream\_mode="updates")} yields \code{dict}
+chunks as each node completes. An interrupt produces a chunk with key
+\code{"\_\_interrupt\_\_"} whose value is a \emph{tuple} of \code{Interrupt}
+named-tuples: \code{\{"\_\_interrupt\_\_":~(Interrupt(value=...,~resumable=True,~...),)\}}.
+The payload is in \code{chunk["\_\_interrupt\_\_"][0].value}---the first element
+of the tuple, which is the \code{ActionRecord} passed to \code{interrupt()}
+in \code{action\_node}. Indexing with \code{[0]} is correct because
+\code{interrupt()} in a single node produces exactly one \code{Interrupt}
+per pause event; the tuple form exists to accommodate future multi-interrupt
+nodes, not because a single-call node produces multiple elements.
+
+\begin{warningbox}
+\code{EventSourceResponse} from \code{sse-starlette} requires the
+\code{"data"} field in each yielded dict to be a \emph{string}, not a
+dict. Passing a raw dict raises a serialisation error at the
+\code{EventSourceResponse} layer before any bytes reach the client. Every
+\code{"data"} value must pass through \code{json.dumps()} before being
+placed in the yield dict---including the \code{"done"} sentinel, which
+must be \code{"\{\}"} (a string), not \code{\{\}} (a dict).
+\end{warningbox}
+
+The resume path is a separate \code{POST} endpoint that accepts a
+\code{ResumeRequest} and calls either \code{resume\_run} or
+\code{edit\_and\_resume} from \code{runner.py}. Before calling either,
+the endpoint queries \code{graph.get\_state(config).next} to verify the
+thread is actually paused; if \code{.next} is empty a resume attempt would
+raise \code{GraphBubbleUp}---an internal runtime error that must never
+reach the client as an unhandled 500. A 409 response is the correct HTTP
+status for the precondition failure: the request is well-formed but the
+server's current state conflicts with it.
+
+\begin{lstlisting}[language=Python,
+  caption={FastAPI app and SSE endpoint: interrupt event stream},
+  label={lst:hitl-api-sse}]
+# chapter21/api.py
+import json
+from fastapi import FastAPI, Depends, HTTPException
+from sse_starlette.sse import EventSourceResponse
+from pydantic import BaseModel
+from langgraph.types import Command
+# graph, state, policy, runner: see prior listings
+from chapter21.graph import build_approval_graph
+from chapter21.state import ApprovalState, ActionRecord
+from chapter21.policy import PolicyConfig, ApprovalGate
+from chapter21.runner import resume_run, edit_and_resume
+
+app    = FastAPI()
+_graph = build_approval_graph()   # process-scoped singleton
+
+class StartRequest(BaseModel):
+    task:      str
+    thread_id: str
+    policy:    PolicyConfig = PolicyConfig()
+
+@app.post("/runs")
+async def start_run_sse(
+    req: StartRequest,
+    graph = Depends(lambda: _graph),
+) -> EventSourceResponse:
+    async def _gen():
+        cfg = {"configurable": {"thread_id": req.thread_id,
+                                "policy":    req.policy}}
+        async for chunk in graph.astream(
+            ApprovalState(task=req.task, messages=[],
+                          pending_actions=[], approved_count=0,
+                          final_output=""),
+            config=cfg, stream_mode="updates",
+        ):
+            if "__interrupt__" in chunk:
+                val = chunk["__interrupt__"][0].value
+                data = (val.model_dump()
+                        if hasattr(val, "model_dump") else val)
+                yield {"event": "interrupt",
+                       "data": json.dumps(data)}
+            else:
+                yield {"event": "update",
+                       "data": json.dumps(chunk, default=str)}
+        yield {"event": "done", "data": "{}"}
+    return EventSourceResponse(_gen())
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Resume endpoint: pause-state guard and decision injection},
+  label={lst:hitl-api-resume}]
+# chapter21/api.py  (continued)
+from langchain_core.runnables import RunnableConfig
+
+class ResumeRequest(BaseModel):
+    decision:       str                     # "approved" | "rejected"
+    edited_action:  ActionRecord | None = None
+    policy:         PolicyConfig        = PolicyConfig()
+
+@app.post("/runs/{thread_id}/resume")
+async def resume_endpoint(
+    thread_id: str,
+    req:       ResumeRequest,
+    graph      = Depends(lambda: _graph),
+) -> dict:
+    cfg: RunnableConfig = {
+        "configurable": {"thread_id": thread_id}
+    }
+    if not graph.get_state(cfg).next:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Thread '{thread_id}' is not paused.",
+        )
+    if req.edited_action is not None:
+        return await edit_and_resume(
+            thread_id=thread_id,
+            edited_action=req.edited_action,
+            decision=req.decision,
+            graph=graph,
+            policy=req.policy,
+        )
+    return await resume_run(
+        decision=req.decision,
+        thread_id=thread_id,
+        graph=graph,
+        policy=req.policy,
+    )
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:hitl-api-sse}
+and~\ref{lst:hitl-api-resume} deserve explanation.
+\code{\_graph} is a process-scoped singleton: the compiled graph object is
+stateless between threads---all per-thread state lives in the
+\code{MemorySaver} checkpointer---so a single instance safely handles all
+concurrent requests without any locking. The \code{Depends(lambda:~\_graph)}
+pattern rather than \code{Depends(get\_graph)} with a named function is
+equivalent but avoids declaring a one-line free function solely to satisfy
+FastAPI's \code{Depends} requirement; in a test, the lambda can be overridden
+by overriding \code{app.dependency\_overrides}. The
+\code{ResumeRequest.policy} field mirrors \code{StartRequest.policy}: the
+resume path calls \code{\_thread\_config(thread\_id,~policy)} inside
+\code{resume\_run} and \code{edit\_and\_resume}, which requires a
+\code{PolicyConfig} in \code{configurable}; a frontend that omits
+\code{policy} on resume would silently execute without the intended approval
+gates on re-entry, reproducing the production failure mode named in the
+chapter opener.
+
+All five layers of the solution are independently implemented and testable.
+The remaining problem is verification: confirming that the three HITL
+workflows---approval, state edit, and time-travel replay---each produce the
+correct state transitions under a fresh in-process checkpointer, before
+any persistent storage or network transport is introduced.
+
+
+%% ------------------------------------------------------------
+\section{Full System: Approval, Edit, and Replay as Runnable Tests}
+\label{sec:hitl-full}
+%% ------------------------------------------------------------
+
+The design problem is the absence of an executable specification for the
+three HITL workflows. The five sections above establish the mechanics
+individually, but no single runnable artefact confirms that they compose
+correctly---that the idempotency check survives resume, that
+\code{\_merge\_actions} replaces rather than appends after an edit, and that
+\code{replay\_from\_snapshot} produces a new branch on the same thread. The
+governing principle is that each workflow is a separate \code{pytest-asyncio}
+test with its own fresh \code{MemorySaver} instance, asserting the highest-
+level contract first and the per-field details second.
+
+The graph assembled for this chapter is minimal: \code{action\_node} followed
+by \code{synthesise\_node}, a single static edge between them, and a
+\code{MemorySaver} checkpointer. There are no conditional edges and no retry
+policies---those are Chapter~19 and Chapter~20 concerns. The \code{MemorySaver}
+limitation is intentional: it is in-process and lost on restart, which makes
+the retry-across-restart invariant provably absent. Verifying durability
+across process restarts requires the \code{AsyncSqliteSaver} migration
+introduced in Chapter~22~\S22.1, recorded here as a skipped test rather than
+a silent gap.
+
+\begin{lstlisting}[language=Python,
+  caption={Graph assembly: MemorySaver checkpointer, two nodes, no
+           conditional edges},
+  label={lst:hitl-graph}]
+# chapter21/graph.py
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.runnables import RunnableConfig
+from chapter21.state import ApprovalState
+from chapter21.action_node import action_node
+
+async def synthesise_node(state: ApprovalState,
+                          config: RunnableConfig) -> dict:
+    return {"final_output": f"Completed: {state['task']}"}
+
+def build_approval_graph() -> CompiledStateGraph:
+    b = StateGraph(ApprovalState)
+    b.add_node("action_node", action_node)
+    b.add_node("synthesise",  synthesise_node)
+    b.add_edge(START,         "action_node")
+    b.add_edge("action_node", "synthesise")
+    b.add_edge("synthesise",  END)
+    return b.compile(checkpointer=MemorySaver())
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:hitl-graph} deserve explanation.
+\code{build\_approval\_graph()} constructs a new \code{MemorySaver()} on
+every call so that each test receives a completely isolated checkpointer;
+sharing a single \code{MemorySaver} instance across tests would cause the
+second test's thread to find prior run state in the checkpointer and silently
+branch from an unexpected snapshot, producing false-positive passes when
+the thread happens to be in the correct state by coincidence. \code{synthesise\_node}
+returns a deterministic string rather than making an LLM call: the tests
+assert that \code{final\_output} is non-empty after a completed run, and a
+predictable string is a verifiable assertion target without requiring a live
+model or a mock; replacing this stub with a real LLM call is a one-line
+change that does not affect any other contract in the test suite.
+
+\begin{lstlisting}[language=Python,
+  caption={Scenario 1: approval gate --- pause, verify, approve, assert
+           execution invariants},
+  label={lst:hitl-test-approve}]
+# chapter21/test_hitl.py
+import pytest
+from langgraph.types import Command
+from chapter21.graph import build_approval_graph
+from chapter21.state import ApprovalState, ActionRecord
+from chapter21.policy import PolicyConfig, ApprovalGate
+from chapter21.runner import resume_run
+from langchain_core.runnables import RunnableConfig
+
+_POLICY = PolicyConfig(approval_gates=[
+    ApprovalGate(node_name="action_node", require_approval=True)
+])
+
+def _cfg(thread_id: str) -> RunnableConfig:
+    return {"configurable": {"thread_id": thread_id,
+                             "policy":    _POLICY}}
+
+@pytest.mark.asyncio
+async def test_approval_gate() -> None:
+    graph = build_approval_graph()
+    cfg   = _cfg("t-approve-001")
+    await graph.ainvoke(
+        ApprovalState(task="Send weekly report", messages=[],
+                      pending_actions=[], approved_count=0,
+                      final_output=""),
+        config=cfg,
+    )
+    snapshot = graph.get_state(cfg)
+    assert snapshot.next, "Graph must pause at interrupt"
+    result = await graph.ainvoke(Command(resume="approved"), config=cfg)
+    assert result["final_output"] != "", \
+        "synthesise_node must write final_output after approval"
+    executed = [r for r in result["pending_actions"]
+                if r["status"] == "executed"]
+    assert len(executed) == 1, \
+        "Exactly one ActionRecord must reach executed status"
+    assert result["approved_count"] == 1
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,
+  caption={Scenario 2: edit at breakpoint; Scenario 3: time-travel
+           replay},
+  label={lst:hitl-test-edit-replay}]
+# chapter21/test_hitl.py  (continued)
+from chapter21.runner import edit_and_resume
+from chapter21.time_travel import replay_from_snapshot
+
+@pytest.mark.asyncio
+async def test_state_edit_at_breakpoint() -> None:
+    graph = build_approval_graph()
+    cfg   = _cfg("t-edit-001")
+    await graph.ainvoke(
+        ApprovalState(task="Send quarterly report", messages=[],
+                      pending_actions=[], approved_count=0,
+                      final_output=""),
+        config=cfg,
+    )
+    assert graph.get_state(cfg).next, "Must be paused before edit"
+    orig: ActionRecord = graph.get_state(cfg).values["pending_actions"][0]
+    edited: ActionRecord = {**orig,  # type: ignore[assignment]
+                            "payload": {**orig["payload"],
+                                        "body": "EDITED BODY"}}
+    result = await edit_and_resume(
+        thread_id="t-edit-001", edited_action=edited,
+        decision="approved", graph=graph, policy=_POLICY,
+    )
+    done = [r for r in result["pending_actions"]
+            if r["status"] == "executed"]
+    assert done[0]["payload"]["body"] == "EDITED BODY"
+
+@pytest.mark.asyncio
+async def test_time_travel_replay() -> None:
+    graph   = build_approval_graph()
+    cfg     = _cfg("t-replay-001")
+    await graph.ainvoke(
+        ApprovalState(task="Archive logs", messages=[],
+                      pending_actions=[], approved_count=0,
+                      final_output=""),
+        config=cfg,
+    )
+    history = list(graph.get_state_history(cfg))
+    assert len(history) >= 2  # current + at least one prior
+    pre_interrupt = history[1]   # second-newest: before interrupt
+    await replay_from_snapshot(graph, pre_interrupt)
+    new_history = list(graph.get_state_history(cfg))
+    assert len(new_history) > len(history), \
+        "Replay must produce at least one new checkpoint on the thread"
+
+@pytest.mark.asyncio
+async def test_persistent_checkpointer_required() -> None:
+    pytest.skip(
+        "Requires AsyncSqliteSaver: Chapter 22 \\S22.1 migration"
+    )
+\end{lstlisting}
+
+Three decisions across Listings~\ref{lst:hitl-test-approve}
+and~\ref{lst:hitl-test-edit-replay} deserve explanation.
+The module-level \code{\_POLICY} and \code{\_cfg} fixtures are shared
+across all three tests because a divergence in gate configuration between
+tests would make a failing test ambiguous: one cannot tell whether the
+assertion failed because the HITL mechanic broke or because the gate was
+not active. \code{test\_state\_edit\_at\_breakpoint} asserts
+\code{done[0]["payload"]["body"]~==~"EDITED~BODY"} rather than asserting
+\code{action\_id}
