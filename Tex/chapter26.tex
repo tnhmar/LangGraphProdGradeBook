@@ -1,0 +1,1035 @@
+%% ============================================================
+%% Chapter 26 — Deployment, Serving & Configuration
+%% Production-Grade Agentic AI: LangGraph + Python Frameworks
+%% ============================================================
+
+\chapter{Deployment, Serving \& Configuration}
+\label{chap:deployment}
+
+A LangGraph graph that works perfectly on a laptop will fail in production
+the moment two requests arrive simultaneously, a pod restarts mid-run, an
+engineer pushes a bad prompt at 2~a.m., or the model vendor changes a
+pricing tier. These are not theoretical risks: teams running agentic
+workloads consistently report that the gap between a working local
+prototype and a stable production service is wider for AI agents than for
+conventional APIs, precisely because an agent's correctness depends on
+external state---LLM weights, prompt text, checkpointer data---that changes
+independently of the code. The deployment layer exists to close that gap by
+making the agent's environment explicit, versioned, and observable.
+
+The solution in this chapter is organised into four layers. The
+\emph{serving layer} translates graph invocations into HTTP semantics,
+distinguishing synchronous responses from streaming ones. The
+\emph{infrastructure layer} packages the serving layer into a reproducible,
+non-root container and operates it on Kubernetes with health-aware traffic
+management. The \emph{configuration layer} externalises every value that
+changes between environments so that the same image runs in staging and
+production without modification. The \emph{experiment layer} makes model
+and prompt choices runtime decisions rather than code changes, enabling
+zero-downtime rollouts and controlled A/B comparisons.
+
+The sections are ordered by dependency: you cannot containerise code you
+have not written (\S\ref{sec:serving-contract} precedes
+\S\ref{sec:infra-layer}), you cannot externalise secrets you have not
+identified (\S\ref{sec:config-must-not-live} follows the serving and
+infrastructure sections where those secrets first appear), and you cannot
+roll out a new prompt atomically without both a config layer and a running
+service (\S\ref{sec:zero-downtime-rollout} follows~\S\ref{sec:config-must-not-live}).
+The chapter then pivots to the LangGraph Platform managed path
+(\S\ref{sec:platform-json}--\S\ref{sec:ab-routing}), which replaces the OSS
+infrastructure layer with a single configuration file but uses the same
+configuration and experiment layers.
+
+\begin{table}[h]
+\centering
+\caption{Domain terms introduced in this chapter}
+\label{tab:ch26-terms}
+\begin{tabular}{lp{9.5cm}}
+\toprule
+\textbf{Term} & \textbf{Definition} \\
+\midrule
+\emph{Server-Sent Events (SSE)} &
+  A unidirectional HTTP streaming protocol in which the server pushes
+  newline-delimited \texttt{data:} frames to a client over a single
+  long-lived connection; distinguished from WebSockets by being
+  half-duplex and HTTP/1.1-compatible. \\
+\emph{liveness probe} &
+  A Kubernetes health check that determines whether a container's process is
+  alive; failure causes the kubelet to restart the container. \\
+\emph{readiness probe} &
+  A Kubernetes health check that determines whether a container is ready to
+  accept traffic; failure removes the pod from the Service's endpoint list
+  without restarting it. \\
+\emph{multi-stage build} &
+  A Docker build pattern in which intermediate stages (e.g.\ dependency
+  installation) are discarded and only their outputs are copied into the
+  final image, minimising image size and attack surface. \\
+\emph{configurable dict} &
+  The \texttt{RunnableConfig["configurable"]} sub-dictionary that LangGraph
+  threads through every node call; the canonical channel for per-request
+  runtime parameters that do not belong in agent state. \\
+\emph{double-texting} &
+  The condition in which a client sends a second request to the same thread
+  before the first run has completed; the Platform's
+  \texttt{multitask\_strategy} field specifies how to handle it. \\
+\emph{LiteLLM Router} &
+  A proxy object from the \texttt{litellm} library that presents a unified
+  OpenAI-compatible completion API in front of multiple model deployments,
+  with configurable routing strategies, retries, and cooldown. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\medskip
+\noindent\textbf{Source layout for this chapter:}
+
+\begin{lstlisting}[language=bash, caption={Chapter 26 source tree},
+  label={lst:ch26-tree}]
+src/
+  serve/
+    app.py          # FastAPI application (S26.1, S26.4)
+  config/
+    settings.py     # Pydantic Settings (S26.3)
+  graph/
+    factory.py      # graph builder + prompt pull (S26.4)
+    nodes.py        # LLM node with variant routing (S26.6)
+  llm/
+    router.py       # LiteLLM Router (S26.6)
+  platform/
+    cron_setup.py   # Platform cron + webhook helpers (S26.5)
+Dockerfile          # multi-stage build (S26.2)
+k8s/
+  deployment.yaml   # Kubernetes manifest (S26.2)
+langgraph.json      # Platform config (S26.5)
+.env.example        # documented environment template
+\end{lstlisting}
+
+%%------------------------------------------------------------
+%% PART A — OSS Runtime (Self-Hosted)
+%%------------------------------------------------------------
+\noindent\rule{\linewidth}{0.8pt}
+\begin{center}
+  \textbf{Part A\quad OSS Runtime\quad FastAPI\,\textperiodcentered\,Docker\,\textperiodcentered\,Kubernetes\,\textperiodcentered\,Config}
+\end{center}
+\noindent\rule{\linewidth}{0.8pt}
+
+%% -----------------------------------------------------------
+\section{An Agent Needs Two Distinct HTTP Contracts}
+\label{sec:serving-contract}
+
+The design problem here is that a LangGraph graph produces two qualitatively
+different outputs depending on the caller's needs: a complete, atomic result
+when the caller wants to process the answer as a unit, and a stream of
+incremental token events when the caller is a chat UI that must update
+character-by-character to feel responsive. Serving both from the same
+endpoint is tempting---return streaming always and let the client
+buffer---but it conflates transport with semantics and breaks every
+JSON-consuming downstream consumer that expects a single response body.
+The principle is that synchronous invocations and streaming invocations are
+different contracts and must be expressed as different endpoints.
+
+FastAPI's default \code{JSONResponse} handles the synchronous case directly:
+the graph runs to completion via \code{ainvoke}, and the result is serialised
+once. The streaming case requires \emph{Server-Sent Events (SSE)}, a protocol
+in which the server sends a sequence of \texttt{data: \{json\}\textbackslash
+n\textbackslash n} frames over a long-lived HTTP connection. SSE is
+preferable to WebSockets for agent token streaming because it is
+half-duplex (the client never needs to send mid-stream), is automatically
+reconnected by browsers, and traverses load balancers without special
+configuration. The \code{sse-starlette} library provides
+\code{EventSourceResponse}, which wraps any async generator and handles
+frame formatting, keep-alive pings, and connection teardown.
+
+For token-by-token streaming, LangGraph's \code{astream} method accepts a
+\code{stream\_mode} parameter. Passing \code{stream\_mode="messages"} causes
+the graph to yield \code{(AIMessageChunk, metadata)} tuples as each token
+arrives from the LLM, rather than waiting for the node to finish. This is the
+correct and officially supported mechanism for token streaming from a
+\code{CompiledStateGraph}; it does not require LangChain's LCEL
+\code{astream\_events} pipeline protocol, which is designed for chain
+composition rather than graph execution.
+
+The graph is expensive to construct---it compiles the state machine, wires
+the checkpointer, and in \S\ref{sec:zero-downtime-rollout} will also pull a
+remote prompt. Constructing it inside a request handler would add hundreds of
+milliseconds to every request and spawn redundant network calls. FastAPI's
+\emph{lifespan} context manager, introduced in FastAPI~0.93 and now the
+canonical alternative to deprecated \code{on\_event} hooks, solves this: the
+graph is built once at startup and stored on \code{app.state} where every
+request handler can reach it without a global variable.
+
+\begin{lstlisting}[language=Python,
+  caption={FastAPI lifespan, \texttt{/invoke}, \texttt{/stream}, and
+    \texttt{/health} --- \texttt{src/serve/app.py}},
+  label={lst:fastapi-app}]
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Literal
+import threading
+from datetime import datetime, timezone
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from sse_starlette.sse import EventSourceResponse
+from pydantic import BaseModel
+from langchain_core.runnables import RunnableConfig
+
+from src.config.settings import get_settings
+from src.graph.factory import build_graph
+
+_cycle_count: int = 0
+_count_lock = threading.Lock()
+
+class InvokeRequest(BaseModel):
+    messages: list[dict[str, str]]
+    thread_id: str
+    configurable: dict[str, Any] = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    settings = get_settings()
+    app.state.graph, app.state.prompt_meta = build_graph(settings)
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/invoke")
+async def invoke(req: InvokeRequest) -> JSONResponse:
+    global _cycle_count
+    cfg: RunnableConfig = {
+        "configurable": {"thread_id": req.thread_id, **req.configurable}
+    }
+    result = await app.state.graph.ainvoke(
+        {"messages": req.messages}, config=cfg
+    )
+    with _count_lock:
+        _cycle_count += 1
+    return JSONResponse({"output": result})
+
+@app.post("/stream", response_class=EventSourceResponse)
+async def stream(req: InvokeRequest) -> EventSourceResponse:
+    cfg: RunnableConfig = {
+        "configurable": {"thread_id": req.thread_id, **req.configurable}
+    }
+    async def event_generator() -> AsyncGenerator[dict, None]:
+        # stream_mode="messages" yields (AIMessageChunk, metadata) tuples
+        async for chunk, _meta in app.state.graph.astream(
+            {"messages": req.messages},
+            config=cfg,
+            stream_mode="messages",
+        ):
+            token = getattr(chunk, "content", "")
+            if token:
+                yield {"data": token}
+    return EventSourceResponse(event_generator(), ping=15)
+
+@app.get("/health")
+def health() -> JSONResponse:           # sync: avoids event-loop deadlock
+    meta = getattr(app.state, "prompt_meta", {})
+    return JSONResponse({
+        "status": "ok",
+        "cycle_count": _cycle_count,
+        "prompt_commit": meta.get("commit", "unknown"),
+        "prompt_loaded_at": meta.get("loaded_at", ""),
+    })
+\end{lstlisting}
+
+Four decisions in Listing~\ref{lst:fastapi-app} deserve explanation. First,
+\code{astream(stream\_mode="messages")} is the correct LangGraph API for
+token streaming: it yields \code{(AIMessageChunk, metadata)} pairs as each
+token arrives from any LLM node in the graph. This is distinct from
+LangChain's \code{astream\_events} method, which operates on LCEL chains
+(sequences of runnables), not on compiled state graphs; using
+\code{astream\_events} on a \code{CompiledStateGraph} would yield node-level
+events rather than per-token chunks and is not the intended API for this
+use case. Second, \code{health} is a plain synchronous function, not an
+\code{async def}: a liveness probe that awaits anything can deadlock if the
+event loop is saturated with graph invocations, causing the probe to fail
+and the pod to restart exactly when it is busiest. Third,
+\code{\_cycle\_count} is guarded by a \code{threading.Lock} rather than an
+\code{asyncio.Lock} because both the async \code{invoke} handler and the
+synchronous \code{health} endpoint read or write the counter; mixing asyncio
+and threading locks causes deadlocks. Fourth, \code{EventSourceResponse} is
+constructed with \code{ping=15}: the 15-second keep-alive ping prevents load
+balancers and proxies with idle-connection timeouts shorter than a typical
+agent run from closing the SSE connection mid-stream.
+
+\begin{notebox}
+  \textbf{NodeInterrupt vs.\ GraphRecursionError.}\quad
+  LangGraph raises \code{NodeInterrupt} when a node calls \code{interrupt()}
+  to pause for human input; the graph state is safely checkpointed and the
+  run can be resumed. This is not an error condition and should return
+  HTTP~202 with a checkpoint reference. \code{GraphRecursionError} signals a
+  genuinely broken graph that has exceeded its recursion limit and should
+  return HTTP~422. Treating both as HTTP~500 will cause your monitoring to
+  page on normal human-in-the-loop pauses.
+\end{notebox}
+
+With the HTTP interface defined, the next problem is making it reproducible
+across machines and environments---the subject of the infrastructure layer.
+
+%% -----------------------------------------------------------
+\section{The Infrastructure Layer Must Protect Traffic in Transit}
+\label{sec:infra-layer}
+
+The design problem here is that deploying a new pod version without
+dropping in-flight requests requires the infrastructure layer to know two
+independent things: whether the process is alive at all, and whether it is
+ready to accept new traffic. The naive approach---a single health check
+that governs both---creates a false equivalency: a pod can be alive (the
+process is running) without being ready (the graph is not yet compiled, the
+checkpointer connection is not yet established). Conflating them means either
+that live traffic hits an unready pod, or that a pod is unnecessarily
+restarted when it is merely warming up. The principle is to decouple
+liveness from readiness at both the image and the Kubernetes manifest levels.
+
+\subsection*{The Image Must Not Run as Root}
+
+Before the Kubernetes manifest can be correct, the image it runs must be
+safe. A process running as root inside a container can, if an attacker
+achieves code execution, write to mounted secrets, modify \code{/etc/hosts},
+or escape to the host via certain kernel CVEs. The multi-stage Docker build
+pattern addresses this in two steps: a \emph{builder stage} installs all
+Python dependencies using \code{uv}, whose \code{--frozen} flag guarantees
+the lockfile governs the install; a \emph{runtime stage} copies only the
+virtual environment and application source into a minimal image and creates a
+dedicated non-root user before setting the entrypoint.
+
+\begin{lstlisting}[language=bash,
+  caption={Multi-stage Dockerfile with non-root runtime --- \texttt{Dockerfile}},
+  label={lst:dockerfile}]
+# --- builder ---
+FROM ghcr.io/astral-sh/uv:0.5-python3.12-bookworm-slim AS builder
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-cache --compile-bytecode
+COPY src/ ./src/
+
+# --- runtime ---
+FROM python:3.12-slim-bookworm AS runtime
+WORKDIR /app
+RUN addgroup --system appgroup \
+ && adduser --system --ingroup appgroup \
+            --no-create-home appuser
+COPY --from=builder /app/.venv ./.venv
+COPY --from=builder /app/src  ./src
+ENV PATH="/app/.venv/bin:$PATH"
+USER appuser
+ENTRYPOINT ["python", "-m", "uvicorn", "src.serve.app:app", \
+            "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:dockerfile} deserve explanation. First,
+\code{--compile-bytecode} in the builder stage pre-compiles all \code{.py}
+files to \code{.pyc} bytecode during the build rather than at first import;
+this shaves 200--400\,ms from pod startup time when the virtual environment
+contains large packages such as \code{langchain-core}. Second, the runtime
+base image is plain \code{python:3.12-slim-bookworm}, not the \code{uv}
+image; the runtime stage has no need for \code{uv} itself, and including it
+adds roughly 20\,MB and an additional binary with network capabilities.
+Third, the \code{ENTRYPOINT} uses array form (exec form) rather than shell
+form: in exec form, \code{uvicorn} is PID~1 and receives \code{SIGTERM}
+directly, enabling graceful shutdown; in shell form, the shell is PID~1 and
+\code{SIGTERM} may never reach \code{uvicorn}, leaving in-flight requests
+orphaned.
+
+\begin{warningbox}
+  \textbf{One worker per pod.}\quad
+  The \code{--workers~1} flag is intentional. LangGraph graphs run on
+  \code{asyncio} event loops; multiple Gunicorn workers each have a separate
+  memory space, meaning \code{app.state.graph} is not shared. If you need
+  horizontal scale, add Kubernetes replicas---each pod gets one event loop and
+  one graph instance. Running multiple workers per pod while holding
+  event-loop-bound state (checkpointer connections, the compiled graph) causes
+  subtle race conditions that are nearly impossible to reproduce locally.
+\end{warningbox}
+
+\subsection*{Kubernetes Needs Two Distinct Health Checks}
+
+With the image defined, the Kubernetes manifest must wire the two health
+check semantics correctly. The \code{livenessProbe} asks: ``is the container
+still functioning?'' Its \code{initialDelaySeconds} must be long enough for
+the graph to finish compiling and the checkpointer connection to be
+established---30\,s is a safe baseline for typical dependency trees. The
+\code{readinessProbe} asks: ``should this pod receive traffic?'' It fires
+earlier (10\,s) and with a lower failure threshold (2 versus 3) because
+removing a pod from rotation is cheap and reversible, while kubelet restarts
+are disruptive. Both probes hit the same \code{GET /health} endpoint from
+Listing~\ref{lst:fastapi-app}, which is synchronous and fast.
+
+\begin{lstlisting}[language=yaml,
+  caption={Kubernetes Deployment with rolling strategy ---
+    \texttt{k8s/deployment.yaml} (key fields)},
+  label={lst:k8s-deployment}]
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langgraph-agent
+spec:
+  replicas: 3
+  minReadySeconds: 15
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels: {app: langgraph-agent}
+  template:
+    metadata:
+      labels: {app: langgraph-agent}
+    spec:
+      containers:
+        - name: agent
+          image: registry.example.com/langgraph-agent:$(TAG)
+          ports: [{containerPort: 8080}]
+          envFrom:
+            - secretRef:    {name: langgraph-secrets}
+            - configMapRef: {name: langgraph-config}
+          resources:
+            limits:   {cpu: "2", memory: 4Gi}
+            requests: {cpu: "500m", memory: 1Gi}
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 2
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:k8s-deployment} deserve explanation.
+First, \code{minReadySeconds:~15} sits at the \code{spec} level of the
+\code{Deployment}, not inside \code{rollingUpdate}; it is a separate field
+that requires a pod to remain ready for 15\,s before the rollout controller
+considers it ``available'' and proceeds to replace the next old pod. Without
+it, a pod that passes its first readiness check but crashes two seconds later
+is counted as available, and the rollout continues into a degraded cluster.
+Second, \code{maxUnavailable:~0} combined with \code{maxSurge:~1} means
+there are always at least \code{replicas} pods serving traffic; the surge pod
+is created, passes readiness, waits \code{minReadySeconds}, and only then is
+an old pod terminated. Third, \code{envFrom.secretRef} references a
+Kubernetes \code{Secret} object by name---the manifest itself contains no
+credential literals, satisfying audit requirements and enabling secret
+rotation without image rebuilds.
+
+Knowing which environment variables belong in which \code{Secret} or
+\code{ConfigMap} requires a principled inventory of all configuration values,
+which is the responsibility of the configuration layer.
+
+%% -----------------------------------------------------------
+\section{Configuration Must Not Live in Code}
+\label{sec:config-must-not-live}
+
+The design problem here is that configuration values scattered across source
+files make it impossible to run the same artefact in multiple environments.
+A model name hardcoded in a node function, a Redis URL hardcoded in the
+checkpointer factory, an API key string-interpolated into a client
+constructor: each of these ties a specific environment to a specific image
+tag, defeating the purpose of containerisation. The naive approach of
+\code{os.environ.get("KEY", "default")} is marginally better but does not
+validate types, does not document what values are expected, and silently
+accepts malformed input. The principle is that every external value must be
+declared, typed, validated at startup, and injected from the environment.
+
+\emph{pydantic-settings} extends Pydantic's validation to environment
+variables and \code{.env} files. A class inheriting from \code{BaseSettings}
+declares fields exactly as a normal Pydantic model, but pydantic-settings
+populates those fields by reading the environment first, then falling back to
+\code{.env} files, then to declared defaults. The key feature for this
+architecture is \emph{nested sub-models}: by setting
+\code{env\_nested\_delimiter="\_\_"}, the environment variable
+\code{GRAPH\_\_RECURSION\_LIMIT=25} automatically maps to
+\code{settings.graph.recursion\_limit}, grouping related values and avoiding
+a flat namespace of thirty top-level variables.
+
+\begin{lstlisting}[language=Python,
+  caption={Typed, validated settings with nested sub-models ---
+    \texttt{src/config/settings.py}},
+  label={lst:settings}]
+from functools import lru_cache
+from typing import Literal
+from pydantic import BaseModel, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+import re
+
+class LLMConfig(BaseModel):
+    provider: str = "anthropic"
+    model: str = "claude-sonnet-4-8"
+    temperature: float = 0.0
+    api_key: SecretStr
+
+class GraphConfig(BaseModel):
+    recursion_limit: int = 25
+    checkpointer_backend: Literal["memory", "redis"] = "redis"
+
+class LangSmithConfig(BaseModel):
+    api_key: SecretStr
+    hub_repo_id: str
+    project_name: str
+
+    @field_validator("hub_repo_id")
+    @classmethod
+    def _validate_repo_id(cls, v: str) -> str:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+", v):
+            raise ValueError("hub_repo_id must be 'owner/name'")
+        return v
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=(".env", ".env.prod"),
+        env_file_encoding="utf-8",
+        env_nested_delimiter="__",
+        case_sensitive=False,
+    )
+    llm: LLMConfig
+    graph: GraphConfig
+    langsmith: LangSmithConfig
+    redis_url: str = "redis://localhost:6379"
+    prompt_variant: Literal["v1", "v2"] = "v1"
+
+    @field_validator("redis_url")
+    @classmethod
+    def _validate_redis_url(cls, v: str) -> str:
+        if not v.startswith(("redis://", "rediss://")):
+            raise ValueError("redis_url must use redis:// or rediss://")
+        return v
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()  # type: ignore[call-arg]
+\end{lstlisting}
+
+Four decisions in Listing~\ref{lst:settings} deserve explanation. First,
+\code{SecretStr} is used for all API keys: Pydantic's \code{SecretStr} type
+masks the value in \code{\_\_repr\_\_} and \code{\_\_str\_\_} output, so an
+accidentally logged settings object will show \code{'**********'} rather than
+the live key. The raw value is accessed only at client construction time via
+\code{.get\_secret\_value()}. Second, \code{AnyUrl} (Pydantic v1 style) is
+intentionally absent: in Pydantic v2, assigning a plain string default to an
+\code{AnyUrl} field raises a validation error because \code{AnyUrl} no longer
+coerces strings automatically. A plain \code{str} with a custom
+\code{@field\_validator} is the correct pattern. Third, \code{env\_file}
+accepts a tuple: \code{(".env", ".env.prod")} means the prod file is loaded
+after the base file and its values win---a clean multi-environment override
+without templating tools. Fourth, \code{@lru\_cache} on \code{get\_settings}
+makes the \code{Settings} object a per-process singleton; in tests,
+\code{get\_settings.cache\_clear()} invalidates the cache between test cases
+so that each case can inject its own environment variables without
+monkeypatching.
+
+\begin{notebox}
+  \code{SettingsConfigDict} and \code{BaseSettings} are both imported from
+  \code{pydantic\_settings}, \emph{not} from \code{pydantic}. They are
+  provided by the separate \code{pydantic-settings} package, which must be
+  listed as an explicit dependency. Importing \code{BaseSettings} from
+  \code{pydantic} directly was deprecated in Pydantic v2 and will raise an
+  \code{ImportError}.
+\end{notebox}
+
+With all values externalised, it is now possible to change a configuration
+value---including the identity of the prompt---without modifying or
+redeploying the image, which is the mechanism that enables the next
+capability: atomic prompt rollout.
+
+%% -----------------------------------------------------------
+\section{Prompt Changes Must Be Atomic and Reversible}
+\label{sec:zero-downtime-rollout}
+
+The design problem here is that a LangGraph agent's behaviour is determined
+by two independent artefacts: the code and the prompt. Deploying a new prompt
+by releasing a new Docker image is safe but slow---a typical image build and
+rollout takes five to fifteen minutes, far too long to recover from a bad
+prompt in production. Storing the prompt inside the codebase ties two
+independent change velocities together: engineers deploy code on one schedule
+and prompt engineers iterate on another. The principle is that the prompt must
+be a versioned external artefact, swappable at runtime, with an instant
+rollback path.
+
+LangSmith Hub provides a versioned store for \code{ChatPromptTemplate}
+objects. A prompt pushed to Hub is identified by a fully qualified reference
+of the form \code{owner/name:commit-hash}. The \code{langsmith.hub.pull()}
+function retrieves the prompt by reference and returns a \code{Runnable} (in
+practice a \code{ChatPromptTemplate}) that can be composed into any LangGraph
+node. Pinning the commit hash makes the pull deterministic: the same hash
+will always return the same prompt bytes regardless of subsequent pushes to
+the same repo. The floating \code{:latest} reference is appropriate only in
+CI/CD pipelines where the intent is always to test the newest prompt.
+
+A typed graph state is required by \code{StateGraph}: passing a plain
+\code{dict} is not a valid schema. The correct pattern is to define a
+\code{TypedDict} with the state fields the graph reads and writes. The
+\code{config\_schema} parameter to \code{StateGraph} was deprecated in
+LangGraph v0.6.0 and removed in the v0.6 release cycle; runtime context that
+was previously passed via \code{config\_schema} now belongs in
+\code{context\_schema}, which makes immutable per-run data (such as a
+\code{user\_id} or database connection) available to nodes via the
+\code{Runtime} object without polluting agent state.
+
+\begin{lstlisting}[language=Python,
+  caption={Graph factory with typed state, prompt pull, and feature-flag ---
+    \texttt{src/graph/factory.py}},
+  label={lst:graph-factory}]
+from typing import Annotated
+from typing_extensions import TypedDict
+from langsmith import hub
+from langchain_core.runnables import Runnable
+from langchain_core.messages import BaseMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.redis import RedisSaver
+from src.config.settings import Settings
+
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+def pull_prompt(repo_id: str, commit: str | None = None) -> Runnable:
+    ref = f"{repo_id}:{commit}" if commit else repo_id
+    return hub.pull(ref)
+
+def build_graph(settings: Settings) -> tuple:
+    """Returns (CompiledStateGraph, prompt_meta dict)."""
+    from datetime import datetime, timezone
+    commit = getattr(settings, "prompt_commit", None)
+    prompt = pull_prompt(settings.langsmith.hub_repo_id, commit)
+    prompt_meta = {
+        "commit": commit or "latest",
+        "loaded_at": datetime.now(timezone.utc).isoformat(),
+        "variant": settings.prompt_variant,
+    }
+    checkpointer = RedisSaver.from_conn_string(settings.redis_url)
+    builder = StateGraph(AgentState)
+    builder.add_node("llm", _make_llm_node(prompt, settings))
+    builder.add_edge(START, "llm")
+    builder.add_edge("llm", END)
+    compiled = builder.compile(checkpointer=checkpointer)
+    return compiled, prompt_meta
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:graph-factory} deserve explanation.
+First, \code{hub.pull} is imported from \code{langsmith}, not from
+\code{langchain\_hub} or \code{langchain}: as of LangChain~0.2, the Hub
+client was migrated to the \code{langsmith} package, and importing from
+\code{langchain} raises a deprecation warning that will become an
+\code{ImportError}. Second, \code{AgentState} is a \code{TypedDict} with a
+\code{messages} field annotated with the \code{add\_messages} reducer: this
+is the correct and required pattern for a \code{StateGraph} schema;
+\code{add\_messages} ensures that new messages are appended rather than
+replacing the entire list on each node return. Third, the function returns a
+tuple of the compiled graph and a \code{prompt\_meta} dictionary: the
+metadata---commit hash, load timestamp, variant---is stored on
+\code{app.state.prompt\_meta} and served by \code{/health}, enabling
+LangSmith traces to be correlated with the exact prompt version that produced
+them.
+
+Hot-swapping the prompt without restarting the pod requires a mechanism to
+trigger \code{build\_graph} after startup. On UNIX systems, \code{SIGUSR1}
+is the conventional ``reload configuration'' signal: it is not used by the
+Python runtime itself and is safe to repurpose. The signal handler schedules
+a reload coroutine on the running event loop using
+\code{loop.add\_signal\_handler}, which is the thread-safe way to hand work
+to an asyncio loop from a synchronous OS signal context.
+
+\begin{lstlisting}[language=Python,
+  caption={SIGUSR1 hot-swap handler added to lifespan ---
+    \texttt{src/serve/app.py} (additions)},
+  label={lst:sigusr1}]
+import asyncio, signal, sys
+from src.graph.factory import build_graph
+from src.config.settings import get_settings
+
+_reload_lock = asyncio.Lock()
+
+async def _reload_graph(app) -> None:
+    async with _reload_lock:          # prevents concurrent reloads
+        settings = get_settings()
+        new_graph, new_meta = build_graph(settings)
+        app.state.graph = new_graph   # atomic single-assignment swap
+        app.state.prompt_meta = new_meta
+
+def _install_reload_handler(app, loop: asyncio.AbstractEventLoop) -> None:
+    if sys.platform == "win32":
+        # Windows has no SIGUSR1; expose POST /admin/reload instead
+        @app.post("/admin/reload", include_in_schema=False)
+        async def admin_reload():
+            await _reload_graph(app)
+            return {"reloaded": True}
+        return
+    loop.add_signal_handler(
+        signal.SIGUSR1,
+        lambda: asyncio.ensure_future(_reload_graph(app))
+    )
+
+# Call inside lifespan, after graph is first built:
+# loop = asyncio.get_event_loop()
+# _install_reload_handler(app, loop)
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:sigusr1} deserve explanation. First,
+\code{\_reload\_lock} is an \code{asyncio.Lock} rather than a
+\code{threading.Lock}: the reload coroutine runs on the event loop, so the
+async lock is correct; a threading lock here would block the event loop
+thread. The lock prevents a second \code{SIGUSR1} from starting a new Hub
+pull while the first is still in flight, which would cause two concurrent
+\code{build\_graph} calls racing to write \code{app.state.graph}. Second,
+the Windows path is not a workaround---it is the correct design for that
+platform: UNIX signals and Windows signals have fundamentally different
+semantics, and a \code{POST /admin/reload} endpoint behind network-policy
+restrictions is the idiomatic Windows-compatible alternative.
+
+\begin{warningbox}
+  \textbf{Multi-worker GIL caveat.}\quad
+  The \code{app.state.graph = new\_graph} swap is a single Python attribute
+  assignment and is atomic under CPython's GIL within a single process.
+  It is \emph{not} safe across multiple Gunicorn workers, because each worker
+  is a separate OS process with its own memory space. If you must use multiple
+  workers per pod, store the active prompt commit hash in Redis and rebuild
+  the graph from it on each request---at the cost of per-request latency.
+\end{warningbox}
+
+The OSS runtime is now fully operational: requests are served, the image is
+safe, configuration is externalised, and prompts roll out atomically. The
+next two sections cover the LangGraph Platform managed path, which replaces
+the infrastructure layer with a single configuration file while preserving
+the same configuration and experiment primitives.
+
+%%------------------------------------------------------------
+%% PART B — LangGraph Platform (Managed Service)
+%%------------------------------------------------------------
+\noindent\rule{\linewidth}{0.8pt}
+\begin{center}
+  \textbf{Part B\quad LangGraph Platform (Managed)\quad
+    langgraph.json\,\textperiodcentered\,Cron\,\textperiodcentered\,Webhooks\,\textperiodcentered\,Studio\,\textperiodcentered\,A/B}
+\end{center}
+\noindent\rule{\linewidth}{0.8pt}
+
+%% -----------------------------------------------------------
+\section{A Single File Replaces the Infrastructure Layer}
+\label{sec:platform-json}
+
+The design problem here is that the OSS infrastructure path requires
+maintaining a Dockerfile, a Kubernetes manifest, an ingress configuration,
+and a rolling-deploy pipeline---artefacts whose combined complexity rivals
+the agent code itself. For teams whose core competency is agent behaviour
+rather than container orchestration, this maintenance tax is a recurring
+source of production incidents unrelated to the agent's logic. The LangGraph
+Platform managed runtime internalises all of this infrastructure and exposes
+a single declarative configuration file, \code{langgraph.json}, as the only
+interface between the application code and the deployment system.
+
+\code{langgraph.json} has two required keys. \code{graphs} is a dictionary
+mapping an agent name to a Python module path and variable (or zero-argument
+factory function) in the form \code{"./path/to/file.py:variable"}. A
+zero-argument callable is detected automatically and called at startup,
+making it the correct form when the graph constructor reads from
+\code{get\_settings()} and therefore requires environment variables to be
+populated first. \code{dependencies} is a list of pip package names or
+relative local paths (e.g.\ \code{"."} to install the project root as a
+package) that the Platform runtime installs before starting the server.
+All other keys---\code{env}, \code{dockerfile\_lines}, \code{http},
+\code{auth}---are optional.
+
+\begin{lstlisting}[language=json,
+  caption={Complete \texttt{langgraph.json} with required and key optional fields},
+  label={lst:langgraph-json}]
+{
+  "graphs": {
+    "research_agent": "./src/graph/agent.py:graph",
+    "summariser":     "./src/graph/summariser.py:make_graph"
+  },
+  "dependencies": [
+    ".",
+    "langchain_anthropic",
+    "langchain_openai",
+    "qdrant-client",
+    "litellm"
+  ],
+  "env": "./.env",
+  "dockerfile_lines": [
+    "RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils && rm -rf /var/lib/apt/lists/*"
+  ],
+  "http": {
+    "app": "./src/serve/middleware.py:app"
+  }
+}
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:langgraph-json} deserve explanation.
+First, \code{"env":~"./.env"} is present for local development with
+\code{langgraph dev} but must be omitted or treated as inert in cloud and
+self-hosted deployments, where the Platform control plane injects environment
+variables directly into the container; relying on a committed \code{.env}
+file in production is a credentials-leak risk. Second, \code{make\_graph}
+(the \code{summariser} entry) points to a factory function rather than a
+compiled graph variable: the Platform detects zero-argument callables and
+calls them at startup, which is necessary when the graph constructor reads
+from \code{get\_settings()} and therefore requires the environment to be
+populated first. Third, \code{dockerfile\_lines} injects raw \code{RUN}
+instructions into the Platform's generated Dockerfile; the
+\code{--no-install-recommends} and cache-cleanup flags are not optional
+niceties---they prevent the runtime image from ballooning with documentation
+packages and APT cache files.
+
+\begin{notebox}
+  \textbf{Four deployment modes, one config file.}\quad
+  The LangGraph Platform supports four deployment modes: Cloud SaaS
+  (one-click deploy from a GitHub repo), Self-Hosted Data Plane (your cloud,
+  LangChain's control plane), Self-Hosted Control Plane (fully air-gapped),
+  and Standalone Container (single Docker container for on-premise). The
+  \code{langgraph.json} file is identical across all four modes; the
+  distinction lies in where \code{langgraph build} pushes its output and who
+  manages the serving infrastructure.
+\end{notebox}
+
+The Platform's managed runtime also provides primitives for time-based
+scheduling and asynchronous run management that would otherwise require
+Celery or APScheduler in the OSS path.
+
+\subsection*{Cron Triggers and Webhook Callbacks}
+
+Many production agents are not request-driven: a daily digest agent, a
+nightly data-enrichment pipeline, or an hourly anomaly detector all need
+to fire on a schedule. In the OSS path this requires a separate Celery worker,
+a beat scheduler, and careful coordination of database connections. The
+Platform provides \emph{cron triggers} as a first-class primitive: a cron job
+is registered once via the SDK and thereafter fires runs against a specified
+assistant on the platform's scheduler, with no additional infrastructure.
+
+A related problem is long-running background runs. A research agent that
+takes three minutes to complete should not hold an HTTP connection open for
+that duration. The Platform's \code{webhook} parameter on run creation allows
+a caller to fire a run and receive the result asynchronously: the Platform
+POSTs the complete run output as a JSON payload to a URL the caller provides
+when the run finishes.
+
+\begin{lstlisting}[language=Python,
+  caption={Platform cron registration and webhook run creation ---
+    \texttt{src/platform/cron\_setup.py}},
+  label={lst:cron-setup}]
+from langgraph_sdk import get_client
+from typing import Any
+
+async def register_daily_digest(
+    base_url: str,
+    assistant_id: str,
+) -> dict[str, Any]:
+    client = get_client(url=base_url)
+    return await client.crons.create(
+        assistant_id=assistant_id,
+        schedule="0 9 * * 1-5",           # weekdays at 09:00 UTC
+        input={"task": "daily_digest"},
+        metadata={"created_by": "cron_setup"},
+    )
+
+async def create_webhook_run(
+    base_url: str,
+    thread_id: str,
+    assistant_id: str,
+    payload: dict[str, Any],
+    webhook_url: str,
+) -> dict[str, Any]:
+    client = get_client(url=base_url)
+    return await client.runs.create(
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        input=payload,
+        webhook=webhook_url,
+        multitask_strategy="rollback",
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:cron-setup} deserve explanation. First,
+\code{crons.create} takes \code{assistant\_id}, not \code{graph\_id}: in
+the Platform's data model, an \emph{assistant} is a deployed instance of a
+graph with a specific configuration; the cron is attached to the assistant,
+not the graph definition, so that different assistants built from the same
+graph can have independent schedules and inputs. Second,
+\code{multitask\_strategy="rollback"} on \code{runs.create} is the correct
+choice for most interactive agents: if a second message arrives on a thread
+while a run is in progress, \code{"rollback"} cancels the in-flight run and
+starts a fresh one with the new input, preserving checkpointed state up to the
+last completed node. The alternatives---\code{"enqueue"} (queue behind the
+current run) and \code{"interrupt"} (cancel without rollback)---suit batch
+pipelines and stateless agents respectively.
+
+\subsection*{Studio Debugging}
+
+The Platform's \emph{Studio} interface connects to any LangGraph Server---local
+\code{langgraph dev} or hosted---and renders a real-time timeline of node
+activations, state values at each step, and the full message history. For
+debugging, the most useful Studio feature is \emph{graph-level breakpoints}:
+by compiling a graph with \code{interrupt\_before=["node\_name"]} or
+\code{interrupt\_after=["node\_name"]}, every run pauses at that node and
+exposes the current state for inspection. A human operator can then modify
+the state via the compiled graph's \code{aupdate\_state()} method (or the
+SDK's \code{client.threads.update\_state()}) and resume the run with an
+empty-input \code{runs.create}, which is the same mechanism used for
+human-in-the-loop approval flows in production.
+
+\begin{tipbox}
+  During development, pass \code{interrupt\_before=["llm"]} to the
+  \code{compile()} call to pause before every LLM invocation. Studio will
+  show you the exact messages being sent to the model---far more informative
+  than reading a trace after the fact. Remove the interrupt before deploying
+  to production.
+\end{tipbox}
+
+With the Platform's infrastructure concerns solved by configuration, the
+remaining problem shared by both the OSS and Platform paths is how to make
+model selection a runtime decision, enabling controlled experiments without
+code changes.
+
+%% -----------------------------------------------------------
+\section{Model Choice Must Be a Runtime Parameter}
+\label{sec:ab-routing}
+
+The design problem here is that choosing between two models---to measure
+quality, latency, or cost differences---requires the model identity to be
+a runtime variable rather than a compile-time constant. The naive approach
+of a simple \code{if} statement inside a node function couples the routing
+logic to the graph code, requires a redeployment to change routing weights,
+and makes it impossible to run both variants simultaneously on real traffic.
+The principle is that the caller assigns a variant label, the label travels
+through the request without touching agent state, and the serving layer
+resolves the label to a model deployment at call time.
+
+The \code{configurable} dictionary in \code{RunnableConfig} is the correct
+carrier for this label. Unlike agent state---which is part of the graph's
+domain model and persisted to the checkpointer---\code{configurable} is a
+per-request transport channel: it is threaded through every node call without
+being stored or returned in the graph's output. A node reads the variant label
+with \code{config["configurable"].get("model\_variant",~"control")} and uses
+it to select a model deployment. The caller assigns the variant before
+invoking the graph:
+\code{config=\{"configurable":\{"thread\_id":~...,~"model\_variant":~"treatment"\}}}.
+
+The variant label is resolved to a specific model deployment by a
+\code{LiteLLM Router}. The Router holds a list of model deployments, each
+identified by a \code{model\_name} alias. For A/B testing, each alias maps to
+exactly one \code{litellm\_params.model} entry---there is no load balancing
+within an alias, because load balancing would randomise which model each
+request hits and destroy experimental attribution. LiteLLM's recommended and
+default routing strategy is \code{simple-shuffle}: with one deployment per
+alias it is effectively deterministic, always returning the single entry that
+matches the requested \code{model\_name}.
+
+\begin{lstlisting}[language=Python,
+  caption={LiteLLM Router with per-alias model deployments ---
+    \texttt{src/llm/router.py}},
+  label={lst:litellm-router}]
+import os
+from litellm import Router
+
+ROUTER_MODEL_LIST: list[dict] = [
+    {
+        "model_name": "control",          # alias passed as model= arg
+        "litellm_params": {
+            "model": "anthropic/claude-sonnet-4-8",
+            "api_key": os.environ["ANTHROPIC_API_KEY"],
+        },
+        "model_info": {"id": "control-sonnet-4-8"},
+    },
+    {
+        "model_name": "treatment",
+        "litellm_params": {
+            "model": "openai/gpt-5-3-instant",
+            "api_key": os.environ["OPENAI_API_KEY"],
+        },
+        "model_info": {"id": "treatment-gpt-5-3"},
+    },
+]
+
+def build_router() -> Router:
+    return Router(
+        model_list=ROUTER_MODEL_LIST,
+        routing_strategy="simple-shuffle",  # default; deterministic at 1 dep/alias
+        num_retries=2,
+        allowed_fails=3,
+        cooldown_time=30,
+    )
+\end{lstlisting}
+
+Two decisions in Listing~\ref{lst:litellm-router} deserve explanation. First,
+each alias (\code{"control"}, \code{"treatment"}) maps to exactly one entry.
+LiteLLM's \code{simple-shuffle} strategy picks randomly among all entries
+sharing the same \code{model\_name}; with one entry per name the selection is
+deterministic, which is what A/B experiments require---every request labelled
+\code{"treatment"} must hit the same model. Second, \code{allowed\_fails:~3}
+combined with \code{cooldown\_time:~30} means that after three consecutive
+failures, a deployment is removed from the active pool for 30\,s. During an
+outage this means your traffic split becomes temporarily 100/0---a known
+tradeoff that should be documented in the experiment plan so the data science
+team can exclude the outage window from significance calculations.
+
+With the Router built, the node that calls the model needs only to read the
+variant from \code{configurable} and pass it as the \code{model} argument:
+
+\begin{lstlisting}[language=Python,
+  caption={LLM node reading variant from \texttt{configurable} ---
+    \texttt{src/graph/nodes.py}},
+  label={lst:llm-node}]
+from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import BaseMessage
+from litellm import Router
+
+async def llm_node(
+    state: dict,
+    config: RunnableConfig,
+) -> dict:
+    configurable = config.get("configurable", {})
+    variant: str = configurable.get("model_variant", "control")
+    router: Router = configurable["llm_router"]   # injected via lifespan
+    messages: list[BaseMessage] = state["messages"]
+    # Convert LangChain messages to OpenAI dicts for LiteLLM
+    oai_msgs = [
+        {"role": m.type if m.type != "human" else "user",
+         "content": m.content}
+        for m in messages
+    ]
+    response = await router.acompletion(
+        model=variant,    # "control" or "treatment" matches model_name
+        messages=oai_msgs,
+    )
+    usage = response.usage
+    return {
+        "messages": [{"role": "assistant",
+                      "content": response.choices[0].message.content}],
+        "model_variant": variant,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+    }
+\end{lstlisting}
+
+Three decisions in Listing~\ref{lst:llm-node} deserve explanation. First,
+\code{llm\_router} is injected through \code{configurable} rather than
+imported as a module-level global: this makes the node testable in isolation
+by passing a mock router in \code{config["configurable"]["llm\_router"]}, and
+avoids the startup-order dependency that arises when a module-level import
+triggers \code{Router()} before environment variables are populated. Second,
+LangChain \code{BaseMessage} objects must be converted to OpenAI-compatible
+dictionaries before passing to \code{router.acompletion}, which speaks the
+OpenAI messages format; the \code{m.type} field uses \code{"human"} where
+OpenAI expects \code{"user"}, requiring the explicit mapping shown. Third,
+\code{variant} and token counts are returned as state fields: downstream nodes
+(such as a Langfuse logging node) can read these values from state without
+re-accessing the response object, which may no longer be in scope by the time
+the logging node runs.
+
+\begin{tipbox}
+  To assign variants consistently across a session, hash the \code{user\_id}
+  modulo 2:
+  \code{variant = "control" if int(hashlib.md5(user\_id.encode()).hexdigest(), 16) \% 2 == 0 else "treatment"}.
+  This produces a stable assignment---the same user always sees the same
+  variant---without requiring a feature-flag service. Use a proper flag
+  service (LaunchDarkly, Flagsmith) only when you need real-time override
+  capability or multi-variant experiments beyond binary splits.
+\end{tipbox}
+
+The Router's \code{allowed\_fails} mechanism, the lifespan injection pattern,
+and the \code{configurable} channel are all load-bearing primitives that
+reappear in Chapter~27's authentication middleware (which injects identity
+claims into the same \code{configurable} dict) and in Chapter~29's Langfuse
+integration (which groups traces by the \code{model\_variant} tag to produce
+the statistical comparison that closes the A/B experiment loop).
