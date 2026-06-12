@@ -904,7 +904,7 @@ being stored or returned in the graph's output. A node reads the variant label
 with \code{config["configurable"].get("model\_variant",~"control")} and uses
 it to select a model deployment. The caller assigns the variant before
 invoking the graph:
-\code{config=\{"configurable":\{"thread\_id":~...,~"model\_variant":~"treatment"\}}}.
+\code{config=\{"configurable":\{"thread\_id":~...,~"model\_variant":~"treatment"\}\}}.
 
 The variant label is resolved to a specific model deployment by a
 \code{LiteLLM Router}. The Router holds a list of model deployments, each
