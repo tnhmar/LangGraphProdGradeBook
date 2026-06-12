@@ -68,30 +68,32 @@ RAGAS score      & Faithfulness and answer relevancy metrics computed by the RAG
 
 \begin{sourcelayout}
 \dirtree{%
-  .1 tests/.\
-  .2 conftest.py \DTcomment{MockLiteLLM, MockMemory, make\_config, make\_context}.\
-  .2 unit/.\
-  .3 test\_llm\_primary\_node.py \DTcomment{\S28.1}.\
-  .2 integration/.\
-  .3 test\_graph\_routing.py \DTcomment{\S28.2}.\
-  .2 e2e/.\
-  .3 conftest.py \DTcomment{Docker service fixtures}.\
-  .3 test\_full\_agent\_run.py \DTcomment{\S28.3}.\
-  .2 fixtures/.\
-  .3 helpers.py \DTcomment{load\_fixture, save\_fixture}.\
-  .3 schema.py \DTcomment{FixtureEntry Pydantic v2 model}.\
-  .3 happy\_path\_baseline.json \DTcomment{recorded state sequence}.\
-  .2 regression/.\
-  .3 regression\_matrix.py \DTcomment{NodeMetrics, evaluate\_metrics, write\_csv}.\
-  .3 ragas\_eval.py \DTcomment{RAGAS EvaluationDataset builder}.\
-  .3 test\_replay.py \DTcomment{\S28.4}.\
-  .3 test\_regression\_gate.py \DTcomment{\S28.5}.\
-  .3 regression\_thresholds.yaml \DTcomment{per-node thresholds}.\
-  .1 docker-compose.test.yml \DTcomment{Qdrant, Redis, PostgreSQL, Ollama}.\
-  .1 .github/.\
-  .2 workflows/.\
-  .3 ci.yml \DTcomment{\S28.6 --- lint, unit, integration, eval, deploy}.\
+  .1 tests/.
+  .2 conftest.py \DTcomment{MockLiteLLM, MockMemory, make\_config, make\_context}.
+  .2 unit/.
+  .3 test\_llm\_primary\_node.py \DTcomment{\S28.1}.
+  .2 integration/.
+  .3 test\_graph\_routing.py \DTcomment{\S28.2}.
+  .2 e2e/.
+  .3 conftest.py \DTcomment{Docker service fixtures}.
+  .3 test\_full\_agent\_run.py \DTcomment{\S28.3}.
+  .2 fixtures/.
+  .3 helpers.py \DTcomment{load\_fixture, save\_fixture}.
+  .3 schema.py \DTcomment{FixtureEntry Pydantic v2 model}.
+  .3 happy\_path\_baseline.json \DTcomment{recorded state sequence}.
+  .2 regression/.
+  .3 regression\_matrix.py \DTcomment{NodeMetrics, evaluate\_metrics, write\_csv}.
+  .3 ragas\_eval.py \DTcomment{RAGAS EvaluationDataset builder}.
+  .3 test\_replay.py \DTcomment{\S28.4}.
+  .3 test\_regression\_gate.py \DTcomment{\S28.5}.
+  .3 regression\_thresholds.yaml \DTcomment{per-node thresholds}.
+  .1 docker-compose.test.yml \DTcomment{Qdrant, Redis, PostgreSQL, Ollama}.
+  .1 .github/.
+  .2 workflows/.
+  .3 ci.yml \DTcomment{\S28.6 --- lint, unit, integration, eval, deploy}.
 }
+
+
 \end{sourcelayout}
 
 %% ─────────────────────────────────────────────────────────────
