@@ -1,34 +1,3 @@
-%% ============================================================
-%%  CHAPTER 1 — The Core Agent Loop
-%%  Source references: src/state.py  src/perceive.py
-%%                     src/review.py  src/graph.py
-%%  Tests: tests/unit/test_ch01.py  (36/36 passing)
-%%
-%%  PREAMBLE ADDITION REQUIRED — add after the Java lstdefinelanguage
-%%  block so Python listings use the same colour scheme:
-%%
-%%  \lstdefinelanguage{Python}{
-%%    morekeywords={import,from,def,class,return,if,else,elif,try,
-%%      except,finally,with,as,for,while,in,not,and,or,is,None,
-%%      True,False,async,await,yield,lambda,pass,break,continue,
-%%      raise,assert,del,global,nonlocal},
-%%    morekeywords=[2]{True,False,None},
-%%    morecomment=[l]{\#},
-%%    morestring=[b]",  morestring=[b]',
-%%    sensitive=true,
-%%    keywordstyle=\color{CodeKeyword}\bfseries,
-%%    keywordstyle=[2]\color{CodeConstant},
-%%    stringstyle=\color{CodeString},
-%%    commentstyle=\color{CodeComment}\itshape,
-%%    breaklines=true, columns=fullflexible,
-%%    showstringspaces=false,
-%%    postbreak=\mbox{\textcolor{gray}{$\hookrightarrow$}\space},
-%%  }
-%% ============================================================
-
-\chapter{The Core Agent Loop}
-\label{chap:core-loop}
-
 \chapterquote{%
   A loop without an exit condition is not an agent; it is a fault.
   A loop without memory is not an agent; it is a script.
