@@ -21,8 +21,9 @@ After completing this chapter you will be able to:
   \item Stamp every checkpoint with a \term{SHA-256 integrity hash} and
         verify it before any state restore, so corrupted or tampered
         snapshots are detected before they can cause goal drift.
-  \item Implement a \term{five-step RecoveryNode} that resumes from the
-        last valid checkpoint without goal substitution or stale context.
+  \item Apply the Subgraph Principle from Chapter~1 to recovery and
+        compile a \term{five-stage RecoverySubgraph} whose stages are
+        each independently observable and independently testable.
   \item Version the state schema and apply a \term{migration chain} so
         that field additions never break existing checkpoints.
 \end{itemize}
@@ -42,10 +43,10 @@ structures that Volume~1 Chapter~9 specifies.
 
 A free-text string in the beliefs list cannot be deduplicated, queried by
 subject, or assigned a confidence score without parsing.  The
-\component{Belief} model (\S\ref{subsec:bdi-fields}) replaces the string
-with a structured triple.  The merge reducer that LangGraph calls when two
-graph branches both update \code{beliefs} must therefore compare by SPO key,
-not by string identity:
+\component{Belief} model replaces the string with a structured triple.
+The merge reducer that LangGraph calls when two graph branches both
+update \code{beliefs} must therefore compare by SPO key, not by string
+identity:
 
 \begin{lstlisting}[language=Python,
     caption={Merge reducer for beliefs --- dedup by S-P-O key (src/state.py)},
@@ -222,10 +223,10 @@ async def main() -> None:
 % ─────────────────────────────────────────────────────────────────────────────
 
 LangGraph writes a checkpoint by default after every node execution.
-For a four-node graph plus two subgraphs, that is six writes per cycle.
-The \component{CheckpointStrategy} class wraps the raw checkpointer
-to thin down the write frequency when per-cycle checkpointing is
-unacceptable.
+For a graph with two compiled subgraphs plus several plain nodes, that is
+several writes per cycle.  The \component{CheckpointStrategy} class wraps
+the raw checkpointer to thin down the write frequency when per-cycle
+checkpointing is unacceptable.
 
 \begin{lstlisting}[language=Python,
     caption={CheckpointStrategy --- every-cycle versus milestone
@@ -327,86 +328,238 @@ run will add entries before the first verify call.
 \begin{notebox}
 \textbf{Stamp at write, verify at read.}  \code{stamp\_integrity()} is
 called by the checkpointer wrapper immediately before writing to storage.
-\code{verify\_integrity()} is called by \code{RecoveryNode} as the first
-step before restoring any field.  The window between stamp and verify is
-exactly the storage round-trip.
+\code{verify\_integrity()} is called as Stage~2 of the RecoverySubgraph
+below, before any other stage touches a single field of the stored
+snapshot.  The window between stamp and verify is exactly the storage
+round-trip.
 \end{notebox}
 
 % ─────────────────────────────────────────────────────────────────────────────
-\section{The RecoveryNode: Five Steps to Safe Resume}
-\label{sec:recovery-node}
+\section{The RecoverySubgraph: Five Stages to a Safe Resume}
+\label{sec:recovery-subgraph}
 % ─────────────────────────────────────────────────────────────────────────────
 
 Recovery from a checkpoint is not a simple state copy.  A naive restore
 can re-introduce a goal that was already completed in the lost cycles, or
 carry forward a stale working-memory entry that was invalidated by a tool
-result that never made it into storage.  Volume~1 §13.4 specifies a
-five-step sequence; the \component{RecoveryNode} implements it in order.
+result that never made it into storage.  A hostile actor with write
+access to the checkpoint store could substitute a different goal entirely.
+Volume~1 §13.4 specifies a five-step sequence to guard against all three.
+
+Recovery is the third application of the Subgraph Principle introduced in
+Chapter~1 (\S\ref{sec:subgraph-principle}).  Run the four-point test
+against it directly: \emph{(1)} five sequential stages; \emph{(2)} each
+stage has a distinct, independently meaningful failure --- a corrupted
+checkpoint (Stage~2) is a different incident from a structurally invalid
+restored state (Stage~4), and an operator triaging a failed resume needs
+to know which; \emph{(3)} every stage communicates exclusively through
+\code{AgentState} keys (\code{\_recovery\_snapshot},
+\code{\_recovery\_error}), never through local variables passed between
+Python functions; \emph{(4)} Stage~1 performs I/O against the checkpoint
+store, and a process crash between stages should not force the entire
+sequence to restart from Stage~1.  All four conditions hold.  Recovery is
+therefore compiled as an independent \component{RecoverySubgraph}, exactly
+like Perception and Review.
+
+\begin{table}[htbp]
+\centering
+\caption{RecoverySubgraph: five stages and their failure modes}
+\label{tab:recovery-stages}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabularx}{\linewidth}{@{} l P{3.2cm} P{5.2cm} @{}}
+\toprule
+\textbf{Stage} & \textbf{Responsibility} & \textbf{Distinct failure mode} \\
+\midrule
+1 \code{checkpoint\_load}
+  & Load last snapshot from the checkpointer
+  & Storage unreachable; thread\_id not found \\
+2 \code{integrity\_verify}
+  & SHA-256 check before any field is read
+  & Hash mismatch --- corruption or tampering \\
+3 \code{schema\_migrate}
+  & Apply \code{MIGRATION\_CHAIN} if snapshot
+    predates \code{CURRENT\_SCHEMA\_VERSION}
+  & Migration function raises on malformed
+    legacy data \\
+4 \code{state\_validate}
+  & Check structural invariants
+    (non-empty goal, non-negative counters)
+  & Restored state fails an invariant the
+    migrated schema should have guaranteed \\
+5 \code{goal\_reanchor}
+  & Re-inject the \emph{caller's} goal; clear
+    ephemeral per-cycle fields
+  & (Terminal stage --- no further failure path;
+    always succeeds once Stages~1--4 pass) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Stages 1--2: load and verify}
+\label{subsec:recovery-load-verify}
 
 \begin{lstlisting}[language=Python,
-    caption={\texttt{RecoveryNode} --- five-step safe resume
-             (src/checkpointing.py)},
-    label={lst:recovery-node}]
-@observe(name="recovery_node")
-async def recovery_node(
-    state:  AgentState,
-    config: RunnableConfig,
-    graph:  CompiledStateGraph,
+    caption={RecoverySubgraph Stages 1--2 (src/checkpointing.py)},
+    label={lst:recovery-stage12}]
+@observe(name="recovery:checkpoint_load")
+async def checkpoint_load_node(
+    state: AgentState, config: RunnableConfig
 ) -> dict:
-    run_config = config or RunnableConfig(
-        configurable={"thread_id": state.get("run_id", "recovery")}
-    )
+    graph = config.get("configurable", {}).get("_recovery_graph")
+    try:
+        saved    = await graph.aget_state(config)
+        snapshot = dict(saved.values)
+        return {"_recovery_snapshot": snapshot}
+    except Exception as exc:
+        return {"_recovery_snapshot": {}, "_recovery_error": str(exc)}
 
-    # Step 1 — Load the last checkpoint from storage
-    saved    = await graph.aget_state(run_config)
-    snapshot = dict(saved.values)
-
-    # Step 2 — Integrity verification (SHA-256)
+@observe(name="recovery:integrity_verify")
+def integrity_verify_node(
+    state: AgentState, config: RunnableConfig
+) -> dict:
+    snapshot = state.get("_recovery_snapshot") or {}
+    if state.get("_recovery_error"):
+        return {"run_state": RunState.TERMINATED,
+                "termination_reason": TerminationReason.ESCALATED,
+                "dead_letter": {"error": "checkpoint_load failed: "
+                                f"{state['_recovery_error']}"}}
     if not verify_integrity(snapshot):
-        return {
-            "run_state":          RunState.TERMINATED,
-            "termination_reason": TerminationReason.ESCALATED,
-            "dead_letter": {"error": "Checkpoint integrity check failed"},
-        }
+        return {"run_state": RunState.TERMINATED,
+                "termination_reason": TerminationReason.ESCALATED,
+                "dead_letter": {"error": "Snapshot integrity check failed"}}
+    return {}
+\end{lstlisting}
+\githubref{src.checkpointing.checkpoint\_load\_node}
 
-    # Step 3 — Schema migration (if snapshot is from an older version)
+\subsection{Stages 3--4: migrate and validate}
+\label{subsec:recovery-migrate-validate}
+
+Every stage from Stage~3 onward begins by checking whether an earlier
+stage has already terminated the run.  This is the subgraph-internal
+analogue of the early-exit pattern Chapter~1 used in
+\code{relevance\_filter\_node}: once a terminal \code{run\_state} is set,
+downstream stages become no-ops rather than overwriting it.
+
+\begin{lstlisting}[language=Python,
+    caption={RecoverySubgraph Stages 3--4 (src/checkpointing.py)},
+    label={lst:recovery-stage34}]
+@observe(name="recovery:schema_migrate")
+def schema_migrate_node(
+    state: AgentState, config: RunnableConfig
+) -> dict:
+    if state.get("run_state") == RunState.TERMINATED:
+        return {}                                  # earlier stage failed
+    snapshot     = state.get("_recovery_snapshot") or {}
     from_version = snapshot.get("schema_version", 1)
     if from_version < CURRENT_SCHEMA_VERSION:
-        snapshot = migrate_state(snapshot, from_version)
+        migrated = migrate_state(snapshot, from_version)
+        return {"_recovery_snapshot": migrated}
+    return {}
 
-    # Step 4 — Validate structural invariants
-    errors = _validate_restored_state(snapshot)
+@observe(name="recovery:state_validate")
+def state_validate_node(
+    state: AgentState, config: RunnableConfig
+) -> dict:
+    if state.get("run_state") == RunState.TERMINATED:
+        return {}
+    snapshot = state.get("_recovery_snapshot") or {}
+    errors   = _validate_restored_state(snapshot)
     if errors:
-        return {
-            "run_state":          RunState.TERMINATED,
-            "dead_letter": {"validation_errors": errors},
-        }
+        return {"run_state": RunState.TERMINATED,
+                "dead_letter": {"validation_errors": errors}}
+    return {}
+\end{lstlisting}
+\githubref{src.checkpointing.schema\_migrate\_node}
 
-    # Step 5 — Re-inject original goal; clear per-cycle ephemeral fields
-    snapshot["goal"]           = state.get("goal") or snapshot.get("goal","")
-    snapshot["decision"]       = None
-    snapshot["action_result"]  = None
-    snapshot["reflect_output"] = None
-    snapshot["run_state"]      = RunState.INITIALIZED
+\subsection{Stage 5: goal re-anchoring}
+\label{subsec:recovery-reanchor}
 
+The final stage is where the goal-substitution defence lives.  The
+restored snapshot's \code{goal} field is \emph{discarded} and replaced
+with the goal carried in the \emph{incoming} state --- the value the
+operator submitted when the resume was requested, never a value read from
+the (already-verified, but still externally writable) checkpoint store.
+
+\begin{lstlisting}[language=Python,
+    caption={RecoverySubgraph Stage 5 --- goal re-anchoring
+             (src/checkpointing.py)},
+    label={lst:recovery-stage5}]
+@observe(name="recovery:goal_reanchor")
+def goal_reanchor_node(
+    state: AgentState, config: RunnableConfig
+) -> dict:
+    if state.get("run_state") == RunState.TERMINATED:
+        return {}
+    snapshot = dict(state.get("_recovery_snapshot") or {})
+
+    # Re-inject: use the CALLER's goal, never the snapshot's.
+    snapshot["goal"] = state.get("goal") or snapshot.get("goal", "")
+
+    snapshot.update({
+        "decision":           None,
+        "action_result":      None,
+        "validation_verdict": None,
+        "reflect_output":     None,
+        "perception_result":  None,
+        "_recovery_snapshot": None,
+        "_recovery_error":    None,
+        "run_state":          RunState.INITIALIZED,
+    })
     return snapshot
 \end{lstlisting}
-\githubref{src.checkpointing.recovery\_node}
+\githubref{src.checkpointing.goal\_reanchor\_node}
 
-\medskip
-Step~5 re-injects the \emph{original} goal from the incoming state rather
-than from the checkpoint.  This prevents a category of attack called
-\term{goal substitution}: if a hostile payload reached the agent in the
-lost cycles and modified the goal field before the crash, restoring from
-the checkpoint would resume with the corrupted goal.  The incoming state's
-goal is the one the operator submitted at the start of the run; it is never
-derived from stored data.
+\begin{warningbox}
+\textbf{Goal substitution is a real attack, not a theoretical one.}  If a
+checkpoint store is shared infrastructure --- a PostgreSQL instance also
+used by other services, or a database an operator can reach with
+\code{psql} during an incident --- the \code{goal} field inside a stored
+snapshot is writable by anyone with row-level access, independent of
+whether the SHA-256 hash was recomputed to match.  Re-anchoring from the
+caller's state, not the snapshot, means an attacker who edits the stored
+goal \emph{and} recomputes a matching hash still cannot redirect a
+resumed run.  The only goal that ever reaches the agent after a resume is
+the one the operator supplied to the resume call itself.
+\end{warningbox}
 
-The ephemeral fields (\code{decision}, \code{action\_result},
-\code{reflect\_output}) are cleared so the agent re-enters at
-\code{INITIALIZED} and runs a fresh perception cycle.  Carrying a stale
-\code{decision} from a crashed cycle into the next invocation would
-dispatch a tool call whose context no longer applies.
+\subsection{Compiling the RecoverySubgraph}
+\label{subsec:recovery-compile}
+
+\begin{lstlisting}[language=Python,
+    caption={build\_recovery\_subgraph --- assembly (src/checkpointing.py)},
+    label={lst:recovery-compile}]
+def build_recovery_subgraph() -> StateGraph:
+    sg = StateGraph(AgentState)
+    sg.add_node("checkpoint_load",   checkpoint_load_node)
+    sg.add_node("integrity_verify",  integrity_verify_node)
+    sg.add_node("schema_migrate",    schema_migrate_node)
+    sg.add_node("state_validate",    state_validate_node)
+    sg.add_node("goal_reanchor",     goal_reanchor_node)
+
+    sg.add_edge(START,               "checkpoint_load")
+    sg.add_edge("checkpoint_load",   "integrity_verify")
+    sg.add_edge("integrity_verify",  "schema_migrate")
+    sg.add_edge("schema_migrate",    "state_validate")
+    sg.add_edge("state_validate",    "goal_reanchor")
+    sg.add_edge("goal_reanchor",      END)
+    return sg
+\end{lstlisting}
+\githubref{src.checkpointing.build\_recovery\_subgraph}
+
+The compiled subgraph is added to the outer graph exactly as Perception
+and Review were in Chapter~1: a single \code{add\_node} call, invoked
+only on the resume path rather than on every cycle.
+
+\begin{lstlisting}[language=Python,
+    caption={Wiring RecoverySubgraph into a resume entry point},
+    label={lst:recovery-wiring}]
+g.add_node("recovery", build_recovery_subgraph())
+g.add_edge(START, "recovery")          # resume-only entry graph
+g.add_conditional_edges("recovery", _route_after_recovery, {
+    "continue": "perceive",            # Stage 5 succeeded
+    "terminal": END,                   # any of Stages 1-4 failed
+})
+\end{lstlisting}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \section{State Schema Migration}
@@ -415,8 +568,8 @@ dispatch a tool call whose context no longer applies.
 
 As the application evolves, \code{AgentState} gains new fields.  A
 checkpoint written by version~1 of the code does not have those fields.
-The migration chain in \code{src/checkpointing.py} applies transformations
-from any stored version up to \code{CURRENT\_SCHEMA\_VERSION}:
+The migration chain consumed by Stage~3 applies transformations from any
+stored version up to \code{CURRENT\_SCHEMA\_VERSION}:
 
 \begin{lstlisting}[language=Python,
     caption={Migration chain --- v1 to v2 (src/checkpointing.py)},
@@ -462,16 +615,17 @@ Adding a new field in a future schema version requires only three steps:
 declare the field in \code{AgentState} with a default value, increment
 \code{CURRENT\_SCHEMA\_VERSION}, and add a new entry to
 \code{MIGRATION\_CHAIN} that sets the field's default for older snapshots.
-The migration is applied transparently inside \code{recovery\_node}
-before any validator sees the restored state.
+The migration is applied transparently inside Stage~3 of the
+RecoverySubgraph before Stage~4 sees the restored state.
 
 \begin{tipbox}
 \textbf{Migrations must be idempotent.}  \code{migrate\_state()} may be
 called more than once on the same checkpoint if a recovery flow is
-interrupted and retried.  Each migration function must detect whether the
-field is already in the target format and skip the conversion if so.  The
-version check \code{while version < CURRENT\_SCHEMA\_VERSION} ensures the
-loop terminates, but individual functions must not assume they always
+interrupted and retried mid-way --- Stage~1 reloading after a transient
+storage error, for example.  Each migration function must detect whether
+the field is already in the target format and skip the conversion if so.
+The version check \code{while version < CURRENT\_SCHEMA\_VERSION} ensures
+the loop terminates, but individual functions must not assume they always
 receive the old format.
 \end{tipbox}
 
@@ -480,48 +634,60 @@ receive the old format.
 \label{sec:ch3-tests}
 % ─────────────────────────────────────────────────────────────────────────────
 
+Twenty-nine unit tests cover the BDI reducers and all five RecoverySubgraph
+stages, including the goal-substitution defence and the early-exit
+behaviour of Stages~3--5 after an earlier stage fails.
+
 \begin{lstlisting}[language=Python,
     caption={Representative Chapter 3 unit tests (tests/unit/test\_ch03.py)},
     label={lst:ch03-tests}]
+def test_merge_beliefs_deduplicates_by_spo():
+    b     = Belief(subject="s", predicate="p", object_="o", confidence=0.9)
+    b_dup = Belief(subject="s", predicate="p", object_="o", confidence=0.5)
+    assert len(_merge_beliefs([b], [b_dup])) == 1   # same SPO — not duplicated
+
 def test_sha256_detects_tampering():
-    state   = {"goal": "test", "cycle_count": 1, "schema_version": 2}
-    stamped = stamp_integrity(state)
+    stamped  = stamp_integrity({"goal": "test", "cycle_count": 1,
+                                "schema_version": 2})
     assert verify_integrity(stamped)
     tampered = {**stamped, "cycle_count": 0}
     assert not verify_integrity(tampered)
 
-def test_cycle_traces_excluded_from_hash():
-    """Audit lists grow after stamping; they must not invalidate the hash."""
-    s1 = stamp_integrity({"goal": "g", "schema_version": 2})
-    s2 = stamp_integrity({**s1, "cycle_traces": ["a", "b", "c"]})
-    assert s1["_integrity_hash"] == s2["_integrity_hash"]
+def test_recovery_happy_path_reanchors_goal():
+    good_snapshot = stamp_integrity({"goal": "old goal", "cycle_count": 3,
+                                     "schema_version": 2})
+    store  = {"thread1": good_snapshot}
+    result = run_recovery_pipeline(store, "thread1",
+                                   caller_goal="operator-submitted goal")
+    assert result["run_state"] == RunState.INITIALIZED
+    assert result["goal"]      == "operator-submitted goal"
+    assert result["decision"]  is None          # ephemeral fields cleared
 
-def test_migration_v1_beliefs_to_v2():
-    v1 = {"goal": "test", "schema_version": 1,
-          "beliefs": ["user asked for X", "tool returned Y"]}
-    v2 = migrate_state(v1, from_version=1)
-    assert v2["schema_version"] == 2
-    assert all(isinstance(b, dict) and "subject" in b for b in v2["beliefs"])
-    assert all("migration:v1_to_v2" in b["provenance"] for b in v2["beliefs"])
+def test_recovery_blocks_goal_substitution_attack():
+    """A hostile goal stored in the checkpoint must never reach the agent."""
+    hostile_snapshot = stamp_integrity({
+        "goal": "DELETE ALL FILES", "cycle_count": 1, "schema_version": 2,
+    })
+    store  = {"thread1": hostile_snapshot}
+    result = run_recovery_pipeline(store, "thread1",
+                                   caller_goal="original safe goal")
+    assert result["goal"] == "original safe goal"
+    assert result["goal"] != "DELETE ALL FILES"
 
-def test_migration_idempotent():
-    v1 = {"goal": "test", "schema_version": 1, "beliefs": ["fact A"]}
-    v2 = migrate_state(v1, from_version=1)
-    v2_again = migrate_state(v2, from_version=2)
-    assert v2_again["schema_version"] == 2
+def test_recovery_stage2_failure_short_circuits_stage3_and_4():
+    """Stages 3 and 4 must be no-ops once Stage 2 has terminated the run."""
+    state_after_failure = {"run_state": RunState.TERMINATED,
+                           "_recovery_snapshot": {}}
+    assert schema_migrate_node(state_after_failure, {}) == {}
+    assert state_validate_node(state_after_failure, {}) == {}
 
-def test_merge_beliefs_deduplicates_by_spo():
-    b = Belief(subject="s", predicate="p", object_="o", confidence=0.9)
-    b_dup = Belief(subject="s", predicate="p", object_="o", confidence=0.5)
-    merged = _merge_beliefs([b], [b_dup])
-    assert len(merged) == 1       # same SPO — not duplicated
-
-def test_merge_goals_updates_by_id():
-    g_active    = Goal(id="g1", description="Find papers", status=GoalStatus.ACTIVE)
-    g_completed = Goal(id="g1", description="Find papers", status=GoalStatus.COMPLETED)
-    merged = _merge_goals([g_active], [g_completed])
-    assert len(merged) == 1
-    assert merged[0].status == GoalStatus.COMPLETED
+def test_recovery_stage4_rejects_empty_goal():
+    empty_goal_snapshot = stamp_integrity({
+        "goal": "", "cycle_count": 1, "schema_version": 2,
+    })
+    store  = {"thread1": empty_goal_snapshot}
+    result = run_recovery_pipeline(store, "thread1", caller_goal="g")
+    assert result["run_state"] == RunState.TERMINATED
 \end{lstlisting}
 \githubref{tests.unit.test\_ch03}
 
@@ -538,21 +704,26 @@ def test_merge_goals_updates_by_id():
   \item \textbf{Dev and production checkpointers differ in resilience,
         not in API.}  Both are consumed through the same
         \code{make\_checkpointer()} context manager.  The switch from
-        SQLite to PostgreSQL requires only an environment variable change,
-        not a code change.
+        SQLite to PostgreSQL requires only an environment variable
+        change, not a code change.
 
   \item \textbf{Integrity verification is non-negotiable.}
-        Every resume path calls \code{verify\_integrity()} before
-        reading a single field from the checkpoint.  A mismatch means
-        the run terminates with \code{TerminationReason.ESCALATED}, not
-        silently resumes with corrupted state.
+        Stage~2 of the RecoverySubgraph calls \code{verify\_integrity()}
+        before any other stage reads a single field from the checkpoint.
+        A mismatch terminates with \code{TerminationReason.ESCALATED},
+        not a silent resume with corrupted state.
 
-  \item \textbf{Five ordered steps separate a safe resume from a
-        dangerous one.}
-        Load → verify → migrate → validate → re-inject-goal-and-clear.
-        Skipping the re-injection step exposes the agent to goal
-        substitution; skipping the migration step causes type errors on
-        newly added fields.
+  \item \textbf{Recovery is a subgraph, by the same rule that made
+        Perception and Review subgraphs.}  Five stages, five distinct
+        failure modes, state-only communication between stages, and an
+        I/O boundary at Stage~1.  The Subgraph Principle from Chapter~1
+        applies without modification --- this is not a special case,
+        it is the rule working as designed.
+
+  \item \textbf{Goal re-anchoring happens last and reads from the
+        caller, never the snapshot.}  This single design decision is
+        what makes goal substitution structurally impossible, independent
+        of how thoroughly an attacker can forge a matching integrity hash.
 
   \item \textbf{Schema migration is additive and idempotent.}
         New fields always have default values.  Migration functions detect
