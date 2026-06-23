@@ -228,6 +228,102 @@ keys it modifies.
 \end{tipbox}
 
 % ─────────────────────────────────────────────────────────────────────────────
+\section{The Subgraph Principle: When to Compile, When to Write a Function}
+\label{sec:subgraph-principle}
+% ─────────────────────────────────────────────────────────────────────────────
+
+This book builds three independently compiled subgraphs --- Perception in
+this chapter, Review later in this chapter, and Recovery in Chapter~3 ---
+alongside dozens of plain node functions and one composable validator
+chain.  Before the first subgraph appears, the rule that decides which
+shape a given piece of logic takes needs to be stated once, explicitly,
+so it can be applied consistently for the remaining twenty-seven chapters.
+
+\begin{takeawaybox}[The Subgraph Principle]
+A multi-step process is compiled as an \textbf{independent subgraph}
+when \emph{all four} of the following hold:
+\begin{enumerate}
+  \item It has \textbf{three or more sequential steps}.
+  \item Each step has a \textbf{distinct failure mode} worth its own
+        Langfuse span --- an operator debugging a failure needs to know
+        \emph{which step} failed, not just that ``the pipeline'' failed.
+  \item Steps communicate through \code{AgentState}, not local Python
+        variables --- each step's input and output are state deltas.
+  \item The steps involve I/O, or a crash between steps should be
+        resumable at the step boundary.
+\end{enumerate}
+A multi-step process stays a \textbf{single node function}, or becomes a
+plain \textbf{composable object}, when \emph{any} of the following hold:
+\begin{enumerate}
+  \item Steps share local variables that have no business being
+        promoted into \code{AgentState}.
+  \item The steps form a \textbf{chain-of-responsibility} that
+        short-circuits at the first failure and returns one verdict ---
+        not a stateful pipeline with independently meaningful
+        intermediate states.
+  \item There is no operational value in resuming \emph{between} steps;
+        the operation is atomic from the caller's perspective.
+  \item The computation is synchronous, in-memory, and carries no I/O
+        boundary between steps.
+\end{enumerate}
+\end{takeawaybox}
+
+Table~\ref{tab:subgraph-examples} applies the principle to every
+multi-step construct in this book.  Two cases are worth reading closely
+because they look superficially similar but resolve differently.
+
+\begin{table}[htbp]
+\centering
+\caption{The Subgraph Principle applied across the book}
+\label{tab:subgraph-examples}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabularx}{\linewidth}{@{} l c P{6.0cm} @{}}
+\toprule
+\textbf{Construct} & \textbf{Shape} & \textbf{Why} \\
+\midrule
+PerceiveSubgraph (§\ref{sec:perceive-subgraph})
+  & Subgraph & 6 stages; each has a distinct, independently loggable
+    failure mode (PII leak, hostile injection, relevance) and at least
+    one stage calls external I/O (Presidio). \\
+ReviewSubgraph (§\ref{sec:review-subgraph})
+  & Subgraph & 7 steps; failure at \code{lt\_writeback} (Chapter~8)
+    is operationally different from failure at
+    \code{termination\_check}, and each must be independently
+    observable. \\
+RecoverySubgraph (Chapter~3, §3.5)
+  & Subgraph & 5 stages, each a distinct, named failure mode
+    (load failure, integrity failure, migration failure, validation
+    failure) that a resumed run must be able to halt at independently. \\
+\midrule
+\component{CompositeActionValidator} (§\ref{sec:action-node})
+  & \textbf{Composable object, not a subgraph}
+  & 4 layers, but they are a synchronous, in-memory
+    chain-of-responsibility with \emph{no I/O between layers}.  The
+    chain short-circuits at the first failure and returns a single
+    \code{ValidationVerdict} --- there is no operational meaning to
+    ``resuming between layers~2 and~3.'' \\
+\component{stagnation\_recovery\_node},
+\component{stuck\_recovery\_node}
+(Chapter~2)
+  & \textbf{Single node, not a subgraph}
+  & Each is one atomic state transformation with exactly one failure
+    mode.  They are guards, not pipelines: there is nothing to
+    decompose. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warningbox}
+\textbf{The principle is a test, not a preference.}  It is tempting to
+compile every multi-line node into a subgraph for the sake of
+uniformity, or conversely to keep everything as flat functions to avoid
+LangGraph's subgraph boilerplate.  Both instincts produce the wrong
+architecture roughly half the time.  Apply the four-point test in the
+takeaway box above to each new multi-step construct as it is introduced;
+do not default to either shape.
+\end{warningbox}
+
+% ─────────────────────────────────────────────────────────────────────────────
 \section{The Perception Pipeline}
 \label{sec:perceive-subgraph}
 % ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +333,13 @@ pipeline} with typed contracts at each stage boundary.  A single flat node
 --- the conventional \code{perceive\_node(state)} function --- cannot be
 tested stage by stage, cannot be versioned independently, and cannot surface
 per-stage latency to the observability layer.
+
+Perception is the first concrete application of the Subgraph Principle
+(§\ref{sec:subgraph-principle}): six sequential stages, each with a
+distinct failure mode (a PII leak is operationally different from a
+blocked hostile injection), and at least one stage performs external I/O
+(the Presidio call in Stage~3).  All four conditions for compiling a
+subgraph are satisfied.
 
 The \component{PerceiveSubgraph} compiles as a \code{StateGraph} in its
 own right and is then added to the outer graph as a single node:
@@ -416,6 +519,18 @@ independent \code{ActionValidator} implementations, composed in a
 and produces a \code{ValidationVerdict} on failure.  The chain short-circuits
 at the first failure.
 
+\begin{notebox}
+\textbf{Four layers, still not a subgraph.}  Under the Subgraph Principle
+(§\ref{sec:subgraph-principle}) this might look like a candidate: four
+sequential steps, each with a distinct question.  It fails the test on
+two of the four conditions.  The layers are synchronous, in-memory, pure
+functions with no I/O boundary between them, and the chain
+short-circuits to a single \code{ValidationVerdict} --- there is no
+operational value in resuming between layer~2 and layer~3.
+\component{CompositeActionValidator} stays a plain Python object called
+once from inside \code{action\_node}.
+\end{notebox}
+
 \begin{table}[htbp]
 \centering
 \caption{Four-layer ActionValidator chain}
@@ -500,7 +615,13 @@ working memory requires an explicit operator action.
 
 After a tool returns, the agent must integrate the result into its world
 model before reasoning again.  Volume~1 §2.2 specifies this as a sequence
-of deterministic updates --- no model call is involved.  The
+of deterministic updates --- no model call is involved.  Like Perception,
+the review pipeline satisfies all four conditions of the Subgraph
+Principle (§\ref{sec:subgraph-principle}): seven sequential steps, each
+with an operationally distinct failure mode --- a failed
+\code{lt\_writeback} (Chapter~8) is not the same incident as a failed
+\code{termination\_check} --- and each writes a delta to
+\code{AgentState} that the next step depends on.  The
 \component{ReviewSubgraph} implements this in seven steps, each compiled
 as an independent node:
 
@@ -910,10 +1031,14 @@ refactoring.  Pin it early.
         \code{src/state.py}, annotated with its introducing chapter.
         Undeclared keys are silent type errors.
 
-  \item \textbf{Perception and Review are subgraphs, not nodes.}
-        Compiling each as an independent \code{StateGraph} gives you
-        stage-level unit tests, independent versioning, and clean
-        Langfuse child spans.
+  \item \textbf{Perception and Review are subgraphs because they pass the
+        four-point test, not by convention.}  Compiling each as an
+        independent \code{StateGraph} gives you stage-level unit tests,
+        independent versioning, and clean Langfuse child spans.  Apply
+        the same Subgraph Principle (§\ref{sec:subgraph-principle}) to
+        every future multi-step construct --- it resolves
+        \component{RecoverySubgraph} in Chapter~3 the same way, and it
+        resolves \component{CompositeActionValidator} the opposite way.
 
   \item \textbf{Four validation layers separate reasoning from execution.}
         Schema, semantic, safety, and taint checks run between the
