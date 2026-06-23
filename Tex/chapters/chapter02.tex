@@ -1,3 +1,5 @@
+
+
 \chapterquote{%
   An agent that cannot stop is not intelligent; it is a runaway process.
   The discipline of termination is not a constraint on capability ---
@@ -302,6 +304,21 @@ The recovery node clears \code{goal\_hash\_history} so it does not
 immediately re-trigger on the next cycle.  It also clears \code{decision}
 and \code{reflect\_output} so the agent enters the next cycle without stale
 outputs from the stuck cycle.
+
+\begin{notebox}
+\textbf{Why \code{stagnation\_recovery\_node} is a single node, not a
+subgraph.}  Applying the Subgraph Principle from Chapter~1
+(\S\ref{sec:subgraph-principle}): the function performs one atomic state
+transformation --- reset four fields and return --- with exactly one
+failure mode (none, in practice; it cannot itself fail).  There is no
+sequence of operationally distinct steps to decompose, no I/O boundary,
+and no value in resuming \emph{mid-reset}.  The same reasoning applies to
+\code{stuck\_recovery\_node} and \code{delegation\_depth\_guard\_node}
+below.  Contrast this with \component{RecoverySubgraph} in Chapter~3,
+which resumes a \emph{crashed run} through five steps that each have a
+distinct, independently loggable failure mode --- a fundamentally
+different shape of problem that the principle resolves the other way.
+\end{notebox}
 
 % ─────────────────────────────────────────────────────────────────────────────
 \section{N2: The Stuck-State Detector}
