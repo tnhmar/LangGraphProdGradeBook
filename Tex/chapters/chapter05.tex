@@ -1,1105 +1,366 @@
 %% ============================================================
-%%  Chapter 5 — LLM Infrastructure: Reliability, Cost, and Configuration
-%%  Production-Grade Agentic AI: LangGraph + Python Frameworks
+%%  CHAPTER 5 — LLM Abstraction, Reliability and Cost Enforcement
+%%  Source references: src/llm.py
+%%  Tests: tests/unit/test_ch05.py  (18/18 passing)
 %% ============================================================
 
-\chapterquote{A system that talks to one model is a prototype. A system that
-survives a model going down is a product.}{anon}
+\chapterquote{%
+  A provider outage is not an edge case.  It is a Tuesday.
+  The agent that survives is the one that planned for Tuesday before
+  it shipped, not the one patched after the first incident.%
+}{Engineering AI Agents for Production, Volume~1}
 
-By the end of Chapter~4 your agent has a validated, strongly typed contract
-between the model and the rest of the runtime. Every node that consumes model
-output receives a Pydantic object, and every parse failure either repairs itself
-or escalates cleanly. What the previous chapters deliberately left to one side
-is the question of what happens \emph{below} that contract: who decides which
-model to call, what happens when the call fails at the network or provider
-level, and who pays attention to the bill.
+\begin{learningbox}
+After completing this chapter you will be able to:
+\begin{itemize}
+  \item Externalise every model parameter into a single
+        \code{Pydantic Settings} object so no model identifier is ever
+        hardcoded at a call site.
+  \item Implement a three-state \term{circuit breaker} per model that
+        stops sending requests to a failing provider rather than waiting
+        for every request to time out individually.
+  \item Build a typed \term{fallback cascade} that tries each configured
+        provider in order and surfaces which one ultimately served the
+        request.
+  \item Track token usage and cost from LiteLLM's callback hook and
+        enforce a hard budget ceiling that halts the agent before an
+        invoice surprises anyone.
+  \item Apply the \code{DEGRADED} $\to$ \code{ABORTED} transition
+        correctly when every configured provider has failed.
+\end{itemize}
+\end{learningbox}
 
-These are not operational afterthoughts. In a production agent system the LLM
-call is the single most expensive, slowest, and most failure-prone operation in
-the hot path. Every model provider has a non-zero outage rate. Every model
-version is eventually deprecated. Every run costs money, and budgets are finite.
-If the infrastructure around that call is naive---a bare \code{litellm.completion()}
-with no fallback and no budget guard---then the agent is one provider hiccup
-away from a cascading failure and one runaway loop away from a costly bill.
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Externalised Configuration}
+\label{sec:llm-settings}
+% ─────────────────────────────────────────────────────────────────────────────
 
-This chapter builds that infrastructure in three layers. The first layer
-\emph{routes} calls: a LiteLLM Router abstracts all provider calls behind a
-single interface, pins exact model versions, and defines an ordered fallback
-cascade. The second layer \emph{protects} calls: Tenacity decorators retry
-transient faults per exception class, and a circuit breaker stops the runtime
-from hammering a provider that is down for minutes rather than milliseconds.
-The third layer \emph{governs} calls: a callback-driven cost tracker accumulates
-real spend into \code{AgentState}, a budget circuit breaker converts an overage
-into a clean graph stop, and a \code{FallbackRouter} logs every degradation
-event to Langfuse. A final section externalises every model name, key, and
-parameter into Pydantic Settings so that no hardcoded string appears in
-application code.
-
-The three custom exception classes introduced here---\code{BudgetExceededError},
-\code{CircuitOpenError}, and \code{RetryExhaustedError}---map to three distinct
-graph-edge outcomes. Table~\ref{tab:exception-routing} summarises that mapping
-before you build any of the components, so you can keep the whole architecture
-in view as each piece appears.
-
-\begin{table}[ht]
-\centering
-\caption{Exception taxonomy and corresponding graph-edge outcomes}
-\label{tab:exception-routing}
-\begin{tabular}{lll}
-\toprule
-\textbf{Exception} & \textbf{Source} & \textbf{Graph edge} \\
-\midrule
-\code{BudgetExceededError} & \code{TokenBudget} validator & \code{budget\_exceeded} \\
-\code{CircuitOpenError}    & \code{LLMCircuitBreaker}     & \code{circuit\_open}    \\
-\code{RetryExhaustedError} & Tenacity \code{before\_sleep} & \code{retry\_exhausted} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The sections of this chapter are ordered by dependency: first choose where
-calls go (\S\ref{sec:litellm-router}), then decide which failures deserve
-another attempt (\S\ref{sec:tenacity}), then decide when to stop calling a
-broken provider entirely (\S\ref{sec:circuit-breaker}), then measure spend
-(\S\ref{sec:cost-tracking}), then give overspend a clean graph exit
-(\S\ref{sec:budget-circuit-breaker}), then make the cascade fully observable
-(\S\ref{sec:fallback-routing}), and finally externalise every value that would
-otherwise be a hardcoded string (\S\ref{sec:settings}). Each section hands a
-resolved problem to the next.
-
-The source layout for this chapter is:
-
-\begin{verbatim}
-src/
-  config/
-    llm_settings.py        # §5.7
-    runnable_config.py     # §5.7
-  llm/
-    router_factory.py      # §5.1
-    retry_policies.py      # §5.2
-    circuit_breaker.py     # §5.3
-    cost_tracker.py        # §5.4
-    fallback_router.py     # §5.6
-    exceptions.py          # §5.5
-  graph/
-    edges.py               # §5.5
-    nodes.py               # §5.5
-\end{verbatim}
-
-%% ------------------------------------------------------------
-\section{Why a Router Exists}
-\label{sec:litellm-router}
-%% ------------------------------------------------------------
-
-The first question to resolve is why you need a router at all. A bare
-\code{litellm.completion(model="gpt-4o", ...)} works perfectly well in
-development, but it carries three production problems. First, it binds the call
-site to a single provider. If that provider degrades, the call fails and there
-is no recovery path. Second, the model string \code{"gpt-4o"} is an alias that
-OpenAI can silently remap to a newer version at any time, breaking prompts that
-were tuned against a specific checkpoint. Third, there is no single place to
-configure timeouts, retries, or API base URLs; each call site accumulates its
-own ad-hoc configuration.
-
-LiteLLM's \code{Router} solves all three problems at once. You declare a
-\code{model\_list}---a list of provider configurations each identified by a
-logical alias---and a \code{fallbacks} dict that maps each alias to an ordered
-list of fallback aliases. The router handles provider selection, request
-dispatch, and failure routing internally. The call site uses only the logical
-alias and never knows which provider actually fulfilled the request.
-
-The model name in each entry's \code{litellm\_params.model} must be a fully
-qualified, version-pinned string in the format \code{provider/model-version},
-for example \code{openai/gpt-4o-2024-08-06} or
-\code{anthropic/claude-3-5-sonnet-20241022}. Using a bare alias like
-\code{gpt-4o} is the same mistake as not pinning a dependency version: it works
-until the day the provider remaps the alias, and debugging a prompt regression
-caused by a silent model upgrade is expensive. Version pinning makes that class
-of failure impossible.
+Every value that determines which model the agent calls lives in one
+\code{Pydantic Settings} object loaded from environment variables.
 
 \begin{lstlisting}[language=Python,
-  caption={RouterFactory assembling a LiteLLM Router from externalised settings},
-  label={lst:router-factory}]
-# src/llm/router_factory.py
-
-from __future__ import annotations
-from typing import Any
-from litellm import Router
-from src.config.llm_settings import LLMSettings
-
-
-def _make_model_entry(alias: str, model: str, api_key: str) -> dict[str, Any]:
-    return {
-        "model_name": alias,
-        "litellm_params": {
-            "model":   model,
-            "api_key": api_key,
-        },
-    }
-
-
-class RouterFactory:
-    """Assemble a LiteLLM Router entirely from LLMSettings.
-
-    No model name, API key, or routing parameter is hardcoded here.
-    All values are injected from settings, which are loaded from the
-    environment (see §5.7).
-    """
-
-    @staticmethod
-    def build(settings: LLMSettings) -> Router:
-        import litellm
-        litellm.set_verbose = settings.debug
-
-        model_list = [
-            _make_model_entry(
-                alias="primary",
-                model=settings.primary_model,
-                api_key=settings.openai_api_key.get_secret_value(),
-            ),
-            _make_model_entry(
-                alias="fallback_1",
-                model=settings.fallback_model_1,
-                api_key=settings.openai_api_key.get_secret_value(),
-            ),
-            _make_model_entry(
-                alias="fallback_2",
-                model=settings.fallback_model_2,
-                api_key=settings.anthropic_api_key.get_secret_value(),
-            ),
-        ]
-
-        # Priority routing: requests always attempt aliases in the order
-        # they appear in model_list before considering the fallbacks dict.
-        return Router(
-            model_list=model_list,
-            fallbacks=[{"primary": ["fallback_1", "fallback_2"]}],
-            routing_strategy="priority",
-            num_retries=0,        % retries are handled by §5.2 decorators
-            timeout=settings.request_timeout_sec,
-        )
+    caption={LLMSettings --- single source of model configuration
+             (src/llm.py)},
+    label={lst:llm-settings}]
+class LLMSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="LLM_", env_nested_delimiter="__"
+    )
+    primary_model:   str = "gpt-4o-2024-11-20"
+    fallback_models: list[str] = Field(default=[
+        "claude-3-5-sonnet-20241022",
+        "gpt-4o-mini-2024-07-18",
+    ])
+    instructor_mode: str   = "TOOLS"   # TOOLS | JSON | MD_JSON
+    temperature:     float = Field(default=0.0, ge=0.0, le=2.0)
+    max_tokens:      int   = Field(default=4096, ge=1)
 \end{lstlisting}
-
-Two decisions in Listing~\ref{lst:router-factory} deserve explanation.
-\code{num\_retries=0} disables LiteLLM's built-in retry so that Section~5.2's
-Tenacity decorators remain the single source of retry behaviour. Duplicate retry
-logic at two layers compounds backoff timing and makes failure analysis
-confusing. The \code{routing\_strategy="priority"} choice is deliberate: for
-cost-sensitive agents you want predictable ordering---primary first, cheaper
-fallback second---rather than latency-optimised load balancing. Chapter~8
-revisits this choice for high-throughput deployments where \code{"least-busy"}
-is more appropriate.
+\githubref{src.llm.LLMSettings}
 
 \begin{warningbox}
-Never pass \code{api\_key} as a plain string literal anywhere in your source
-tree. The pattern \code{settings.openai\_api\_key.get\_secret\_value()} is the
-only correct unwrapping site. Pydantic's \code{SecretStr} field prevents the key
-from appearing in logs, \code{repr()}, or serialised state. Section~5.7 explains
-the full settings hierarchy.
+\textbf{Every model identifier is version-pinned.}  \code{"gpt-4o-2024-11-20"},
+not \code{"gpt-4o"}.  Provider-side silent model updates --- a vendor
+repointing an unpinned alias overnight --- are a real production incident
+category.  A pinned identifier makes a model upgrade a deliberate code
+change with its own test cycle.
 \end{warningbox}
 
-The router centralises \emph{where} calls go. The next question is
-\emph{which failures deserve another attempt} --- and the answer depends
-entirely on the type of failure, not on a single global retry count.
-
-%% ------------------------------------------------------------
-\section{Retries Depend on Failure Type}
-\label{sec:tenacity}
-%% ------------------------------------------------------------
-
-Retry logic is not a single policy. A \code{RateLimitError} is retriable
-because the provider will accept the request again once the rate window resets;
-waiting and retrying is the correct response. An \code{AuthenticationError} is
-not retriable because sending the same invalid credentials again will produce the
-same failure; retrying wastes budget and delays the error signal. A catch-all
-\code{except Exception} wrapper silently conflates the two: it retries auth
-failures, swallows the error, and burns tokens doing it.
-
-The correct pattern is one \code{@retry} decorator per exception class, each
-with parameters calibrated to that class's failure semantics. Tenacity supports
-this directly through \code{retry\_if\_exception\_type}, which composes cleanly
-with \code{wait\_exponential} and \code{stop\_after\_attempt}.
-
-\begin{lstlisting}[language=Python,
-  caption={Per-exception Tenacity decorators with calibrated backoff parameters},
-  label={lst:retry-policies}]
-# src/llm/retry_policies.py
-
-from __future__ import annotations
-import logging
-from tenacity import (
-    retry,
-    wait_exponential,
-    stop_after_attempt,
-    retry_if_exception_type,
-    before_sleep_log,
-    RetryError,
-)
-from litellm.exceptions import RateLimitError, APIConnectionError, Timeout
-from litellm import Router, ModelResponse
-from src.llm.exceptions import BudgetExceededError, RetryExhaustedError
-
-logger = logging.getLogger(__name__)
-
-
-# --- RateLimitError ---
-# Five attempts: provider rate windows typically reset within 60 s.
-# Exponential backoff from 2 s to 60 s covers both short and long windows.
-@retry(
-    retry=retry_if_exception_type(RateLimitError),
-    wait=wait_exponential(multiplier=1, min=2, max=60),
-    stop=stop_after_attempt(5),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=False,
-)
-def _call_rate_limited(router: Router, payload: dict) -> ModelResponse:
-    return router.completion(**payload)
-
-
-# --- APIConnectionError ---
-# Three attempts: connection failures are often transient (DNS blip,
-# TCP reset) but if three consecutive attempts fail, the provider is
-# likely down and the circuit breaker (§5.3) should open instead.
-@retry(
-    retry=retry_if_exception_type(APIConnectionError),
-    wait=wait_exponential(multiplier=1, min=1, max=30),
-    stop=stop_after_attempt(3),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=False,
-)
-def _call_connection_retry(router: Router, payload: dict) -> ModelResponse:
-    return router.completion(**payload)
-
-
-# --- Timeout ---
-# Two attempts only: a timeout already consumed wall-clock time equal to
-# the configured request_timeout_sec. Two attempts means at most 2x that
-# cost before giving up.
-@retry(
-    retry=retry_if_exception_type(Timeout),
-    wait=wait_exponential(multiplier=1, min=5, max=30),
-    stop=stop_after_attempt(2),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=False,
-)
-def _call_timeout_retry(router: Router, payload: dict) -> ModelResponse:
-    return router.completion(**payload)
-
-
-def resilient_call(router: Router, payload: dict) -> ModelResponse:
-    """Dispatch a completion through the appropriate retry wrapper.
-
-    BudgetExceededError is deliberately not wrapped in any @retry
-    decorator: it must propagate immediately to the graph's error-routing
-    edge (§5.5). Retrying a budget-exceeded call would only deepen the
-    overage.
-    """
-    if isinstance(payload.get("__exc_hint"), RateLimitError):
-        try:
-            return _call_rate_limited(router, payload)
-        except RetryError as exc:
-            raise RetryExhaustedError("RateLimitError") from exc
-
-    try:
-        return _call_connection_retry(router, payload)
-    except RetryError as exc:
-        raise RetryExhaustedError("APIConnectionError") from exc
-\end{lstlisting}
-
-The \code{before\_sleep\_log} callback writes a structured log entry on every
-sleep, including the attempt number, exception type, and calculated wait
-duration. These entries feed the cost-tracking callback in Section~5.4 via the
-same structured logging pipeline: each retry is a signal that budget may be
-burning without progress.
-
-\begin{notebox}
-\code{reraise=False} means Tenacity raises a \code{RetryError} wrapping the last
-exception when all attempts are exhausted, rather than re-raising the original
-exception class directly. The \code{resilient\_call} wrapper converts
-\code{RetryError} to the domain-specific \code{RetryExhaustedError} so the graph
-edge routing in Section~5.5 can distinguish it from a first-attempt failure.
-\end{notebox}
-
-Retries handle faults that resolve within seconds. The next failure mode is
-different in kind: a provider that is unhealthy for minutes. Retrying against
-that provider burns the full Tenacity budget on every call. The answer is a
-circuit breaker that fails immediately once the provider is known to be down,
-and probes cautiously for recovery.
-
-%% ------------------------------------------------------------
-\section{When to Stop Calling a Broken Provider}
+% ─────────────────────────────────────────────────────────────────────────────
+\section{The Circuit Breaker}
 \label{sec:circuit-breaker}
-%% ------------------------------------------------------------
+% ─────────────────────────────────────────────────────────────────────────────
 
-Tenacity retries handle transient failures. A circuit breaker handles
-\emph{sustained} failures---a provider that is down for minutes, not
-milliseconds. Without a circuit breaker, retrying against a down provider burns
-the full Tenacity budget on every call, adding seconds of latency to every
-agent cycle. With a circuit breaker, the first burst of failures opens the
-circuit, subsequent calls fail immediately without touching the network, and the
-circuit probes for recovery after a timeout.
-
-There are Python libraries that implement circuit breakers, but using one here
-would hide the state machine behind an API surface. The implementation below is
-short enough to read in five minutes and long enough to contain all the
-production-relevant behaviour: thread-safe state transitions, a half-open probe
-that allows exactly one test call, and an extended recovery timeout on repeated
-failures.
-
-The three states are:
-
-\begin{itemize}
-  \item \textbf{CLOSED} --- the normal operating state. Calls pass through.
-        Failures are counted. When the failure count reaches
-        \code{failure\_threshold}, the circuit transitions to OPEN.
-  \item \textbf{OPEN} --- the tripped state. Calls fail immediately with
-        \code{CircuitOpenError} without touching the provider. After
-        \code{recovery\_timeout} seconds, the circuit transitions to HALF\_OPEN.
-  \item \textbf{HALF\_OPEN} --- the probing state. Exactly one call is allowed
-        through. If it succeeds, the circuit closes and the failure count resets.
-        If it fails, the circuit reopens with a doubled recovery timeout.
-\end{itemize}
+A circuit breaker stops the agent from discovering that a provider is
+down one slow timeout at a time.  Once a provider has failed
+\code{failure\_threshold} consecutive times, the breaker opens and every
+subsequent call fails immediately --- no network round-trip --- until a
+cooldown has elapsed.
 
 \begin{lstlisting}[language=Python,
-  caption={Circuit breaker as an explicit three-state machine},
-  label={lst:circuit-breaker}]
-# src/llm/circuit_breaker.py
+    caption={CircuitBreaker --- three-state machine (src/llm.py)},
+    label={lst:circuit-breaker}]
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, cooldown_s=60.0, name="default"):
+        self._state     = _CBState.CLOSED
+        self._failures  = 0
+        self._threshold = failure_threshold
+        self._cooldown  = cooldown_s
+        self._opened_at: float | None = None
+        self._lock      = threading.Lock()
 
-from __future__ import annotations
-import threading
-import time
-from enum import Enum, auto
-from typing import Any, Callable
-from litellm import ModelResponse
-from src.llm.exceptions import CircuitOpenError
-
-
-class CircuitState(Enum):
-    CLOSED    = auto()
-    OPEN      = auto()
-    HALF_OPEN = auto()
-
-
-class LLMCircuitBreaker:
-    """
-    Thread-safe circuit breaker for a single LiteLLM router tier.
-
-    State machine (ASCII diagram for inline reference):
-      CLOSED  --[failures >= threshold]--> OPEN
-      OPEN    --[recovery_timeout elapsed]--> HALF_OPEN
-      HALF_OPEN --[probe succeeds]--> CLOSED
-      HALF_OPEN --[probe fails]----> OPEN (timeout *= 2)
-    """
-
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        recovery_timeout: float = 60.0,
-    ) -> None:
-        self.failure_threshold  = failure_threshold
-        self._base_timeout      = recovery_timeout
-        self._current_timeout   = recovery_timeout
-        self.state              = CircuitState.CLOSED
-        self._failure_count     = 0
-        self._last_failure_time: float | None = None
-        self._lock              = threading.Lock()
-
-    def call(
-        self,
-        fn: Callable[..., ModelResponse],
-        *args: Any,
-        **kwargs: Any,
-    ) -> ModelResponse:
+    @property
+    def state(self) -> _CBState:
         with self._lock:
-            if self.state == CircuitState.OPEN:
-                if self._should_attempt_reset():
-                    self._transition(CircuitState.HALF_OPEN)
-                else:
-                    raise CircuitOpenError(
-                        f"Circuit is OPEN; recovery in "
-                        f"{self._seconds_until_reset():.1f}s"
-                    )
+            if self._state == _CBState.OPEN:
+                if time.monotonic() - (self._opened_at or 0) >= self._cooldown:
+                    self._state = _CBState.HALF_OPEN
+            return self._state
 
+    def call(self, fn: Callable, *args, **kwargs) -> Any:
+        if self.state == _CBState.OPEN:
+            raise CircuitOpenError(f"Circuit '{self._name}' is OPEN")
         try:
             result = fn(*args, **kwargs)
-            self._record_success()
+            self._on_success()
             return result
-        except Exception as exc:
-            self._record_failure()
+        except Exception:
+            self._on_failure()
             raise
-
-    def _transition(self, new_state: CircuitState) -> None:
-        self.state = new_state
-
-    def _should_attempt_reset(self) -> bool:
-        if self._last_failure_time is None:
-            return False
-        elapsed = time.monotonic() - self._last_failure_time
-        return elapsed >= self._current_timeout
-
-    def _seconds_until_reset(self) -> float:
-        if self._last_failure_time is None:
-            return 0.0
-        elapsed = time.monotonic() - self._last_failure_time
-        return max(0.0, self._current_timeout - elapsed)
-
-    def _record_success(self) -> None:
-        with self._lock:
-            if self.state == CircuitState.HALF_OPEN:
-                self._failure_count   = 0
-                self._current_timeout = self._base_timeout
-                self._transition(CircuitState.CLOSED)
-            elif self.state == CircuitState.CLOSED:
-                self._failure_count = 0
-
-    def _record_failure(self) -> None:
-        with self._lock:
-            self._failure_count    += 1
-            self._last_failure_time = time.monotonic()
-
-            if self.state == CircuitState.HALF_OPEN:
-                self._current_timeout *= 2
-                self._transition(CircuitState.OPEN)
-            elif (
-                self.state == CircuitState.CLOSED
-                and self._failure_count >= self.failure_threshold
-            ):
-                self._transition(CircuitState.OPEN)
 \end{lstlisting}
+\githubref{src.llm.CircuitBreaker}
 
-Two implementation choices are worth explaining in detail.
+Transition sequence: \code{CLOSED} $\to$ \code{OPEN} after
+\code{failure\_threshold} failures; \code{OPEN} $\to$ \code{HALF\_OPEN}
+once \code{cooldown\_s} elapses (checked lazily inside the \code{state}
+property, not on a background timer); one probe decides
+\code{HALF\_OPEN} $\to$ \code{CLOSED} (success) or
+\code{HALF\_OPEN} $\to$ \code{OPEN} (failure).
 
-First, \code{time.monotonic()} rather than \code{datetime.now()} is used for
-timing. Monotonic clocks are guaranteed never to go backwards, which matters
-because system clocks can jump during NTP corrections or when a container is
-migrated. A backwards jump on a wall clock would cause the circuit to remain
-open far longer than \code{recovery\_timeout}. Monotonic time has no such
-vulnerability.
+\begin{tipbox}
+\textbf{One breaker per model, not one for the whole router.}
+\code{LLMRouter} keeps \code{self.\_cbs: dict[str, CircuitBreaker]}.
+A primary-model outage opens only the primary's breaker; fallback
+models remain individually available.
+\end{tipbox}
 
-Second, the actual call to \code{fn} happens \emph{outside} the lock. If the
-lock were held during the I/O call, every thread in the process would block
-waiting for the lock to release, defeating the purpose of multithreading
-entirely. The state check and transition happen under the lock; the network call
-does not.
+% ─────────────────────────────────────────────────────────────────────────────
+\section{The Fallback Cascade}
+\label{sec:fallback-cascade}
+% ─────────────────────────────────────────────────────────────────────────────
 
-Chapter~11 revisits this class to produce an \code{async}-compatible variant
-using \code{asyncio.Lock} and \code{asyncio.get\_event\_loop().run\_in\_executor}
-for high-concurrency deployments.
+\code{LLMRouter.complete()} walks the configured model list in order,
+stopping at the first model that returns successfully.
 
-With routing, retries, and circuit breaking in place, the runtime now has
-defences against provider faults. The remaining operational risk is financial:
-the agent could run for many cycles and accumulate a large bill before any node
-notices. The next section addresses that by making cost visible in real time,
-directly inside \code{AgentState}.
+\begin{lstlisting}[language=Python,
+    caption={LLMRouter.complete --- fallback iteration (src/llm.py)},
+    label={lst:fallback-cascade}]
+def complete(self, messages: list[dict], max_retries: int = 3, **kwargs) -> Any:
+    all_models = [self._cfg.primary_model, *self._cfg.fallback_models]
 
-%% ------------------------------------------------------------
-\section{Tracking Spend in Real Time}
+    for model in all_models:
+        cb = self._cbs.get(model, CircuitBreaker(name=model))
+        try:
+            result = self._call_with_retry(
+                model, messages, max_retries, cb, **kwargs
+            )
+            langfuse_context.update_current_observation(metadata={
+                "model_used": model,
+                "fallback":   model != self._cfg.primary_model,
+            })
+            return result
+        except (CircuitOpenError, litellm.exceptions.APIConnectionError):
+            continue                       # try next model
+        except BudgetExceededError:
+            raise                          # never silently swallow
+        except Exception:
+            continue
+
+    raise RuntimeError("All models exhausted; no LLM call succeeded.")
+\end{lstlisting}
+\githubref{src.llm.LLMRouter.complete}
+
+Each attempt is also wrapped in a Tenacity retry (\code{\_call\_with\_retry})
+for transient errors.  Two retry layers for two failure timescales: Tenacity
+handles a request likely to succeed on the second try within the same model;
+the fallback loop handles a provider that will not succeed at all this window.
+
+\begin{warningbox}
+\textbf{\code{BudgetExceededError} is re-raised, never caught by the
+fallback loop.}  Trying a different provider does not help when the cost
+cap is exhausted --- the next provider costs money too.
+\end{warningbox}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Cost Tracking and the Budget Circuit Breaker}
 \label{sec:cost-tracking}
-%% ------------------------------------------------------------
+% ─────────────────────────────────────────────────────────────────────────────
 
-The natural place to accumulate cost is at the call site --- a line like
-\code{budget += estimate\_tokens(prompt) * price\_per\_token} after each
-\code{router.completion()} call. That approach has a fatal flaw: you do not know
-the actual token count until the response arrives, per-model pricing is not
-a constant you should hardcode, and the estimate can be wrong in ways that
-compound silently across cycles.
-
-LiteLLM already solves this. It emits a \code{success\_callback} after every
-completed call, passes the full response object including token usage, and
-exposes \code{litellm.completion\_cost()} which knows the current price schedule
-for each supported model. This is the correct accumulation point: it fires
-exactly once per successful call, after the response has been validated, with
-accurate usage data.
-
-The \code{CostTracker} class registers a method as that callback and accumulates
-cost into a \code{TokenBudget} Pydantic model. \code{TokenBudget} lives inside
-\code{AgentState} so that every node in the graph can read the current spend
-without importing the tracker directly. When an accumulation would push
-\code{used\_usd} past \code{limit\_usd}, the \code{TokenBudget} validator raises
-\code{BudgetExceededError} immediately, before the update is committed.
+LiteLLM exposes a \code{success\_callback} that fires after every
+completed call.  Registering here is the only reliable way to capture
+token counts across every provider without writing a provider-specific
+parser.
 
 \begin{lstlisting}[language=Python,
-  caption={TokenBudget model and CostTracker callback wiring},
-  label={lst:cost-tracker}]
-# src/llm/cost_tracker.py
+    caption={Budget callback and drain (src/llm.py)},
+    label={lst:budget-callback}]
+_BUDGET_QUEUE: list[dict] = []   # process-global; see note below
 
-from __future__ import annotations
-import threading
-import litellm
-from pydantic import BaseModel, model_validator
-from litellm import ModelResponse
-from src.llm.exceptions import BudgetExceededError
+def _budget_callback(kwargs, completion_response,
+                     start_time, end_time) -> None:
+    usage = getattr(completion_response, "usage", None)
+    if not usage:
+        return
+    cost = litellm.completion_cost(completion_response=completion_response)
+    _BUDGET_QUEUE.append({
+        "tokens": getattr(usage, "total_tokens", 0),
+        "cost":   cost or 0.0,
+    })
 
-
-class TokenBudget(BaseModel):
-    used_usd:                float = 0.0
-    limit_usd:               float
-    prompt_tokens_total:     int   = 0
-    completion_tokens_total: int   = 0
-
-    @model_validator(mode="after")
-    def check_budget(self) -> "TokenBudget":
-        if self.used_usd > self.limit_usd:
-            raise BudgetExceededError(
-                used_usd=self.used_usd,
-                limit_usd=self.limit_usd,
-            )
-        return self
-
-
-class CostTracker:
-    """Registers itself as a LiteLLM success_callback and accumulates cost.
-
-    Registration is per-Router instance, not global, to avoid cross-agent
-    pollution in multi-agent deployments where multiple Routers coexist in
-    the same process.
-    """
-
-    def __init__(self, budget: TokenBudget, router: litellm.Router) -> None:
-        self._budget = budget
-        self._lock   = threading.Lock()
-        router.success_callback = [self.success_callback]
-
-    def success_callback(
-        self,
-        kwargs:              dict,
-        completion_response: ModelResponse,
-        start_time:          float,
-        end_time:            float,
-    ) -> None:
-        call_cost = litellm.completion_cost(
-            completion_response=completion_response
+def drain_budget_into_state(state: dict) -> dict:
+    budget = state.get("token_budget")
+    if not budget:
+        return {}
+    total_tokens = total_cost = 0
+    while _BUDGET_QUEUE:
+        item = _BUDGET_QUEUE.pop(0)
+        total_tokens += item["tokens"]
+        total_cost   += item["cost"]
+    if total_tokens == 0:
+        return {}
+    new_budget = budget.add(total_tokens, total_cost)
+    if new_budget.is_exhausted():
+        raise BudgetExceededError(
+            f"Budget exceeded: {new_budget.used}/{new_budget.ceiling} tokens"
         )
-        usage = completion_response.usage
-        with self._lock:
-            self._budget = TokenBudget(
-                used_usd=self._budget.used_usd + call_cost,
-                limit_usd=self._budget.limit_usd,
-                prompt_tokens_total=(
-                    self._budget.prompt_tokens_total
-                    + (usage.prompt_tokens if usage else 0)
-                ),
-                completion_tokens_total=(
-                    self._budget.completion_tokens_total
-                    + (usage.completion_tokens if usage else 0)
-                ),
-            )
-
-    def get_budget_snapshot(self) -> TokenBudget:
-        with self._lock:
-            return self._budget.model_copy()
+    return {"token_budget": new_budget}
 \end{lstlisting}
-
-The \code{AgentState} type now carries two new fields to support cost tracking
-and the downstream sections of this chapter:
-
-\begin{lstlisting}[language=Python,
-  caption={New AgentState fields for cost tracking and degradation},
-  label={lst:agent-state-ch5}]
-# src/agent/state.py (additions)
-
-from src.llm.cost_tracker import TokenBudget
-
-class AgentState(TypedDict):
-    # ... existing fields from previous chapters ...
-    token_budget:       TokenBudget        # updated by CostTracker
-    last_model_used:    str                # populated by FallbackRouter (§5.6)
-    last_call_cost_usd: float              # scalar for Langfuse event
-    degraded:           bool               # True when static fallback used
-    stop_reason:        StopReason | None  # None while running
-\end{lstlisting}
+\githubref{src.llm.drain\_budget\_into\_state}
 
 \begin{notebox}
-The \code{TokenBudget} validator raises \code{BudgetExceededError} at
-construction time, which means the exception surfaces inside
-\code{success\_callback}, which runs inside LiteLLM's response handling. The
-\code{CostTracker} therefore catches \code{BudgetExceededError}, stores it on
-an internal flag, and lets the graph node check \code{get\_budget\_snapshot()}
-immediately after a call completes. Section~5.5 shows the graph-side wiring that
-reads this flag and routes accordingly.
+\textbf{The queue is process-global; the budget is per-run.}
+\code{\_BUDGET\_QUEUE} accumulates across all concurrent runs in the same
+process.  This is safe because \code{drain\_budget\_into\_state()} is
+called synchronously, immediately after the specific LLM call it is
+measuring, before any other run's call can interleave on a
+single-threaded event loop.  A multi-threaded deployment would need a
+per-run queue.
 \end{notebox}
 
-Now that spend is visible inside every graph cycle, the runtime needs a policy
-for what an overage means at the graph level. The answer is not a retry and not
-an exception that bubbles up through the runner. It is a clean, structured
-graph stop---the subject of the next section.
+% ─────────────────────────────────────────────────────────────────────────────
+\section{DEGRADED: The State Between Working and Giving Up}
+\label{sec:degraded}
+% ─────────────────────────────────────────────────────────────────────────────
 
-%% ------------------------------------------------------------
-\section{Treating Budget Overage as a Graph Exit}
-\label{sec:budget-circuit-breaker}
-%% ------------------------------------------------------------
-
-A budget overage is not a network error or a model failure. It is a business
-rule violation: the agent has consumed more than the operator authorised. The
-correct response is not a retry, not a fallback to a cheaper model, and not an
-unhandled exception that propagates up through the graph runner. It is a clean,
-observable stop that writes the final state, records the reason, and returns a
-structured signal to the caller.
-
-Three components implement this: a custom exception, a graph routing function,
-and a terminal node.
+When the fallback cascade exhausts every configured model, Volume~1
+Chapter~8 requires this be treated as \code{RunState.DEGRADED}, not
+immediate termination --- a future cycle might recover if a provider
+comes back.
 
 \begin{lstlisting}[language=Python,
-  caption={BudgetExceededError and the StopReason model},
-  label={lst:budget-exception}]
-# src/llm/exceptions.py
-
-from __future__ import annotations
-from typing import Literal
-from pydantic import BaseModel
-
-
-class BudgetExceededError(Exception):
-    def __init__(self, used_usd: float, limit_usd: float) -> None:
-        super().__init__(
-            f"Budget exceeded: used={used_usd:.4f} USD, "
-            f"limit={limit_usd:.4f} USD"
-        )
-        self.used_usd  = used_usd
-        self.limit_usd = limit_usd
-
-
-class CircuitOpenError(Exception):
-    pass
-
-
-class RetryExhaustedError(Exception):
-    def __init__(self, exception_class: str) -> None:
-        super().__init__(
-            f"All retries exhausted for exception class: {exception_class}"
-        )
-        self.exception_class = exception_class
-
-
-class StopReason(BaseModel):
-    code:     Literal["budget_exceeded", "circuit_open", "max_iterations"]
-    detail:   str
-    used_usd: float | None = None
+    caption={handle\_all\_providers\_failed --- DEGRADED then ABORTED
+             (src/llm.py)},
+    label={lst:degraded}]
+def handle_all_providers_failed(state: dict) -> dict:
+    if state.get("run_state") == RunState.DEGRADED:
+        # Already degraded once — now give up
+        return {
+            "run_state":          RunState.ABORTED,
+            "termination_reason": TerminationReason.FAILURE_ESCALATION,
+        }
+    return {"run_state": RunState.DEGRADED}
 \end{lstlisting}
+\githubref{src.llm.handle\_all\_providers\_failed}
+
+The first total failure in a cycle transitions to \code{DEGRADED}; the
+outer graph routes back to \code{perceive} for one more attempt.  Only
+when \emph{the very next} cycle also exhausts every provider does the
+run transition \code{DEGRADED} $\to$ \code{ABORTED}.
+
+\begin{warningbox}
+\textbf{\code{ABORTED} is reachable only through \code{DEGRADED}.}
+No code path sets \code{RunState.ABORTED} directly from a live state.
+\code{ABORTED} means the agent tried, partially recovered, tried again,
+and still failed --- a meaningfully different operational signal from a
+single transient blip, and downstream alerting should treat it as more
+severe.
+\end{warningbox}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Applying the Subgraph Principle to \texttt{LLMRouter.complete()}}
+\label{sec:ch5-subgraph}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\code{complete()} iterates over up to three models, each wrapped in a
+circuit breaker and a Tenacity retry --- real network I/O across multiple
+attempts.  The strongest false-positive so far, purely on the strength of
+condition~4 (I/O boundary).  Applying all four tests:
+
+\begin{takeawaybox}[Subgraph Principle applied: verdict — stays a plain method]
+\begin{enumerate}
+  \item \emph{Three or more steps?}  Yes --- up to three model attempts.
+  \item \emph{Distinct failure modes worth separate spans?}
+        \textbf{No.}  Every attempt in the loop has the \emph{same}
+        failure mode: this model was unavailable.  They differ only in
+        which model name is attached.  PerceiveSubgraph's stages catch
+        categorically different problems; this loop retries the same
+        category of problem repeatedly.
+  \item \emph{Communicate through \code{AgentState}?}  \textbf{No.}
+        The loop variable \code{model} and the per-attempt circuit
+        breaker are local to the \code{for} loop.  Nothing about which
+        model is currently being tried is visible in \code{AgentState}.
+  \item \emph{I/O boundary, or resumability value between attempts?}
+        I/O: yes.  Resumability: \textbf{no.}  There is no operational
+        value in resuming ``after trying the primary but before trying
+        fallback~1.''  A restart simply re-enters \code{complete()} from
+        the top.
+\end{enumerate}
+Conditions~2 and~3 both fail decisively.  This is the clearest
+illustration that \textbf{I/O presence alone is not sufficient} for
+subgraph treatment.
+\end{takeawaybox}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Validating This Chapter}
+\label{sec:ch5-tests}
+% ─────────────────────────────────────────────────────────────────────────────
 
 \begin{lstlisting}[language=Python,
-  caption={Graph edge and terminal node for budget-exceeded routing},
-  label={lst:budget-graph}]
-# src/graph/edges.py
+    caption={Representative Chapter 5 unit tests (tests/unit/test\_ch05.py)},
+    label={lst:ch05-tests}]
+def test_circuit_opens_after_threshold_failures(breaker):
+    for _ in range(3):
+        with pytest.raises(ValueError):
+            breaker.call(lambda: (_ for _ in ()).throw(ValueError("boom")))
+    assert breaker.state == _CBState.OPEN
 
-from __future__ import annotations
-from typing import Literal
-from src.agent.state import AgentState
+def test_circuit_closed_after_successful_probe(breaker):
+    # open it
+    for _ in range(3):
+        with pytest.raises(ValueError):
+            breaker.call(lambda: (_ for _ in ()).throw(ValueError("boom")))
+    time.sleep(0.02)   # cooldown_s=0.01 in fixture
+    breaker.call(lambda: "ok")
+    assert breaker.state == _CBState.CLOSED
 
+def test_second_failure_transitions_degraded_to_aborted():
+    rs, reason = _handle_all_providers_failed(RunState.DEGRADED)
+    assert rs     == RunState.ABORTED
+    assert reason == TerminationReason.FAILURE_ESCALATION
 
-def should_continue_or_stop(
-    state: AgentState,
-) -> Literal["continue", "budget_exceeded"]:
-    """Conditional edge after every LLM call node.
-
-    Reads the budget snapshot from state rather than calling the tracker
-    directly, so that the graph remains a pure function of state.
-    """
-    budget = state.get("token_budget")
-    if budget is None:
-        return "continue"
-    if budget.used_usd >= budget.limit_usd:
-        return "budget_exceeded"
-    return "continue"
-
-
-# src/graph/nodes.py (budget handler)
-
-from langfuse import Langfuse
-from langgraph.types import RunnableConfig
-from src.agent.state import AgentState
-from src.llm.exceptions import StopReason
-
-
-def handle_budget_exceeded(
-    state: AgentState,
-    config: RunnableConfig,
-) -> AgentState:
-    """Terminal node: flush state, emit Langfuse event, return stop reason.
-
-    BudgetExceededError is not re-raised here. It has already been caught
-    and logged by the CostTracker. This node's job is to produce a clean
-    final state.
-    """
-    langfuse = Langfuse()
-    budget   = state.get("token_budget")
-    used     = budget.used_usd if budget else 0.0
-    limit    = budget.limit_usd if budget else 0.0
-
-    langfuse.event(
-        name="budget_exceeded",
-        metadata={
-            "used_usd":  used,
-            "limit_usd": limit,
-            "model":     state.get("last_model_used", "unknown"),
-        },
-    )
-
-    return {
-        **state,
-        "stop_reason": StopReason(
-            code="budget_exceeded",
-            detail=(
-                f"Agent stopped: used {used:.4f} USD of "
-                f"{limit:.4f} USD budget."
-            ),
-            used_usd=used,
-        ),
-    }
+def test_aborted_never_reached_directly_from_planning():
+    rs, _ = _handle_all_providers_failed(RunState.PLANNING)
+    assert rs != RunState.ABORTED
 \end{lstlisting}
+\githubref{tests.unit.test\_ch05}
 
-The graph wiring connects these two pieces with a conditional edge that runs
-after every node that performs an LLM call:
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{takeawaybox}[Chapter~5 Key Takeaways]
+\begin{itemize}
+  \item \textbf{One config object, zero hardcoded model names.}
+        \code{LLMSettings} is the single place that names a model;
+        version-pinned identifiers make provider upgrades a deliberate,
+        testable change.
 
-\begin{lstlisting}[language=Python,
-  caption={Graph wiring for the budget-exceeded branch},
-  label={lst:budget-wiring}]
-# src/agent/graph.py (excerpt)
+  \item \textbf{One circuit breaker per model.}  A primary-model outage
+        opens only the primary's breaker; fallback models remain
+        individually available.
 
-from langgraph.graph import END, StateGraph
-from src.graph.edges import should_continue_or_stop
-from src.graph.nodes import handle_budget_exceeded
+  \item \textbf{Fallback and Tenacity retry solve different problems.}
+        Tenacity handles a single model's transient errors; the fallback
+        loop handles a model that is entirely down for the window.
 
-b.add_node("handle_budget_exceeded", handle_budget_exceeded)
+  \item \textbf{\code{BudgetExceededError} is never swallowed by the
+        fallback loop.}  Switching providers cannot fix an exhausted cost
+        cap.
 
-b.add_conditional_edges(
-    "reason_node",
-    should_continue_or_stop,
-    {
-        "continue":        "validation_node",
-        "budget_exceeded": "handle_budget_exceeded",
-    },
-)
+  \item \textbf{\code{DEGRADED} is not a synonym for failure.}
+        \code{ABORTED} is reachable only via \code{DEGRADED}, and only
+        after a second consecutive total failure.
 
-b.add_edge("handle_budget_exceeded", END)
-\end{lstlisting}
-
-The \code{StopReason} object in \code{AgentState} is the authoritative signal
-for any caller of the compiled graph. A calling orchestrator, API handler, or
-test checks \code{final\_state["stop\_reason"]} rather than catching an
-exception, because the graph guarantees it always terminates with a structured
-final state rather than propagating an error out of the runner. Chapter~6
-persists \code{stop\_reason} to episodic memory so that retrospective analysis
-can distinguish budget stops from normal completions. Chapter~12 surfaces it in
-the operator dashboard.
-
-The budget exit works, but it operates on a single tier. The production system
-need a wider defensive layer: one that tries cheaper providers before giving up,
-and that logs every tier attempt for post-mortem analysis. That is the job of
-the fallback cascade.
-
-%% ------------------------------------------------------------
-\section{Fallback Cascade with Full Observability}
-\label{sec:fallback-routing}
-%% ------------------------------------------------------------
-
-LiteLLM's built-in fallback mechanism is convenient for simple cases, but it
-operates at the library level and is invisible to your application's
-observability stack. When the primary model fails and LiteLLM silently routes to
-the fallback, you have no event in Langfuse, no update to \code{AgentState}, and
-no opportunity to check whether the budget permits the fallback call. The
-\code{FallbackRouter} class makes the cascade explicit: each tier is a named
-\code{FallbackTier} object with its own circuit breaker, and every
-attempt---successful or not---is logged as a Langfuse event with a consistent
-schema.
-
-\begin{lstlisting}[language=Python,
-  caption={FallbackRouter with per-tier circuit breakers and Langfuse logging},
-  label={lst:fallback-router}]
-# src/llm/fallback_router.py
-
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Union
-import logging
-from langfuse import Langfuse
-from litellm import ModelResponse
-from langgraph.types import RunnableConfig
-from pydantic import BaseModel
-from src.llm.circuit_breaker import LLMCircuitBreaker
-from src.llm.cost_tracker import CostTracker
-from src.llm.exceptions import CircuitOpenError, RetryExhaustedError
-from src.llm.retry_policies import resilient_call
-from src.agent.state import AgentState
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class FallbackTier:
-    model_alias:      str
-    circuit_breaker:  LLMCircuitBreaker
-    cost_ceiling_usd: float
-
-
-class StaticFallbackResponse(BaseModel):
-    content:    str  = "Service temporarily unavailable. Please retry shortly."
-    degraded:   bool = True
-    model_used: str  = "static"
-    cost_usd:   float = 0.0
-
-
-class FallbackRouter:
-    """Explicit three-tier fallback cascade with per-attempt Langfuse events.
-
-    Each tier wraps its own LLMCircuitBreaker instance so that failures on
-    the primary tier do not contaminate the fallback tier's health counter.
-    """
-
-    def __init__(
-        self,
-        tiers:    list[FallbackTier],
-        tracker:  CostTracker,
-        langfuse: Langfuse,
-        router,
-    ) -> None:
-        self._tiers    = tiers
-        self._tracker  = tracker
-        self._langfuse = langfuse
-        self._router   = router
-
-    def route(
-        self,
-        payload: dict,
-        state:   AgentState,
-        config:  RunnableConfig,
-    ) -> Union[ModelResponse, StaticFallbackResponse]:
-        budget    = self._tracker.get_budget_snapshot()
-        remaining = budget.limit_usd - budget.used_usd
-
-        for tier_index, tier in enumerate(self._tiers):
-            if remaining < tier.cost_ceiling_usd:
-                self._log_attempt(
-                    tier=tier, tier_index=tier_index,
-                    success=False, cost_usd=0.0,
-                    reason="InsufficientBudget",
-                )
-                continue
-
-            call_payload = {**payload, "model": tier.model_alias}
-            try:
-                response: ModelResponse = tier.circuit_breaker.call(
-                    resilient_call, self._router, call_payload
-                )
-                call_cost = float(
-                    getattr(response, "_hidden_params", {}).get(
-                        "response_cost", 0.0
-                    )
-                )
-                self._log_attempt(
-                    tier=tier, tier_index=tier_index,
-                    success=True, cost_usd=call_cost,
-                    reason=None,
-                )
-                state["last_model_used"]    = tier.model_alias
-                state["last_call_cost_usd"] = call_cost
-                return response
-
-            except (CircuitOpenError, RetryExhaustedError) as exc:
-                reason = type(exc).__name__
-                logger.warning(
-                    "Tier %d (%s) failed: %s",
-                    tier_index, tier.model_alias, reason,
-                )
-                self._log_attempt(
-                    tier=tier, tier_index=tier_index,
-                    success=False, cost_usd=0.0,
-                    reason=reason,
-                )
-                continue
-
-        self._log_attempt(
-            tier=FallbackTier("static", None, 0.0),  # type: ignore[arg-type]
-            tier_index=len(self._tiers),
-            success=False, cost_usd=0.0,
-            reason="AllTiersExhausted",
-        )
-        state["degraded"] = True
-        return StaticFallbackResponse()
-
-    def _log_attempt(
-        self,
-        tier:       FallbackTier,
-        tier_index: int,
-        success:    bool,
-        cost_usd:   float,
-        reason:     str | None,
-    ) -> None:
-        self._langfuse.event(
-            name="llm_call_attempt",
-            metadata={
-                "model_used": tier.model_alias,
-                "tier":       tier_index,
-                "success":    success,
-                "cost_usd":   cost_usd,
-                "reason":     reason,
-            },
-        )
-\end{lstlisting}
-
-The \code{reason} field in each Langfuse event is always the exception class
-name, never free text. This keeps Langfuse queries filterable: you can build a
-dashboard query for all events where \code{reason == "CircuitOpenError"} and
-immediately see how often the primary tier is tripping the breaker. Free-text
-reasons would make that aggregation impossible. Chapter~7 covers the full
-Langfuse trace hierarchy and shows how \code{llm\_call\_attempt} events nest
-under the parent agent trace. Chapter~12 covers the alerting rules that fire
-when consecutive \code{success=False} events exceed a threshold.
-
-With all three infrastructure layers in place---routing, protection, and
-governance---the last risk is configuration drift: model names, API keys, and
-budget limits that live in source code rather than the environment. The next
-section eliminates that risk entirely.
-
-%% ------------------------------------------------------------
-\section{Configuration Must Not Live in Code}
-\label{sec:settings}
-%% ------------------------------------------------------------
-
-Every section in this chapter has deferred one question: where do the model
-names, API keys, budget limits, and retry parameters come from? The answer is a
-single \code{LLMSettings} class that inherits from Pydantic's
-\code{BaseSettings} and loads all values from environment variables prefixed
-with \code{LLM\_}. Nothing else in the source tree knows a model name as a
-string literal.
-
-This matters for three reasons. First, the same codebase can run against
-different model configurations in development, staging, and production by
-changing environment variables rather than source code. Second, secrets never
-appear in code, logs, or version control because \code{SecretStr} fields prevent
-them from being serialised or included in \code{repr()}. Third, a CI pipeline
-can validate the production \code{.env} file against the \code{LLMSettings}
-schema before deployment, catching a missing or malformed variable before it
-causes a runtime error. Chapter~13 shows that CI validation step in detail.
-
-\begin{lstlisting}[language=Python,
-  caption={LLMSettings loading all configuration from the environment},
-  label={lst:llm-settings}]
-# src/config/llm_settings.py
-
-from __future__ import annotations
-import re
-from functools import lru_cache
-from pydantic import SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-_MODEL_PIN_RE = re.compile(r"^[a-z0-9_\-]+/[a-z0-9\-\.]+$")
-
-
-class LLMSettings(BaseSettings):
-    """All LiteLLM router configuration, loaded from environment variables.
-
-    Variable names are the field names uppercased and prefixed with LLM_.
-    Example .env.development:
-
-        LLM_PRIMARY_MODEL=openai/gpt-4o-2024-08-06
-        LLM_FALLBACK_MODEL_1=openai/gpt-4o-mini-2024-07-18
-        LLM_FALLBACK_MODEL_2=anthropic/claude-3-5-haiku-20241022
-        LLM_OPENAI_API_KEY=sk-...
-        LLM_ANTHROPIC_API_KEY=sk-ant-...
-        LLM_TOTAL_BUDGET_USD=2.00
-        LLM_FAILURE_THRESHOLD=5
-        LLM_RECOVERY_TIMEOUT_SEC=60.0
-        LLM_REQUEST_TIMEOUT_SEC=30.0
-        LLM_DEBUG=false
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="LLM_",
-        env_file=(".env", ".env.production"),
-        secrets_dir="/run/secrets",
-        case_sensitive=False,
-    )
-
-    primary_model:          str
-    fallback_model_1:       str
-    fallback_model_2:       str
-    openai_api_key:         SecretStr
-    anthropic_api_key:      SecretStr
-    total_budget_usd:       float
-    failure_threshold:      int   = 5
-    recovery_timeout_sec:   float = 60.0
-    request_timeout_sec:    float = 30.0
-    debug:                  bool  = False
-
-    @field_validator(
-        "primary_model", "fallback_model_1", "fallback_model_2",
-        mode="before",
-    )
-    @classmethod
-    def validate_model_pin(cls, v: str) -> str:
-        """Reject bare aliases like 'gpt-4o'; require 'openai/gpt-4o-2024-08-06'."""
-        if not _MODEL_PIN_RE.match(v):
-            raise ValueError(
-                f"Model name must be in 'provider/model-version' format, "
-                f"got: {v!r}. Using bare aliases risks silent version drift."
-            )
-        return v
-
-
-@lru_cache(maxsize=1)
-def get_settings() -> LLMSettings:
-    """Return the process-scoped LLMSettings singleton.
-
-    The lru_cache ensures the .env file is read exactly once per process,
-    which matters for performance and for test isolation (tests can
-    invalidate the cache with get_settings.cache_clear()).
-    """
-    return LLMSettings()
-\end{lstlisting}
-
-\begin{lstlisting}[language=Python,
-  caption={Building a RunnableConfig with per-invocation overrides},
-  label={lst:runnable-config}]
-# src/config/runnable_config.py
-
-from __future__ import annotations
-from typing import Any
-from langgraph.types import RunnableConfig
-from src.config.llm_settings import LLMSettings, get_settings
-
-
-def build_runnable_config(
-    settings:  LLMSettings | None = None,
-    overrides: dict[str, Any] | None = None,
-) -> RunnableConfig:
-    """Produce a RunnableConfig that carries LLM settings into graph nodes.
-
-    The 'configurable' dict is the LangGraph-standard location for
-    per-invocation parameters. Nodes access it via:
-        config["configurable"].get("model_override")
-
-    Overrides allow a single graph invocation to use a different model
-    tier than the default without mutating the global settings. This is
-    used by the test suite (§9.1) to force specific tiers.
-    """
-    resolved = settings or get_settings()
-    configurable: dict[str, Any] = {
-        "primary_model":        resolved.primary_model,
-        "fallback_model_1":     resolved.fallback_model_1,
-        "fallback_model_2":     resolved.fallback_model_2,
-        "total_budget_usd":     resolved.total_budget_usd,
-        "failure_threshold":    resolved.failure_threshold,
-        "recovery_timeout_sec": resolved.recovery_timeout_sec,
-        "request_timeout_sec":  resolved.request_timeout_sec,
-    }
-    if overrides:
-        configurable.update(overrides)
-    return RunnableConfig(configurable=configurable)
-\end{lstlisting}
-
-The \code{LLM\_} prefix namespace prevents collision with other environment
-variables in the same deployment. In a multi-service container environment where
-a dozen services share an environment, an unprefixed variable named
-\code{PRIMARY\_MODEL} is a liability. Every settings class in this system uses
-its own prefix; Chapter~8 adds an \code{EMBED\_} prefix for embedding model
-settings and a \code{RERANK\_} prefix for reranker settings, following the same
-pattern.
-
-The dependency direction through this chapter is now fully linear and explicit:
-\code{get\_settings()} provides \code{LLMSettings} to \code{RouterFactory.build()},
-which produces a \code{Router} for \code{CostTracker} and \code{FallbackRouter}.
-\code{FallbackRouter} is injected into graph nodes. No component reaches across
-the chain; each layer only knows its direct dependency. Chapter~9 exploits this
-by constructing the chain in test fixtures with synthetic settings and a mock
-router, making every component testable in isolation without network access.
+  \item \textbf{I/O presence alone does not qualify a function for
+        subgraph treatment.}  \code{LLMRouter.complete()} performs real
+        network I/O across multiple attempts and still correctly stays a
+        plain method, because its steps share one failure mode and
+        communicate through local variables.
+\end{itemize}
+\end{takeawaybox}
